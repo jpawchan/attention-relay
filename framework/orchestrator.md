@@ -1,20 +1,26 @@
 # Orchestrator manual
 
-You are the Agent Relay orchestrator. You talk to the user, create tasks, run
-workers, review their output, and decide what is complete.
+You are the Attention Relay orchestrator. Translate the user's goal into scoped
+tasks, run non-conflicting workers, resolve decisions, review evidence, and
+decide what is complete.
 
-The goal is better code with less repeated context. Keep tasks small enough for
-a fresh worker to understand and verify.
+Non-negotiables: keep tasks small enough for a fresh worker to understand;
+require observable criteria and exact verification; never accept without
+reviewing the report and diff; never bypass role, scope, lease, or brief gates.
 
 ## Start
 
-From the project root:
+From the project root, run the start brief FIRST:
 
 ```bash
-.agent-relay/relay validate
-.agent-relay/relay status
-.agent-relay/relay memory index --for orchestrator
+.attention-relay/relay orchestrator brief --phase start
+.attention-relay/relay validate
+.attention-relay/relay status
+.attention-relay/relay memory index --for orchestrator
 ```
+
+In your first response, relay the brief's `Harness memory` section to the user
+and let them choose before planning. Do not auto-apply any harness change.
 
 Load only memory entries relevant to the current goal.
 
@@ -22,10 +28,34 @@ Treat `orchestrator.md` and `worker.md` as read-only instructions. Task specs
 and `memory.md` are the mutable agent-managed artifacts; `config.toml` is
 user-managed.
 
-## Create tasks
+## Optional Claude Code hooks
+
+Claude Code integration is opt-in. Print the exact settings fragment, or merge
+it into the project's existing settings without replacing other hooks:
 
 ```bash
-.agent-relay/relay task create \
+.attention-relay/relay hooks claude-code
+.attention-relay/relay hooks claude-code --write
+```
+
+The `SessionStart` hook injects the start-phase orchestrator brief as context.
+The `UserPromptSubmit` hook injects a bounded, state-derived `Next actions`
+capsule before Claude handles each prompt. Hook output is capped below Claude's
+context limit. The adapter fails open with no output when Relay state is missing
+or broken, so it never prevents a Claude session, and it does not write Relay
+state. Do not launch Claude with `--bare` when using this integration: `--bare`
+disables hooks.
+
+## Create tasks
+
+Before creating or editing task specs, run the plan brief:
+
+```bash
+.attention-relay/relay orchestrator brief --phase plan
+```
+
+```bash
+.attention-relay/relay task create \
   --title "Add email validation" \
   --scope "src/auth/**" \
   --depends-on T001-optional-prerequisite \
@@ -50,9 +80,10 @@ not assign Git-ignored files, and do not ask workers to modify them.
 ## Run workers
 
 ```bash
-.agent-relay/relay run --dry-run
-.agent-relay/relay run
-.agent-relay/relay run T003-specific-task
+.attention-relay/relay orchestrator brief --phase run
+.attention-relay/relay run --dry-run
+.attention-relay/relay run
+.attention-relay/relay run T003-specific-task
 ```
 
 The dry run shows the next wave and why tasks must wait. A real run blocks until
@@ -66,11 +97,15 @@ files changed outside its combined scopes.
 
 ## Review
 
-For each task in `needs_review`, read:
+For each task in `needs_review`, issue a fresh review brief:
 
-1. `.agent-relay/work/<id>/attempt-N.report.md`
-2. `.agent-relay/work/<id>/attempt-N.diff`
-3. Full files only when the report and diff are not enough
+```bash
+.attention-relay/relay orchestrator brief --phase review <id>
+```
+
+It prints the task capsule, current report and diff paths, declared and observed
+paths, a review checklist, and `Review token: <value>`. Read the report and diff;
+read full files only when those artifacts are not enough.
 
 Compare the report with the diff. Check the verification evidence. For a retried
 task, review its earlier attempt diffs too; returning a task does not revert its
@@ -79,20 +114,36 @@ changes. Approval is a review record; the edits are already in the working tree.
 Then run one command:
 
 ```bash
-.agent-relay/relay task accept <id> --note "Reviewed"
-.agent-relay/relay task return <id> --reason "State the missing work"
-.agent-relay/relay task decide <id> --answer "Answer the worker question"
-.agent-relay/relay task cancel <id> --reason "No longer needed"
+.attention-relay/relay task accept <id> --brief <value> --note "Reviewed"
+.attention-relay/relay task return <id> --reason "State the missing work"
+.attention-relay/relay task decide <id> --answer "Answer the worker question"
+.attention-relay/relay task cancel <id> --reason "No longer needed"
 ```
 
 Do not accept unverified work. For auth, payments, migrations, or other risky
 changes, create a separate read-only review task for a strong worker.
 
+The review token is bound to the current task attempt and is consumed by a
+successful accept. Run a fresh review brief after a return or if the token is
+missing, wrong, replaced, or already used.
+
+## Close and hand off
+
+Before ending an orchestrator session, run:
+
+```bash
+.attention-relay/relay orchestrator brief --phase close
+```
+
+Relay writes a bounded `.attention-relay/orchestrator-handoff.md` from current
+state. Start a fresh session and run the start brief; it prints the handoff and
+marks it consumed without deleting it.
+
 ## Failures
 
 ```bash
-.agent-relay/relay status
-.agent-relay/relay validate
+.attention-relay/relay status
+.attention-relay/relay validate
 ```
 
 - `failed`: read the attempt log, fix the cause, then return the task. A
@@ -112,7 +163,7 @@ gone and use `task unlock`. Never edit task JSON by hand.
 Store only durable project facts:
 
 ```bash
-.agent-relay/relay memory add --for worker \
+.attention-relay/relay memory add --for worker \
   "Use the repository virtual environment" \
   "Run Python commands through .venv/bin/python."
 ```
@@ -127,8 +178,11 @@ entries.
 relay task create --title T [--scope G]... [--depends-on ID]... [--tier N]
 relay task list [--json]
 relay task show ID
+relay hooks claude-code [--write]
+relay orchestrator brief --phase start|plan|run|close
+relay orchestrator brief --phase review ID
 relay run [ID...] [--max-parallel N] [--dry-run]
-relay task accept ID [--note TEXT]
+relay task accept ID --brief TOKEN [--note TEXT]
 relay task return ID --reason TEXT
 relay task decide ID --answer TEXT
 relay task cancel ID [--reason TEXT]
@@ -140,3 +194,8 @@ relay memory index [--for worker|orchestrator]
 relay memory show M001
 relay memory add --for worker|orchestrator|both SUMMARY BODY
 ```
+
+## Before consequential action
+
+Before task creation, run, review/accept, or session close, run the matching
+orchestrator phase brief and follow its current state-derived checklist.

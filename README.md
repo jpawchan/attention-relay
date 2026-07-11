@@ -1,8 +1,8 @@
-# agent relay
+# attention relay
 
-## What is Agent Relay?
+## What is Attention Relay?
 
-Agent Relay is a small delegation framework. It can improve code quality and
+Attention Relay is a small delegation framework. It can improve code quality and
 reduce token use.
 
 You work with one orchestrator agent. It breaks your goal into tasks, sends each
@@ -11,35 +11,43 @@ task to a separate worker, and reviews the result before accepting it.
 Workers can use Hermes Agent, Claude Code, Codex, OpenCode, or another
 non-interactive CLI agent.
 
-## Why can this improve quality and reduce token use?
+## Why put critical context at the edges?
 
-### Quality
-
-In one long session, context grows quickly. As it grows, models can miss earlier
-facts, break old constraints, or invent details. This often appears around
-100,000 tokens, but there is no fixed threshold; it depends on the model and
-task. Read more:
+Models can use context near the beginning and end more reliably than context in
+the middle. As a session grows, instructions in the middle can fade or be
+missed. The effect varies by model and task; read more in
 [Attention Decay](https://jpawchan.substack.com/p/attention-decay).
 
-Each worker receives one task and only the context it needs. A smaller context
-can lead to better implementation.
+Attention Relay puts the same Critical Context Capsule at both ends of every
+worker prompt. The capsule carries the task's objective, acceptance criteria,
+restrictions, and verification commands. This placement does not guarantee
+quality, but it can make critical context easier to recover.
 
-### Token use
+Workers re-read the capsule before editing, verification, and reporting. The
+report brief issues a fresh token bound to the current attempt and lease before
+`task finish`; the review brief does the same for `task accept` and the current
+attempt.
 
-As work continues, completed tasks remain in the conversation. Most of that
-history is no longer useful, but it may be processed or billed again with later
-requests. Relay keeps worker sessions separate, so the orchestrator reviews a
-short task report and relevant Git diff instead of the worker's full
-conversation.
+At session close, the orchestrator writes a bounded handoff from current state.
+The next start brief prints and consumes that handoff. Output from `status`,
+`task show`, and each completed real `run` also ends with a short, state-derived
+`Next actions` capsule.
 
-### Why not just summarize?
+## How is this different from Agent Relay?
 
-Summarization compresses the full history and may lose useful details. Relay
-avoids giving that history to each worker in the first place.
+- **Edge placement:** a deterministic task capsule appears at both ends of each
+  worker prompt.
+- **Freshness gates:** finish and accept can require brief tokens bound to the
+  current action and attempt.
+- **Handoff:** close and start briefs carry current state between orchestrator
+  sessions.
+- **Claude Code hooks:** optional hooks inject the start brief and bounded next
+  actions.
+- **Memory-clean defaults:** workers skip saved harness memory and startup offers
+  memory-clean choices without applying them.
 
-The orchestrator keeps the high-level view and delegates low-level work. It
-reviews each task's report and diff instead of loading the worker's full
-session.
+Attention Relay uses [agent-relay](https://github.com/jpawchan/agent-relay) as
+its base.
 
 ## Requirements
 
@@ -67,33 +75,61 @@ specification and may produce a better implementation.
 Clone the repository:
 
 ```bash
-git clone https://github.com/jpawchan/agent-relay
+git clone https://github.com/jpawchan/attention-relay
 ```
 
 Install Relay into your project:
 
 ```bash
-agent-relay/framework/relay init /path/to/project
+attention-relay/framework/relay init /path/to/project
 ```
+
+This creates a local `.attention-relay/` directory in the project.
 
 ## How to use it
 
 1. Install Relay in your project.
-2. Ask your main agent to read `.agent-relay/orchestrator.md`.
-3. Describe your goal.
+2. Ask your main agent to read `.attention-relay/orchestrator.md`.
+3. The agent runs the start brief and offers its memory-clean choices before
+   planning:
+
+   ```bash
+   .attention-relay/relay orchestrator brief --phase start
+   ```
+
+4. Describe your goal.
+
+## Optional Claude Code hooks
+
+Print the Claude Code settings fragment, or merge it into the project's current
+settings:
+
+```bash
+.attention-relay/relay hooks claude-code
+.attention-relay/relay hooks claude-code --write
+```
+
+The `SessionStart` hook injects the start-phase orchestrator brief. The
+`UserPromptSubmit` hook injects a bounded, state-derived `Next actions` capsule
+before Claude handles each prompt. Repeated setup is idempotent and does not
+replace existing hook arrays.
+
+The adapters cap output and fail open with no output if Relay state is missing
+or broken. Do not launch Claude with `--bare` when using this integration,
+because `--bare` disables hooks.
 
 ## What is in this repository?
 
 | Path | Contents |
 | --- | --- |
-| `framework/` | Ready-to-use Relay CLI, config, and agent instructions. |
+| `framework/` | Ready-to-use Relay CLI, config example, orchestrator and worker manuals, and memory template. |
 | `prompts/create-framework.md` | Prompt for building Relay from the specification. |
 | `prompts/improve-framework.md` | Prompt for testing and fixing an implementation. |
 | `prompts/use-framework.md` | Prompt for using an installed Relay framework. |
-| `skill/` | Agent-skill metadata. |
-| `tests/` | End-to-end tests. |
+| `skill/` | Agent-skill metadata and usage guidance. |
+| `tests/test_relay.py` | End-to-end test suite. |
 | `SPEC.md` | Exact behavior and safety rules. |
-| `summary.md` | Code-verified project guide. |
+| `LICENSE` | MIT license text. |
 
 ## License
 

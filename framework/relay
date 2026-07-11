@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Agent Relay: scoped coding-agent tasks with review before approval.
+"""Attention Relay: scoped coding-agent tasks with review before approval.
 
 Requires Python 3.11+, Git, and macOS or Linux.
 Run `relay <command> --help` for command details.
 """
 
 import argparse
+import hashlib
+import io
 import json
 import os
 import re
@@ -17,10 +19,10 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from datetime import datetime, timezone
 
-RELAY_DIRNAME = ".agent-relay"
+RELAY_DIRNAME = ".attention-relay"
 STATUSES = (
     "queued", "running", "needs_review", "needs_decision",
     "blocked", "failed", "done", "cancelled",
@@ -30,11 +32,17 @@ TASK_ID_RE = re.compile(r"T\d{3,}-[a-z0-9]+(?:-[a-z0-9]+)*")
 PRINT_LOCK = threading.Lock()
 MANAGED_FILES = (
     "relay", "orchestrator.md", "worker.md", "memory.md", "config.toml",
+    "orchestrator-handoff.md",
 )
 MANAGED_DIRS = ("tasks", "work", "archive", ".locks")
+HOOK_OUTPUT_MAX_CHARS = 9000
+CLAUDE_HOOK_COMMANDS = {
+    "SessionStart": '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event session-start',
+    "UserPromptSubmit": '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event user-prompt-submit',
+}
 
 if sys.version_info < (3, 11):
-    raise SystemExit("error: Agent Relay requires Python 3.11 or newer")
+    raise SystemExit("error: Attention Relay requires Python 3.11 or newer")
 
 
 class RunInterrupted(Exception):
@@ -89,9 +97,9 @@ def runtime_paths_are_safe(relay_dir):
     root = os.path.realpath(os.path.dirname(relay_dir))
     if os.path.lexists(relay_dir):
         if os.path.islink(relay_dir) or not os.path.isdir(relay_dir):
-            die(".agent-relay must be a real directory inside the project")
+            die(".attention-relay must be a real directory inside the project")
         if os.path.commonpath((root, os.path.realpath(relay_dir))) != root:
-            die(".agent-relay resolves outside the project")
+            die(".attention-relay resolves outside the project")
     for name in MANAGED_FILES:
         path = os.path.join(relay_dir, name)
         if os.path.lexists(path) and (os.path.islink(path) or not os.path.isfile(path)):
@@ -111,7 +119,7 @@ def runtime_paths_are_safe(relay_dir):
 def require_relay_dir():
     relay_dir = find_relay_dir()
     if not relay_dir:
-        die("no .agent-relay directory found; run: relay init [project-path]")
+        die("no .attention-relay directory found; run: relay init [project-path]")
     runtime_paths_are_safe(relay_dir)
     return relay_dir
 
@@ -219,6 +227,27 @@ def configured_limits(config, override=None):
     return max_parallel, float(timeout)
 
 
+def configured_capsule_max_chars(config):
+    maximum = cfg_get(config, "limits.capsule_max_chars", 4000)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ValueError("capsule_max_chars must be a positive integer")
+    return maximum
+
+
+def configured_finish_requires_brief(config):
+    required = cfg_get(config, "gates.finish_requires_brief", True)
+    if not isinstance(required, bool):
+        raise ValueError("finish_requires_brief must be true or false")
+    return required
+
+
+def configured_accept_requires_brief(config):
+    required = cfg_get(config, "gates.accept_requires_brief", True)
+    if not isinstance(required, bool):
+        raise ValueError("accept_requires_brief must be true or false")
+    return required
+
+
 def command_template(config, task):
     tier = task.get("tier", "default")
     return (
@@ -273,6 +302,23 @@ def report_path(relay_dir, task_id, attempt):
 
 def result_path(relay_dir, task_id, attempt):
     return os.path.join(work_dir(relay_dir, task_id), "attempt-%d.result.json" % attempt)
+
+
+def brief_token_path(relay_dir, task_id):
+    return os.path.join(work_dir(relay_dir, task_id), "finish-brief-token.json")
+
+
+def review_token_path(relay_dir, task_id):
+    return os.path.join(work_dir(relay_dir, task_id), "review-brief-token.json")
+
+
+def orchestrator_handoff_path(relay_dir):
+    return os.path.join(relay_dir, "orchestrator-handoff.md")
+
+
+def invalidate_review_token(relay_dir, task_id):
+    with suppress(FileNotFoundError):
+        os.unlink(review_token_path(relay_dir, task_id))
 
 
 def report_is_ready(path):
@@ -508,6 +554,85 @@ List the paths and facts the worker needs. Reference memory ids when useful.
 """
 
 
+CAPSULE_SECTIONS = (
+    "Objective", "Acceptance criteria", "Not allowed", "Verification",
+)
+CAPSULE_REQUIRED_PLACEHOLDERS = {
+    "Objective": "Replace this line with one clear outcome.",
+    "Acceptance criteria": "- Add observable requirements.",
+}
+
+
+def task_spec_sections(spec):
+    """Return top-level task sections without reading files or changing state."""
+    matches = list(re.finditer(r"^## ([^\n]+)[ \t]*$", spec, re.MULTILINE))
+    sections = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(spec)
+        sections.setdefault(match.group(1).strip(), spec[match.end():end].strip())
+    return sections
+
+
+def latest_task_spec_entry(text):
+    """Return the newest list entry (Relay prepends feedback and decisions)."""
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def compile_context_capsule(task, spec, capsule_max_chars=4000):
+    """Compile a deterministic, bounded capsule from canonical task sections."""
+    if isinstance(capsule_max_chars, bool) or not isinstance(capsule_max_chars, int) \
+            or capsule_max_chars < 1:
+        raise ValueError("capsule_max_chars must be a positive integer")
+    sections = task_spec_sections(spec)
+    task_id = task.get("id", "unknown")
+    for name in ("Objective", "Acceptance criteria"):
+        content = sections.get(name, "")
+        if not content:
+            raise ValueError(
+                "{}: {} is empty; replace the template text with task-specific content".format(
+                    task_id, name,
+                )
+            )
+        placeholder = CAPSULE_REQUIRED_PLACEHOLDERS[name]
+        if placeholder in (line.strip() for line in content.splitlines()):
+            raise ValueError(
+                "{}: {} still contains the template placeholder {!r}; replace it with "
+                "task-specific content".format(task_id, name, placeholder)
+            )
+
+    scope = ", ".join(task.get("scope", [])) or "whole project"
+    parts = [
+        "# Critical Context Capsule",
+        "",
+        "Task: {}: {}".format(task_id, task.get("title", "")),
+        "Scope: " + scope,
+    ]
+    for name in CAPSULE_SECTIONS:
+        parts.extend(("", "## " + name, sections.get(name, "") or "(none)"))
+    if task.get("attempt", 1) > 1:
+        feedback = latest_task_spec_entry(sections.get("Review feedback", ""))
+        decision = latest_task_spec_entry(sections.get("Decisions", ""))
+        retry = []
+        if feedback:
+            retry.append("Review feedback: " + feedback)
+        if decision:
+            retry.append("Decision: " + decision)
+        parts.extend(("", "## Retry delta", "\n".join(retry) or "(none recorded)"))
+    capsule = "\n".join(parts)
+    size = len(capsule)
+    if size > capsule_max_chars:
+        raise ValueError(
+            "{}: critical context capsule is {} characters; capsule_max_chars={} "
+            "is exceeded by {} characters".format(
+                task_id, size, capsule_max_chars, size - capsule_max_chars,
+            )
+        )
+    return capsule
+
+
 def cmd_task_create(args):
     require_orchestrator()
     if not args.title.strip():
@@ -575,10 +700,48 @@ def cmd_task_list(args):
         ))
 
 
+def bounded_ids(tasks, statuses, limit=4):
+    ids = [task["id"] for task in tasks if task.get("status") in statuses]
+    if len(ids) > limit:
+        return ids[:limit] + ["+{} more".format(len(ids) - limit)]
+    return ids
+
+
+def render_next_actions(relay_dir):
+    tasks = load_all_tasks(relay_dir)
+    review = [task for task in tasks if task.get("status") == "needs_review"]
+    decisions = bounded_ids(tasks, {"needs_decision"}, limit=3)
+    lines = ["Next actions:"]
+    for task in review[:3]:
+        path = report_path(relay_dir, task["id"], task.get("attempt", 1))
+        lines.append("- review {}: {}".format(
+            task["id"], os.path.relpath(path, project_root(relay_dir)),
+        ))
+    if len(review) > 3:
+        lines.append("- review: +{} more".format(len(review) - 3))
+    if decisions:
+        lines.append("- decide: " + ", ".join(decisions))
+    if not review and not decisions:
+        if any(task.get("status") == "queued" for task in tasks):
+            lines.append("- run: relay orchestrator brief --phase run")
+            lines.append("- then: relay run")
+        elif not tasks:
+            lines.append("- create: relay orchestrator brief --phase plan")
+            lines.append("- then: relay task create --title TITLE")
+        else:
+            lines.append("- no queued, needs_review, or needs_decision tasks")
+    return "\n".join(lines)
+
+
+def say_next_actions(relay_dir):
+    say(render_next_actions(relay_dir))
+
+
 def cmd_task_show(args):
     relay_dir = require_relay_dir()
     task = load_task(relay_dir, args.id, include_archive=True)
     say(json.dumps(task, indent=2))
+    say_next_actions(relay_dir)
 
 
 def append_md_section(relay_dir, task_id, section, text):
@@ -610,6 +773,7 @@ def ensure_not_live(task):
 def cmd_task_accept(args):
     require_orchestrator()
     relay_dir = require_relay_dir()
+    accept_requires_brief = configured_accept_requires_brief(load_config(relay_dir))
     with task_lock(relay_dir, args.id):
         task = load_task(relay_dir, args.id)
         ensure_not_live(task)
@@ -617,9 +781,30 @@ def cmd_task_accept(args):
             die("{} has unresolved scope violations".format(task["id"]))
         if task["status"] != "needs_review":
             die("{} is {}, not needs_review".format(task["id"], task["status"]))
+        token_path = review_token_path(relay_dir, task["id"])
+        if accept_requires_brief:
+            stored = None
+            if os.path.isfile(token_path):
+                try:
+                    stored = read_json(token_path)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    stored = None
+            if (
+                    not args.brief
+                    or not isinstance(stored, dict)
+                    or stored.get("task_id") != task["id"]
+                    or stored.get("attempt") != task.get("attempt", 1)
+                    or stored.get("token") != args.brief):
+                die(
+                    "a fresh review-phase brief token is required; run `relay "
+                    "orchestrator brief --phase review {}`, then pass its token as "
+                    "`--brief TOKEN`".format(task["id"])
+                )
         task["status"] = "done"
         record(task, "accepted", note=args.note or "")
         save_task(relay_dir, task)
+        if accept_requires_brief:
+            os.unlink(token_path)
     say("{} accepted".format(task["id"]))
 
 
@@ -652,6 +837,7 @@ def cmd_task_return(args):
         task.pop("last_note", None)
         record(task, "returned", reason=args.reason)
         save_task(relay_dir, task)
+        invalidate_review_token(relay_dir, task["id"])
         append_md_section(
             relay_dir, task["id"], "Review feedback",
             "- attempt %d: %s" % (previous_attempt, args.reason),
@@ -672,6 +858,7 @@ def cmd_task_decide(args):
         task.pop("last_note", None)
         record(task, "decided", answer=args.answer)
         save_task(relay_dir, task)
+        invalidate_review_token(relay_dir, task["id"])
         append_md_section(relay_dir, task["id"], "Decisions", "- " + args.answer)
     say("{} answered and re-queued".format(task["id"]))
 
@@ -690,6 +877,7 @@ def cmd_task_cancel(args):
             task["status"] = "cancelled"
             record(task, "cancelled", reason=args.reason or "")
             save_task(relay_dir, task)
+            invalidate_review_token(relay_dir, task["id"])
     say("{} cancelled".format(task["id"]))
 
 
@@ -702,6 +890,8 @@ def cmd_task_finish(args):
         die("task finish is available only inside a leased worker process")
     if worker_id != args.id:
         die("a worker may finish only its assigned task: {}".format(worker_id))
+    config = load_config(relay_dir)
+    finish_requires_brief = configured_finish_requires_brief(config)
     with task_lock(relay_dir, args.id):
         task = load_task(relay_dir, args.id)
         attempt = task.get("attempt", 1)
@@ -711,6 +901,27 @@ def cmd_task_finish(args):
             die("worker lease does not match current task lease")
         if task["status"] != "running":
             die("{} is {}, not running".format(task["id"], task["status"]))
+        token_path = brief_token_path(relay_dir, task["id"])
+        if finish_requires_brief:
+            stored = None
+            if os.path.isfile(token_path):
+                try:
+                    stored = read_json(token_path)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    stored = None
+            if (
+                    not args.brief
+                    or not isinstance(stored, dict)
+                    or stored.get("task_id") != task["id"]
+                    or stored.get("attempt") != attempt
+                    or stored.get("lease") != worker_lease
+                    or stored.get("token") != args.brief):
+                die(
+                    "a fresh report-phase brief token is required; run `relay task brief {} "
+                    "--phase report`, then pass its token as `--brief TOKEN`".format(
+                        task["id"],
+                    )
+                )
         report = report_path(relay_dir, task["id"], attempt)
         if args.status == "needs_review" and not report_is_ready(report):
             die("write a non-empty regular report before requesting review")
@@ -728,7 +939,463 @@ def cmd_task_finish(args):
             "lease": worker_lease,
             "changed_paths": changed_paths,
         })
+        if finish_requires_brief:
+            os.unlink(token_path)
     say("{} submitted {}".format(task["id"], args.status))
+
+
+PHASE_CHECKLISTS = {
+    "edit": (
+        "## Edit phase checklist\n"
+        "- Make the smallest change that meets the acceptance criteria.\n"
+        "- Change only Git-visible files inside the task scope."
+    ),
+    "verify": (
+        "## Verify phase checklist\n"
+        "- Run only the verification commands in the task spec.\n"
+        "- Record each command's pass or fail result and relevant output."
+    ),
+    "report": (
+        "## Report phase checklist\n"
+        "- Write the report with Result, Changes, Verification, and Decisions and risks.\n"
+        "- Declare every exact project-relative changed path with repeated --changed PATH.\n"
+        "- Use only needs_review, needs_decision, blocked, or failed."
+    ),
+}
+
+
+def cmd_task_brief(args):
+    relay_dir = require_relay_dir()
+    worker_id = os.environ.get("RELAY_TASK_ID")
+    worker_attempt = os.environ.get("RELAY_ATTEMPT")
+    worker_lease = os.environ.get("RELAY_LEASE")
+    if not worker_id or not worker_lease:
+        die("task brief is available only inside a leased worker process")
+    if worker_id != args.id:
+        die("a worker may brief only its assigned task: {}".format(worker_id))
+    token = None
+    with task_lock(relay_dir, args.id):
+        task = load_task(relay_dir, args.id)
+        attempt = task.get("attempt", 1)
+        if worker_attempt != str(attempt):
+            die("worker attempt does not match current task attempt")
+        if task.get("runner", {}).get("lease") != worker_lease:
+            die("worker lease does not match current task lease")
+        if task["status"] != "running":
+            die("{} is {}, not running".format(task["id"], task["status"]))
+        path = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt)
+        with open(path, encoding="utf-8") as source:
+            stored_brief = source.read()
+        _digest, separator, capsule = stored_brief.partition("\n\n")
+        if not separator or not capsule.startswith("# Critical Context Capsule"):
+            die("current attempt capsule is missing or invalid; rerun the task")
+        if args.phase == "report":
+            import secrets
+
+            token = secrets.token_hex(32)
+            atomic_json(brief_token_path(relay_dir, task["id"]), {
+                "task_id": task["id"],
+                "attempt": attempt,
+                "lease": worker_lease,
+                "token": token,
+            })
+    say(capsule)
+    say()
+    say(PHASE_CHECKLISTS[args.phase])
+    if token:
+        say("Brief token: " + token)
+
+
+def read_handoff(relay_dir):
+    path = orchestrator_handoff_path(relay_dir)
+    if not os.path.exists(path):
+        return ""
+    if os.path.islink(path) or not os.path.isfile(path):
+        die("orchestrator handoff must be a regular file")
+    with open(path, encoding="utf-8") as source:
+        return source.read()[:8000]
+
+
+def handoff_field(content, name, default=""):
+    match = re.search(r"^{}:[ \t]*(.*)$".format(re.escape(name)), content, re.MULTILINE)
+    return match.group(1).strip() if match else default
+
+
+def handoff_done_ids(content):
+    match = re.search(r"^done:[ \t]*\n((?:^- .*(?:\n|$))*)", content, re.MULTILINE)
+    if not match:
+        return set()
+    return {
+        line[2:].split(":", 1)[0].strip()
+        for line in match.group(1).splitlines()
+        if line.startswith("- ") and ":" in line
+    }
+
+
+def limited_lines(values, limit=8):
+    rendered = [str(value).replace("\n", " ")[:240] for value in values]
+    if len(rendered) > limit:
+        rendered = rendered[:limit] + ["+{} more".format(len(rendered) - limit)]
+    return rendered or ["(none)"]
+
+
+def orchestrator_start_brief(relay_dir, tasks, consume_handoff=True):
+    say("Orchestrator role:")
+    say("- Translate the user goal into small, observable tasks.")
+    say("- Run only non-conflicting work and resolve worker decisions.")
+    say("- Review reports and diffs before accepting any task.")
+    say("\nHarness memory:")
+    say("- Choose inherited memory/rules or a clean start; no change is applied automatically.")
+    say('- Claude Code: disable auto-memory via settings "autoMemoryEnabled": false, env CLAUDE_CODE_DISABLE_AUTO_MEMORY=1, or the /memory toggle.')
+    say('- Skip loaded CLAUDE.md files with "claudeMdExcludes" globs; managed-policy CLAUDE.md cannot be excluded.')
+    say("- claude --bare = strongest clean start but ALSO disables hooks (conflicts with hook-based injection).")
+    say("- Hermes: add --ignore-rules to the command (keeps model config).")
+    say("- Do not use --safe-mode: it drops user config, including the configured model.")
+    say("- `hermes memory reset` is destructive.")
+    say("- Workers launched by this framework are already clean by default via the config worker command.")
+    if consume_handoff:
+        with file_lock(lock_path(relay_dir, "orchestrator-handoff")):
+            handoff = read_handoff(relay_dir)
+            if handoff:
+                consumed = now()
+                if re.search(r"^consumed_at:.*$", handoff, re.MULTILINE):
+                    handoff = re.sub(
+                        r"^consumed_at:.*$", "consumed_at: " + consumed,
+                        handoff, count=1, flags=re.MULTILINE,
+                    )
+                else:
+                    handoff = handoff.rstrip() + "\nconsumed_at: " + consumed + "\n"
+                atomic_write(orchestrator_handoff_path(relay_dir), handoff)
+    else:
+        handoff = read_handoff(relay_dir)
+    if handoff:
+        say("\nCurrent handoff:")
+        say(handoff.rstrip())
+    counts = {}
+    for task in tasks:
+        counts[task["status"]] = counts.get(task["status"], 0) + 1
+    say("\nTask counts: " + (
+        ", ".join("{}={}".format(*item) for item in sorted(counts.items())) or "none"
+    ))
+    decisions = bounded_ids(tasks, {"needs_decision"})
+    reviews = bounded_ids(tasks, {"needs_review"})
+    say("Needs decision: " + (", ".join(decisions) or "none"))
+    say("Needs review: " + (", ".join(reviews) or "none"))
+    if decisions:
+        command = "relay task decide {} --answer ANSWER".format(decisions[0])
+    elif reviews:
+        command = "relay orchestrator brief --phase review {}".format(reviews[0])
+    elif any(task.get("status") == "queued" for task in tasks):
+        command = "relay orchestrator brief --phase run"
+    else:
+        command = "relay orchestrator brief --phase plan"
+    say("Recommended next command: " + command)
+
+
+def orchestrator_plan_brief(tasks):
+    say("Task-spec quality checklist:")
+    say("- One clear outcome.")
+    say("- Observable acceptance criteria.")
+    say("- Only needed paths and context.")
+    say("- Exact targeted verification commands.")
+    say("- Explicit permissions for dependencies or sensitive changes.")
+    say("Queued/blocked graph:")
+    graph = [task for task in tasks if task.get("status") in {"queued", "blocked"}]
+    for task in graph[:12]:
+        dependencies = ",".join(task.get("depends_on", [])) or "none"
+        say("- {} [{}] depends_on: {}".format(
+            task["id"], task["status"], dependencies,
+        ))
+    if len(graph) > 12:
+        say("- +{} more".format(len(graph) - 12))
+    if not graph:
+        say("- (none)")
+
+
+def latest_worker_exit(task):
+    for entry in reversed(task.get("history", [])):
+        if entry.get("event") == "worker_exited":
+            return entry
+    return {}
+
+
+def orchestrator_review_brief(relay_dir, task_id):
+    import secrets
+
+    with task_lock(relay_dir, task_id):
+        task = load_task(relay_dir, task_id)
+        if task.get("status") != "needs_review":
+            die("{} is {}, not needs_review".format(task["id"], task.get("status")))
+        attempt = task.get("attempt", 1)
+        config = load_config(relay_dir)
+        with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+            capsule = compile_context_capsule(
+                task, source.read(), configured_capsule_max_chars(config),
+            )
+        result = {}
+        result_file = result_path(relay_dir, task["id"], attempt)
+        if os.path.isfile(result_file):
+            try:
+                result = read_json(result_file)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                result = {}
+        observed = latest_worker_exit(task).get("observed_paths")
+        token = secrets.token_hex(32)
+        atomic_json(review_token_path(relay_dir, task["id"]), {
+            "task_id": task["id"], "attempt": attempt, "token": token,
+        })
+    root = project_root(relay_dir)
+    report = report_path(relay_dir, task["id"], attempt)
+    diff = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.diff" % attempt)
+    say(capsule)
+    say("\nReview artifacts:")
+    say("- Report: " + os.path.relpath(report, root))
+    say("- Diff: " + os.path.relpath(diff, root))
+    declared = result.get("changed_paths") if isinstance(result, dict) else None
+    say("- Declared changed paths: " + (
+        ", ".join(declared) if isinstance(declared, list) and declared else "(none)"
+    ))
+    say("- Observed changed paths: " + (
+        ", ".join(observed) if isinstance(observed, list) and observed else "(none recorded)"
+    ))
+    say("Review checklist:")
+    say("- Compare the report, diff, and declared/observed paths to the criteria.")
+    say("- Verify the reported checks and inspect risky full files when needed.")
+    say("- Accept with this token, return with a concrete reason, or decide a question.")
+    say("Review token: " + token)
+
+
+def orchestrator_run_brief(relay_dir, tasks):
+    config = load_config(relay_dir)
+    max_parallel, _timeout = configured_limits(config)
+    archived = load_archived_tasks(relay_dir)
+    busy_scopes = [task.get("scope", []) for task in tasks
+                   if task.get("status") == "running"]
+    wave, skipped = pick_wave(tasks, archived, [], max_parallel, busy_scopes)
+    say("Would run: " + (", ".join(task["id"] for task in wave) or "(nothing)"))
+    cautions = [(task_id, reason) for task_id, reason in skipped
+                if "scope conflicts" in reason or "waiting on" in reason]
+    say("Cautions:")
+    for task_id, reason in cautions[:10]:
+        say("- {}: {}".format(task_id, reason))
+    if len(cautions) > 10:
+        say("- +{} more".format(len(cautions) - 10))
+    if not cautions:
+        say("- none")
+
+
+def orchestrator_close_brief(relay_dir, tasks):
+    with file_lock(lock_path(relay_dir, "orchestrator-handoff")):
+        previous = read_handoff(relay_dir)
+        previous_at = handoff_field(previous, "generated_at")
+        previous_done = handoff_done_ids(previous)
+        goal = (handoff_field(previous, "goal", "(fill in)") or "(fill in)")
+        goal = goal.replace("\n", " ")[:240]
+        done = {}
+        decisions = []
+        for task in tasks + load_archived_tasks(relay_dir):
+            for entry in task.get("history", []):
+                if entry.get("event") == "accepted" and (
+                        not previous_at or entry.get("at", "") >= previous_at):
+                    if task["id"] not in previous_done:
+                        done[task["id"]] = "{}: {}".format(
+                            task["id"], task.get("title", ""),
+                        )
+                if entry.get("event") == "decided":
+                    decisions.append((entry.get("at", ""), "{}: {}".format(
+                        task["id"], entry.get("answer", ""),
+                    )))
+        decisions = [text for _at, text in sorted(decisions, reverse=True)[:8]]
+        next_ids = [task["id"] for task in tasks
+                    if task.get("status") in {"queued", "needs_review"}]
+        unresolved = [task["id"] for task in tasks
+                      if task.get("status") == "needs_decision"]
+        sections = [
+            "# Orchestrator handoff", "generated_at: " + now(),
+            "consumed_at: (not yet)", "goal: " + goal,
+        ]
+        for name, values in (
+                ("done", sorted(done.values())), ("decisions", decisions),
+                ("next", next_ids), ("unresolved", unresolved),
+                ("avoid", ["(fill in)"])):
+            sections.append(name + ":")
+            sections.extend("- " + line for line in limited_lines(values))
+        content = "\n".join(sections) + "\n"
+        atomic_write(orchestrator_handoff_path(relay_dir), content)
+    say(content.rstrip())
+    say("Start a fresh session, then run: relay orchestrator brief --phase start")
+
+
+def cmd_orchestrator_brief(args):
+    require_orchestrator()
+    relay_dir = require_relay_dir()
+    tasks = load_all_tasks(relay_dir)
+    if args.phase == "review":
+        if not args.id:
+            die("review phase requires a task id")
+        orchestrator_review_brief(relay_dir, args.id)
+    elif args.id:
+        die("a task id is valid only for the review phase")
+    elif args.phase == "start":
+        orchestrator_start_brief(relay_dir, tasks)
+    elif args.phase == "plan":
+        orchestrator_plan_brief(tasks)
+    elif args.phase == "run":
+        orchestrator_run_brief(relay_dir, tasks)
+    else:
+        orchestrator_close_brief(relay_dir, tasks)
+
+
+def claude_code_hook_fragment():
+    return {
+        "hooks": {
+            event: [{"hooks": [{"type": "command", "command": command}]}]
+            for event, command in CLAUDE_HOOK_COMMANDS.items()
+        },
+    }
+
+
+def claude_hook_command_is_registered(entries, command):
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        hooks = entry.get("hooks")
+        if not isinstance(hooks, list):
+            continue
+        if any(isinstance(hook, dict) and hook.get("command") == command for hook in hooks):
+            return True
+    return False
+
+
+def cmd_hooks_claude_code(args):
+    require_orchestrator()
+    relay_dir = require_relay_dir()
+    fragment = claude_code_hook_fragment()
+    if not args.write:
+        say(json.dumps(fragment, indent=2))
+        say("Merge this fragment into .claude/settings.json, or rerun with --write.")
+        return
+
+    root = project_root(relay_dir)
+    claude_dir = os.path.join(root, ".claude")
+    settings_path = os.path.join(claude_dir, "settings.json")
+    if os.path.lexists(claude_dir) and (
+            os.path.islink(claude_dir) or not os.path.isdir(claude_dir)):
+        die(".claude must be a real directory inside the project")
+    if os.path.lexists(settings_path) and (
+            os.path.islink(settings_path) or not os.path.isfile(settings_path)):
+        die(".claude/settings.json must be a regular file")
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as source:
+                settings = json.load(source)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            die("cannot parse .claude/settings.json: {}".format(error))
+        if not isinstance(settings, dict):
+            die(".claude/settings.json must contain a JSON object")
+    else:
+        settings = {}
+
+    hooks = settings.get("hooks")
+    if hooks is None:
+        hooks = {}
+        settings["hooks"] = hooks
+    if not isinstance(hooks, dict):
+        die('.claude/settings.json "hooks" must be a JSON object')
+    for event, command in CLAUDE_HOOK_COMMANDS.items():
+        entries = hooks.get(event)
+        if entries is None:
+            entries = []
+            hooks[event] = entries
+        if not isinstance(entries, list):
+            die('.claude/settings.json hooks.{} must be a JSON array'.format(event))
+        if not claude_hook_command_is_registered(entries, command):
+            entries.append(fragment["hooks"][event][0])
+    atomic_json(settings_path, settings)
+    say("updated .claude/settings.json")
+
+
+def cap_hook_output(text, maximum=HOOK_OUTPUT_MAX_CHARS):
+    if len(text) <= maximum:
+        return text
+    trailing_newline = "\n" if text.endswith("\n") else ""
+    lines = text.rstrip("\n").split("\n")
+    if len(lines) < 2:
+        return ""
+    first, last = lines[0], lines[-1]
+    suffix = "\n(truncated)\n" + last + trailing_newline
+    if len(first) + len(suffix) > maximum:
+        return ""
+    available = maximum - len(first) - len(suffix)
+    middle = "\n".join(lines[1:-1])
+    prefix = middle[:max(0, available - 1)].rstrip("\n")
+    return first + (("\n" + prefix) if prefix else "") + suffix
+
+
+def claude_user_prompt_output(context):
+    def encode(value):
+        return json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": value,
+            },
+        }, separators=(",", ":")) + "\n"
+
+    output = encode(context)
+    if len(output) <= HOOK_OUTPUT_MAX_CHARS:
+        return output
+    low, high = 0, len(context) - 1
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        capped = cap_hook_output(context, middle)
+        if not capped and context:
+            low = middle + 1
+            continue
+        candidate = encode(capped)
+        if len(candidate) <= HOOK_OUTPUT_MAX_CHARS:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def cmd_hook_event(args):
+    require_orchestrator()
+    try:
+        raw_input = sys.stdin.read()
+        if raw_input:
+            try:
+                json.loads(raw_input)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+        captured_out = io.StringIO()
+        captured_error = io.StringIO()
+        with redirect_stdout(captured_out), redirect_stderr(captured_error):
+            relay_dir = find_relay_dir()
+            if not relay_dir:
+                return
+            runtime_paths_are_safe(relay_dir)
+            required_files = ("relay", "orchestrator.md", "config.toml")
+            if any(not os.path.isfile(os.path.join(relay_dir, name))
+                   for name in required_files):
+                return
+            if not os.path.isdir(tasks_dir(relay_dir)):
+                return
+            tasks = load_all_tasks(relay_dir)
+            if args.name == "session-start":
+                orchestrator_start_brief(relay_dir, tasks, consume_handoff=False)
+            else:
+                context = "attention-relay state:\n" + render_next_actions(relay_dir)
+        if args.name == "session-start":
+            output = cap_hook_output(captured_out.getvalue())
+        else:
+            output = claude_user_prompt_output(context)
+        if output:
+            sys.stdout.write(output)
+    except (Exception, SystemExit):
+        return
 
 
 def cmd_task_unlock(args):
@@ -788,10 +1455,10 @@ def git_submodule_paths(root):
 
 def require_git_root(root):
     if not is_git_repo(root):
-        die("Agent Relay requires a Git repository")
+        die("Attention Relay requires a Git repository")
     top_level = git_checked(root, "rev-parse", "--show-toplevel").strip()
     if os.path.realpath(root) != os.path.realpath(top_level):
-        die("Agent Relay must run from the Git worktree root: {}".format(top_level))
+        die("Attention Relay must run from the Git worktree root: {}".format(top_level))
     submodules = git_submodule_paths(root)
     if submodules:
         die("tracked Git submodules are unsupported: " + ", ".join(submodules))
@@ -806,7 +1473,7 @@ def git_checked(root, *arguments, env=None, text=True):
 
 
 def git_snapshot(root):
-    fd, index_path = tempfile.mkstemp(prefix="agent-relay-index-")
+    fd, index_path = tempfile.mkstemp(prefix="attention-relay-index-")
     os.close(fd)
     os.unlink(index_path)
     env = dict(os.environ, GIT_INDEX_FILE=index_path)
@@ -892,7 +1559,7 @@ def terminate_process_group(pid, grace=0.5):
     terminate_process_groups([pid], grace)
 
 
-WORKER_PROMPT = """Agent Relay worker: {id}, attempt {attempt}
+WORKER_PROMPT = """Attention Relay worker: {id}, attempt {attempt}
 Project: {root}
 Scope: {scope}
 
@@ -900,14 +1567,16 @@ Read and follow:
 - {relay_dir}/worker.md
 - {relay_dir}/tasks/{id}.md{previous}
 
-Write the report to {report}, then run with every exact changed path:
-python3 {relay_dir}/relay task finish {id} --status needs_review [--changed PATH ...]
+Immediately before writing the report, run:
+python3 {relay_dir}/relay task brief {id} --phase report
+Write the report to {report}, then finish with its Brief token and every exact changed path:
+python3 {relay_dir}/relay task finish {id} --status needs_review --brief TOKEN [--changed PATH ...]
 Use needs_decision, blocked, or failed instead when needed.
 Other workers may be active. Run only the targeted checks in the task spec.
 """
 
 
-def build_prompt(relay_dir, task):
+def build_prompt(relay_dir, task, capsule_max_chars=4000, capsule=None):
     root = project_root(relay_dir)
     relative_relay = os.path.relpath(relay_dir, root)
     attempt = task.get("attempt", 1)
@@ -916,22 +1585,36 @@ def build_prompt(relay_dir, task):
         previous = "\n- %s/work/%s/attempt-%d.report.md" % (
             relative_relay, task["id"], attempt - 1,
         )
-    return WORKER_PROMPT.format(
+    if capsule is None:
+        with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+            capsule = compile_context_capsule(task, source.read(), capsule_max_chars)
+    mechanics = WORKER_PROMPT.format(
         id=task["id"], attempt=attempt, root=root,
         scope=", ".join(task.get("scope", [])) or "whole project",
         relay_dir=relative_relay, previous=previous,
         report=os.path.relpath(report_path(relay_dir, task["id"], attempt), root),
+    ).strip()
+    return (
+        capsule + "\n\n" + mechanics
+        + "\n\n## Re-read before acting (same capsule, repeated on purpose)\n\n"
+        + capsule
     )
 
 
 def prepare_worker(relay_dir, config, task):
     root = project_root(relay_dir)
     attempt = task.get("attempt", 1)
+    capsule_max_chars = configured_capsule_max_chars(config)
+    with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+        capsule = compile_context_capsule(task, source.read(), capsule_max_chars)
+    prompt = build_prompt(relay_dir, task, capsule_max_chars, capsule=capsule)
     directory = work_dir(relay_dir, task["id"])
     os.makedirs(directory, exist_ok=True)
-    prompt = build_prompt(relay_dir, task)
     prompt_file = os.path.join(directory, "attempt-%d.prompt.md" % attempt)
-    atomic_write(prompt_file, prompt + "\n")
+    atomic_write(prompt_file, prompt)
+    digest = hashlib.sha256(capsule.encode("utf-8")).hexdigest()
+    brief_file = os.path.join(directory, "attempt-%d.brief.md" % attempt)
+    atomic_write(brief_file, "Content digest: sha256:{}\n\n{}".format(digest, capsule))
     result = result_path(relay_dir, task["id"], attempt)
     if os.path.exists(result):
         raise ValueError("result already exists for %s attempt %d" % (task["id"], attempt))
@@ -1116,6 +1799,7 @@ def finalize_task(
         record(
             current, "worker_exited", status=status,
             exit_code=outcome.get("returncode"), note=note,
+            declared_paths=declared_paths, observed_paths=list(observed_paths),
         )
         save_task(relay_dir, current)
     say("[{}] {}{}".format(
@@ -1178,6 +1862,8 @@ def cmd_run(args):
     finally:
         for item, handler in previous.items():
             signal.signal(item, handler)
+        if not args.dry_run:
+            say_next_actions(relay_dir)
 
 
 def run_wave(args, relay_dir, context):
@@ -1309,7 +1995,6 @@ def run_wave(args, relay_dir, context):
             relay_dir, task, outcomes[task["id"]], violations, observed,
             before_tree, context["lease"],
         )
-    say("review each report and diff, then accept, return, or decide")
     if interrupted:
         raise SystemExit(interrupted_code)
 
@@ -1331,6 +2016,7 @@ def cmd_status(args):
         elif task["status"] in WORKER_FINAL:
             note = " - " + task["last_note"] if task.get("last_note") else ""
             say("  attention: {} ({}){}".format(task["id"], task["status"], note))
+    say_next_actions(relay_dir)
 
 
 def dependency_cycles(tasks):
@@ -1358,7 +2044,7 @@ def dependency_cycles(tasks):
     return cycles
 
 
-def task_problems(relay_dir, task, known_tasks):
+def task_problems(relay_dir, task, known_tasks, capsule_max_chars=None):
     problems = []
     task_id = task.get("id")
     prefix = str(task_id or "unknown") + ": "
@@ -1426,6 +2112,14 @@ def task_problems(relay_dir, task, known_tasks):
             problems.append(prefix + "scope violation baseline is missing")
     elif task.get("scope_baseline"):
         problems.append(prefix + "scope baseline exists without violations")
+    if valid_id and task.get("status") == "queued" and capsule_max_chars is not None:
+        spec_path = task_md_path(relay_dir, task_id)
+        if os.path.exists(spec_path):
+            try:
+                with open(spec_path, encoding="utf-8") as source:
+                    compile_context_capsule(task, source.read(), capsule_max_chars)
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                problems.append(str(error))
     return problems
 
 
@@ -1448,9 +2142,13 @@ def cmd_validate(args):
                 )
         except RuntimeError as error:
             problems.append("repository: " + str(error))
+    capsule_max_chars = None
     try:
         config = load_config(relay_dir)
         configured_limits(config)
+        capsule_max_chars = configured_capsule_max_chars(config)
+        configured_finish_requires_brief(config)
+        configured_accept_requires_brief(config)
         sample = {"tier": "default"}
         template = command_template(config, sample)
         if not isinstance(template, str) or not template.strip():
@@ -1467,8 +2165,8 @@ def cmd_validate(args):
                 problems.append("config: worker command needs one prompt placeholder")
             if embedded:
                 problems.append("config: prompt placeholder must be a complete argument")
-    except (SystemExit, ValueError):
-        problems.append("config: invalid")
+    except (SystemExit, ValueError) as error:
+        problems.append("config: {}".format(error))
     try:
         active = load_all_tasks(relay_dir)
         archived = load_archived_tasks(relay_dir)
@@ -1503,7 +2201,9 @@ def cmd_validate(args):
                 )
             seen_numbers[number] = task_id
     for task in active:
-        problems.extend(task_problems(relay_dir, task, known))
+        problems.extend(task_problems(
+            relay_dir, task, known, capsule_max_chars=capsule_max_chars,
+        ))
         task_id = task.get("id")
         if isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id):
             if not os.path.exists(task_md_path(relay_dir, task_id)):
@@ -1678,16 +2378,16 @@ def cmd_init(args):
             updated += "\n"
         updated += RELAY_DIRNAME + "/\n"
         atomic_write(gitignore, updated)
-        say("added .agent-relay/ to .gitignore")
+        say("added .attention-relay/ to .gitignore")
     say("initialized {}".format(relay_dir))
-    say("next: edit .agent-relay/config.toml, then ask your agent to read .agent-relay/orchestrator.md")
+    say("next: have your agent read .attention-relay/orchestrator.md and run .attention-relay/relay orchestrator brief --phase start")
 
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="relay", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    command = commands.add_parser("init", help="install Agent Relay in a Git project")
+    command = commands.add_parser("init", help="install Attention Relay in a Git project")
     command.add_argument("path", nargs="?", help="project directory (default: .)")
     command.add_argument("--force", action="store_true", help="refresh relay and its manuals")
     command.set_defaults(function=cmd_init)
@@ -1713,6 +2413,7 @@ def build_parser():
     command = task_commands.add_parser("accept", help="approve reviewed work")
     command.add_argument("id")
     command.add_argument("--note")
+    command.add_argument("--brief")
     command.set_defaults(function=cmd_task_accept)
 
     command = task_commands.add_parser("return", help="queue another attempt")
@@ -1735,7 +2436,13 @@ def build_parser():
     command.add_argument("--status", required=True, choices=WORKER_FINAL)
     command.add_argument("--note")
     command.add_argument("--changed", action="append", default=[])
+    command.add_argument("--brief")
     command.set_defaults(function=cmd_task_finish)
+
+    command = task_commands.add_parser("brief", help="reprint the worker capsule and phase checklist")
+    command.add_argument("id")
+    command.add_argument("--phase", required=True, choices=("edit", "verify", "report"))
+    command.set_defaults(function=cmd_task_brief)
 
     command = task_commands.add_parser("unlock", help="clear a stale runner")
     command.add_argument("id")
@@ -1755,6 +2462,31 @@ def build_parser():
 
     command = commands.add_parser("archive", help="archive done and cancelled tasks")
     command.set_defaults(function=cmd_archive)
+
+    orchestrator = commands.add_parser("orchestrator", help="orchestrator phase briefs")
+    orchestrator_commands = orchestrator.add_subparsers(
+        dest="orchestrator_command", required=True,
+    )
+    command = orchestrator_commands.add_parser(
+        "brief", help="print a state-derived orchestrator phase brief",
+    )
+    command.add_argument(
+        "--phase", required=True, choices=("start", "plan", "run", "review", "close"),
+    )
+    command.add_argument("id", nargs="?")
+    command.set_defaults(function=cmd_orchestrator_brief)
+
+    hooks = commands.add_parser("hooks", help="configure optional host integrations")
+    hook_commands = hooks.add_subparsers(dest="hooks_command", required=True)
+    command = hook_commands.add_parser(
+        "claude-code", help="print or install Claude Code hook settings",
+    )
+    command.add_argument("--write", action="store_true")
+    command.set_defaults(function=cmd_hooks_claude_code)
+
+    command = commands.add_parser("hook-event", help=argparse.SUPPRESS)
+    command.add_argument("name", choices=("session-start", "user-prompt-submit"))
+    command.set_defaults(function=cmd_hook_event)
 
     memory = commands.add_parser("memory", help="manage indexed project memory")
     memory_commands = memory.add_subparsers(dest="memory_command", required=True)

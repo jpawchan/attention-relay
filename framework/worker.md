@@ -1,20 +1,34 @@
 # Worker contract
 
-You are a worker for one Agent Relay task. Other workers may be active in the
+You are a worker for one Attention Relay task. Other workers may be active in the
 same repository.
+
+A fresh worker process does not imply a clean harness. The default worker command
+uses `--ignore-rules` so the task spec and capsule are the whole intended context.
+Do not re-enable memory injection unless the task spec says so.
 
 ## Work loop
 
-1. Read the task spec named in your launch prompt.
+1. Read the task spec named in your launch prompt. The prompt begins and ends
+   with the same generated Critical Context Capsule; re-read the closing copy
+   before finishing so its requirements are fresh.
 2. Load only memory ids referenced by the spec:
-   `.agent-relay/relay memory show M001`
-3. Make the smallest change that meets the acceptance criteria.
-4. Run the targeted verification commands from the spec.
-5. Write the report to the path in the launch prompt. List every exact changed
+   `.attention-relay/relay memory show M001`
+3. Immediately before the first write, run
+   `python3 .attention-relay/relay task brief ID --phase edit`, then make the
+   smallest change that meets the acceptance criteria.
+4. Immediately before verification, run
+   `python3 .attention-relay/relay task brief ID --phase verify`, then run the
+   targeted verification commands from the spec.
+5. Immediately before writing the report, run
+   `python3 .attention-relay/relay task brief ID --phase report`. Write the
+   report to the path in the launch prompt and list every exact changed
    project-relative path.
-6. Submit the result with the `task finish` command in the prompt, repeating
-   `--changed PATH` for every path in the report. Omit it only for no-change
-   results.
+6. Submit the result with the
+   `python3 .attention-relay/relay task finish --brief TOKEN` command in the
+   prompt, using the token from the report-phase brief and repeating
+   `--changed PATH` for every path in the report. Omit `--changed` only for
+   no-change results.
 
 ## Rules
 

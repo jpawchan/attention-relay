@@ -1,11 +1,11 @@
-# Review and improve Agent Relay
+# Review and improve Attention Relay
 
-You have write access to an Agent Relay implementation. Test it, fix confirmed
+You have write access to an Attention Relay implementation. Test it, fix confirmed
 bugs, remove unnecessary code, and leave it ready for use. Do not stop at a
 review report.
 
-Agent Relay is a Python 3.11+ CLI for Git projects on macOS and Linux. It uses no
-third-party Python packages and creates `.agent-relay/` with:
+Attention Relay is a Python 3.11+ CLI for Git projects on macOS and Linux. It uses no
+third-party Python packages and creates `.attention-relay/` with:
 
 ```text
 relay
@@ -45,6 +45,19 @@ Check these behaviors with temporary Git repositories and stub workers:
     outside diff guarantees and forbidden by the worker contract.
 13. Archive preflights all destinations and defers termination signals until
     every move completes or rolls back.
+14. Critical Context Capsules reject empty or placeholder task sections, enforce
+    the configured character budget without truncation, and save byte-identical
+    edge copies with the correct SHA-256 digest.
+15. Finish and accept brief tokens are bound to the current task and attempt;
+    finish tokens are also lease-bound. Replacement, replay, and stale tokens
+    are rejected without consumption, successful use consumes the token, and
+    return, decide, and cancel invalidate review tokens.
+16. Orchestrator handoff writes and start-phase consumption are atomic. Start
+    marks the handoff consumed without deleting it.
+17. Claude Code hook adapters cap their output and fail open without stdout or
+    stderr when Relay state is missing or broken.
+18. Claude Code settings merges are idempotent and do not clobber existing
+    settings or hook arrays.
 
 Read the local specification and tests when present. Compare every promise in
 the manuals with actual CLI behavior. Keep the shared-working-tree limitation

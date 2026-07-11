@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""End-to-end tests for Agent Relay."""
+"""End-to-end tests for Attention Relay."""
 
+import hashlib
 import json
 import os
 import runpy
@@ -70,10 +71,16 @@ if marker:
 
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
+brief = subprocess.run(
+    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    cwd=root, check=True, capture_output=True, text=True,
+)
+token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
+             if line.startswith("Brief token: "))
 report.write_text(f"# {tid} report\n\nResult: needs_review\n")
 status = os.environ.get("SUBMIT_STATUS", "needs_review")
 finish = [sys.executable, str(rd / "relay"), "task", "finish", tid,
-          "--status", status]
+          "--status", status, "--brief", token]
 for path in changed:
     finish.extend(["--changed", path])
 subprocess.run(finish, cwd=root, check=True)
@@ -104,9 +111,15 @@ tid = os.environ["RELAY_TASK_ID"]
 attempt = os.environ["RELAY_ATTEMPT"]
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
+brief = subprocess.run(
+    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    cwd=root, check=True, capture_output=True, text=True,
+)
+token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
+             if line.startswith("Brief token: "))
 report.write_text("# no-change report\n")
 subprocess.run([sys.executable, str(rd / "relay"), "task", "finish", tid,
-                "--status", "needs_review"], cwd=root, check=True)
+                "--status", "needs_review", "--brief", token], cwd=root, check=True)
 '''
 
 TIMEOUT_WORKER = r'''
@@ -182,16 +195,23 @@ path.write_text("staged\n")
 subprocess.run(["git", "add", str(path)], cwd=root, check=True)
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
+brief = subprocess.run(
+    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    cwd=root, check=True, capture_output=True, text=True,
+)
+token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
+             if line.startswith("Brief token: "))
 report.write_text("# staged report\n")
 subprocess.run([sys.executable, str(rd / "relay"), "task", "finish", tid,
-                "--status", "needs_review", "--changed", "new/staged.txt"],
+                "--status", "needs_review", "--brief", token,
+                "--changed", "new/staged.txt"],
                cwd=root, check=True)
 '''
 
 
 class RelayTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="agent-relay-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="attention-relay-test-")
         self.base = Path(self.temp.name)
         self.worker_number = 0
 
@@ -232,7 +252,7 @@ class RelayTests(unittest.TestCase):
 
     def relay(self, project, *args, env=None, check=False, timeout=15):
         return self.command(
-            [project / ".agent-relay" / "relay", *args], project,
+            [project / ".attention-relay" / "relay", *args], project,
             env=env, check=check, timeout=timeout,
         )
 
@@ -242,16 +262,18 @@ class RelayTests(unittest.TestCase):
         path.write_text(body)
         return path
 
-    def configure(self, project, worker, max_parallel=3, timeout_minutes: int | float = 1):
+    def configure(self, project, worker, max_parallel=3,
+                  timeout_minutes: int | float = 1, capsule_max_chars=4000):
         command = f"{sys.executable} {worker} {{prompt_file}}"
         config = (
             "[commands]\n"
             f"worker = {json.dumps(command)}\n\n"
             "[limits]\n"
             f"max_parallel = {max_parallel}\n"
+            f"capsule_max_chars = {capsule_max_chars}\n"
             f"worker_timeout_minutes = {timeout_minutes}\n"
         )
-        (project / ".agent-relay" / "config.toml").write_text(config)
+        (project / ".attention-relay" / "config.toml").write_text(config)
 
     def task_create_command(self, title, scope=None, depends_on=None):
         args = ["task", "create", "--title", title]
@@ -264,28 +286,94 @@ class RelayTests(unittest.TestCase):
     def create_task(self, project, title, scope=None, depends_on=None):
         args = self.task_create_command(title, scope, depends_on)
         result = self.relay(project, *args, check=True)
-        return result.stdout.split()[1]
+        task_id = result.stdout.split()[1]
+        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        content = spec.read_text().replace(
+            "Replace this line with one clear outcome.",
+            f"Complete the {title} task.",
+        ).replace(
+            "- Add observable requirements.",
+            "- The targeted task behavior is verified.",
+        )
+        spec.write_text(content)
+        return task_id
 
     def try_create_task(self, project, title, scope=None, depends_on=None):
         args = self.task_create_command(title, scope, depends_on)
         return self.relay(project, *args)
 
     def state(self, project, task_id):
-        path = project / ".agent-relay" / "tasks" / f"{task_id}.json"
+        path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
         return json.loads(path.read_text())
+
+    def lease_task(self, project, task_id, lease):
+        runtime = project / ".attention-relay"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = "running"
+        task["runner"] = {"pid": None, "started_at": "now", "lease": lease}
+        state_path.write_text(json.dumps(task))
+        spec = (runtime / "tasks" / f"{task_id}.md").read_text()
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_brief_probe")
+        capsule = module["compile_context_capsule"](task, spec)
+        digest = hashlib.sha256(capsule.encode()).hexdigest()
+        brief = runtime / "work" / task_id / f"attempt-{task['attempt']}.brief.md"
+        brief.parent.mkdir(parents=True, exist_ok=True)
+        brief.write_text(f"Content digest: sha256:{digest}\n\n{capsule}")
+        return {
+            "RELAY_TASK_ID": task_id,
+            "RELAY_ATTEMPT": str(task["attempt"]),
+            "RELAY_LEASE": lease,
+            "RELAY_DIR": runtime,
+            "RELAY_ROOT": project,
+        }
+
+    def report_brief_token(self, project, task_id, env):
+        brief = self.relay(
+            project, "task", "brief", task_id, "--phase", "report",
+            env=env, check=True,
+        )
+        token = next(
+            line.removeprefix("Brief token: ")
+            for line in brief.stdout.splitlines()
+            if line.startswith("Brief token: ")
+        )
+        return brief, token
+
+    def review_brief_token(self, project, task_id, env=None):
+        brief = self.relay(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+            env=env, check=True,
+        )
+        token = next(
+            line.removeprefix("Review token: ")
+            for line in brief.stdout.splitlines()
+            if line.startswith("Review token: ")
+        )
+        return brief, token
+
+    def accept_task(self, project, task_id):
+        _brief, token = self.review_brief_token(project, task_id)
+        return self.relay(
+            project, "task", "accept", task_id, "--brief", token, check=True,
+        )
 
     def test_init_requires_git_and_creates_only_runtime_files(self):
         plain = self.base / "plain"
         plain.mkdir()
         result = self.command([SOURCE_RELAY, "init", plain], plain)
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((plain / ".agent-relay").exists())
+        self.assertFalse((plain / ".attention-relay").exists())
 
         project = self.make_project()
-        self.command([SOURCE_RELAY, "init", project], project, check=True)
+        initialized = self.command([SOURCE_RELAY, "init", project], project, check=True)
+        self.assertIn(
+            ".attention-relay/relay orchestrator brief --phase start",
+            initialized.stdout,
+        )
         lines = (project / ".gitignore").read_text().splitlines()
-        self.assertEqual(lines.count(".agent-relay/"), 1)
-        runtime = project / ".agent-relay"
+        self.assertEqual(lines.count(".attention-relay/"), 1)
+        runtime = project / ".attention-relay"
         self.assertTrue(os.access(runtime / "relay", os.X_OK))
         self.assertTrue((runtime / "config.toml").exists())
         self.assertFalse((runtime / "config.example.toml").exists())
@@ -302,13 +390,13 @@ class RelayTests(unittest.TestCase):
         nested.mkdir()
         nested_result = self.command([SOURCE_RELAY, "init", nested], nested)
         self.assertNotEqual(nested_result.returncode, 0)
-        self.assertFalse((nested / ".agent-relay").exists())
+        self.assertFalse((nested / ".attention-relay").exists())
 
         symlink_project = self.make_project("symlink-project", initialize=False)
         external = self.base / "external"
         external.mkdir()
         (external / "sentinel").write_text("unchanged\n")
-        (symlink_project / ".agent-relay").symlink_to(
+        (symlink_project / ".attention-relay").symlink_to(
             external, target_is_directory=True,
         )
         escaped = self.command(
@@ -342,7 +430,7 @@ class RelayTests(unittest.TestCase):
             [SOURCE_RELAY, "init", submodule_project], submodule_project,
         )
         self.assertNotEqual(staged_removal.returncode, 0)
-        self.assertFalse((submodule_project / ".agent-relay").exists())
+        self.assertFalse((submodule_project / ".attention-relay").exists())
 
     def test_scope_normalization_and_input_validation(self):
         project = self.make_project()
@@ -395,12 +483,12 @@ class RelayTests(unittest.TestCase):
         self.assertIn(one, run.stdout)
         for task_id in (one, two):
             self.assertEqual(self.state(project, task_id)["status"], "needs_review")
-            work = project / ".agent-relay" / "work" / task_id
+            work = project / ".attention-relay" / "work" / task_id
             self.assertTrue((work / "attempt-1.report.md").stat().st_size)
             diff = (work / "attempt-1.diff").read_text()
             self.assertIn(f"{task_id}.txt", diff)
-        self.relay(project, "task", "accept", one, check=True)
-        self.relay(project, "task", "accept", two, check=True)
+        self.accept_task(project, one)
+        self.accept_task(project, two)
 
     def test_attempt_diff_starts_at_attempt_baseline(self):
         project = self.make_project()
@@ -408,13 +496,13 @@ class RelayTests(unittest.TestCase):
         self.configure(project, worker)
         first = self.create_task(project, "first", ["same/**"])
         self.relay(project, "run", check=True)
-        self.relay(project, "task", "accept", first, check=True)
+        self.accept_task(project, first)
 
         human = project / "same" / "human.txt"
         human.write_text("already here\n")
         second = self.create_task(project, "second", ["same/**"], [first])
         self.relay(project, "run", check=True)
-        diff = (project / ".agent-relay" / "work" / second / "attempt-1.diff").read_text()
+        diff = (project / ".attention-relay" / "work" / second / "attempt-1.diff").read_text()
         self.assertIn(f"{second}.txt", diff)
         self.assertNotIn(f"{first}.txt", diff)
         self.assertNotIn("human.txt", diff)
@@ -423,7 +511,7 @@ class RelayTests(unittest.TestCase):
         no_change = self.write_worker(NO_CHANGE_WORKER)
         self.configure(project, no_change)
         self.relay(project, "run", second, check=True)
-        retry_diff = project / ".agent-relay" / "work" / second / "attempt-2.diff"
+        retry_diff = project / ".attention-relay" / "work" / second / "attempt-2.diff"
         self.assertEqual(retry_diff.read_text(), "")
 
     def test_scope_violation_blocks_acceptance_even_when_file_was_dirty(self):
@@ -439,7 +527,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(state["status"], "blocked")
         self.assertIn("outside.txt", state["scope_violations"])
         violations_diff = (
-            project / ".agent-relay" / "work" / task_id
+            project / ".attention-relay" / "work" / task_id
             / "attempt-1.violations.diff"
         )
         self.assertIn("outside.txt", violations_diff.read_text())
@@ -463,7 +551,7 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "workflow", [".github/**"])
         self.relay(project, "run", task_id, check=True)
         self.assertEqual(self.state(project, task_id)["status"], "needs_review")
-        diff = project / ".agent-relay" / "work" / task_id / "attempt-1.diff"
+        diff = project / ".attention-relay" / "work" / task_id / "attempt-1.diff"
         self.assertIn(f".github/{task_id}.txt", diff.read_text())
 
     def test_needs_decision_round_trip(self):
@@ -481,7 +569,7 @@ class RelayTests(unittest.TestCase):
             "--answer", "Use option A", check=True,
         )
         self.assertEqual(self.state(project, task_id)["attempt"], 2)
-        spec = project / ".agent-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
         self.assertIn("Use option A", spec.read_text())
 
     def test_worker_role_and_live_runner_guards(self):
@@ -492,7 +580,7 @@ class RelayTests(unittest.TestCase):
         marker = self.base / "finished"
         self_accept = self.base / "self-accept"
         proc = subprocess.Popen(
-            [str(project / ".agent-relay" / "relay"), "run", task_id],
+            [str(project / ".attention-relay" / "relay"), "run", task_id],
             cwd=project,
             env=dict(os.environ, FINISH_MARKER=str(marker), SELF_ACCEPT_RESULT=str(self_accept)),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -509,8 +597,463 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, stdout + stderr)
         self.assertNotEqual(self_accept.read_text(), "0")
         self.assertEqual(self.state(project, task_id)["status"], "needs_review")
-        diff = project / ".agent-relay" / "work" / task_id / "attempt-1.diff"
+        diff = project / ".attention-relay" / "work" / task_id / "attempt-1.diff"
         self.assertIn("after-finish.txt", diff.read_text())
+
+    def test_worker_phase_briefs_and_default_finish_gate(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "brief gate", ["brief/**"])
+        env = self.lease_task(project, task_id, "lease-one")
+        runtime = project / ".attention-relay"
+        token_path = runtime / "work" / task_id / "finish-brief-token.json"
+
+        unleased = self.relay(project, "task", "brief", task_id, "--phase", "edit")
+        self.assertNotEqual(unleased.returncode, 0)
+        for phase, heading in (("edit", "Edit"), ("verify", "Verify")):
+            output = self.relay(
+                project, "task", "brief", task_id, "--phase", phase,
+                env=env, check=True,
+            )
+            self.assertTrue(output.stdout.startswith("# Critical Context Capsule\n"))
+            self.assertIn(f"## {heading} phase checklist", output.stdout)
+            self.assertNotIn("Brief token:", output.stdout)
+            self.assertFalse(token_path.exists())
+
+        first_brief, first_token = self.report_brief_token(project, task_id, env)
+        second_brief, second_token = self.report_brief_token(project, task_id, env)
+        self.assertTrue(first_brief.stdout.startswith("# Critical Context Capsule\n"))
+        self.assertIn("## Report phase checklist", second_brief.stdout)
+        self.assertNotEqual(first_token, second_token)
+        report = runtime / "work" / task_id / "attempt-1.report.md"
+        report.write_text("# brief gate report\n")
+
+        finish = ["task", "finish", task_id, "--status", "needs_review"]
+        for token in (None, "foreign-token", first_token):
+            command = finish + (["--brief", token] if token else [])
+            rejected = self.relay(project, *command, env=env)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("report-phase brief token is required", rejected.stderr)
+
+        self.relay(project, *finish, "--brief", second_token, env=env, check=True)
+        self.assertFalse(token_path.exists())
+        result = runtime / "work" / task_id / "attempt-1.result.json"
+        result.unlink()
+        replay = self.relay(
+            project, *finish, "--brief", second_token, env=env,
+        )
+        self.assertNotEqual(replay.returncode, 0)
+        self.assertIn("report-phase brief token is required", replay.stderr)
+
+    def test_finish_gate_can_be_disabled(self):
+        project = self.make_project()
+        config = project / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text().replace(
+            "finish_requires_brief = true", "finish_requires_brief = false",
+        ))
+        task_id = self.create_task(project, "gate off", ["off/**"])
+        env = self.lease_task(project, task_id, "gate-off-lease")
+        report = (
+            project / ".attention-relay" / "work" / task_id
+            / "attempt-1.report.md"
+        )
+        report.write_text("# gate off report\n")
+        self.relay(
+            project, "task", "finish", task_id, "--status", "needs_review",
+            env=env, check=True,
+        )
+
+    def test_return_then_retry_invalidates_report_brief_token(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "retry brief", ["retry/**"])
+        first_env = self.lease_task(project, task_id, "first-lease")
+        _brief, old_token = self.report_brief_token(project, task_id, first_env)
+
+        runtime = project / ".attention-relay"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = "needs_review"
+        task.pop("runner")
+        state_path.write_text(json.dumps(task))
+        self.relay(
+            project, "task", "return", task_id, "--reason", "retry token",
+            check=True,
+        )
+
+        second_env = self.lease_task(project, task_id, "second-lease")
+        report = runtime / "work" / task_id / "attempt-2.report.md"
+        report.write_text("# retry report\n")
+        stale = self.relay(
+            project, "task", "finish", task_id, "--status", "needs_review",
+            "--brief", old_token, env=second_env,
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("report-phase brief token is required", stale.stderr)
+
+    def test_orchestrator_review_brief_accept_gate_and_worker_denial(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(project, "review gate", ["review/**"])
+        self.relay(project, "run", task_id, check=True)
+
+        missing = self.relay(project, "task", "accept", task_id)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("review-phase brief token is required", missing.stderr)
+        brief, first_token = self.review_brief_token(project, task_id)
+        self.assertTrue(brief.stdout.startswith("# Critical Context Capsule\n"))
+        self.assertIn("attempt-1.report.md", brief.stdout)
+        self.assertIn("attempt-1.diff", brief.stdout)
+        self.assertIn(f"review/{task_id}.txt", brief.stdout)
+        _replacement, current_token = self.review_brief_token(project, task_id)
+        for token in ("wrong", first_token):
+            rejected = self.relay(
+                project, "task", "accept", task_id, "--brief", token,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("review-phase brief token is required", rejected.stderr)
+
+        worker_env = {
+            "RELAY_TASK_ID": task_id, "RELAY_ATTEMPT": "1", "RELAY_LEASE": "worker",
+        }
+        denied = self.relay(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+            env=worker_env,
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
+
+        self.relay(
+            project, "task", "accept", task_id, "--brief", current_token, check=True,
+        )
+        token_path = (
+            project / ".attention-relay" / "work" / task_id
+            / "review-brief-token.json"
+        )
+        self.assertFalse(token_path.exists())
+        state_path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_review"
+        state_path.write_text(json.dumps(state))
+        replay = self.relay(
+            project, "task", "accept", task_id, "--brief", current_token,
+        )
+        self.assertNotEqual(replay.returncode, 0)
+        self.assertIn("review-phase brief token is required", replay.stderr)
+
+    def test_review_token_invalidated_by_return_and_accept_gate_off(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(project, "return review", ["return-review/**"])
+        self.relay(project, "run", task_id, check=True)
+        _brief, stale_token = self.review_brief_token(project, task_id)
+        token_path = (
+            project / ".attention-relay" / "work" / task_id
+            / "review-brief-token.json"
+        )
+        self.relay(
+            project, "task", "return", task_id, "--reason", "try again", check=True,
+        )
+        self.assertFalse(token_path.exists())
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        self.relay(project, "run", task_id, check=True)
+        invalidated = self.relay(
+            project, "task", "accept", task_id, "--brief", stale_token,
+        )
+        self.assertNotEqual(invalidated.returncode, 0)
+
+        gate_off = self.make_project("gate-off-accept")
+        self.configure(gate_off, self.write_worker(GOOD_WORKER))
+        config = gate_off / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text() + "\n[gates]\naccept_requires_brief = false\n")
+        gate_off_id = self.create_task(gate_off, "accept gate off", ["gate-off/**"])
+        self.relay(gate_off, "run", gate_off_id, check=True)
+        self.relay(gate_off, "task", "accept", gate_off_id, check=True)
+
+    def test_orchestrator_phase_handoff_and_next_action_capsules(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(project, "phase output", ["phase/**"])
+        started = self.relay(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        )
+        harness = started.stdout.split("Harness memory:\n", 1)[1].split(
+            "\n\nTask counts:", 1,
+        )[0]
+        self.assertLessEqual(len(harness.splitlines()) + 1, 12)
+        for control in (
+            '"autoMemoryEnabled": false',
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
+            "the /memory toggle",
+            '"claudeMdExcludes"',
+            "managed-policy CLAUDE.md cannot be excluded",
+            "claude --bare",
+            "ALSO disables hooks (conflicts with hook-based injection)",
+            "--ignore-rules",
+            "--safe-mode: it drops user config",
+            "hermes memory reset` is destructive",
+            "already clean by default via the config worker command",
+        ):
+            self.assertIn(control, harness)
+        plan = self.relay(
+            project, "orchestrator", "brief", "--phase", "plan", check=True,
+        )
+        self.assertIn("Task-spec quality checklist:", plan.stdout)
+        self.assertIn(f"{task_id} [queued]", plan.stdout)
+        run_brief = self.relay(
+            project, "orchestrator", "brief", "--phase", "run", check=True,
+        )
+        self.assertIn(f"Would run: {task_id}", run_brief.stdout)
+
+        status = self.relay(project, "status", check=True)
+        self.assertIn("\nNext actions:\n", status.stdout)
+        run = self.relay(project, "run", task_id, check=True)
+        self.assertIn("\nNext actions:\n", run.stdout)
+        self.assertIn("attempt-1.report.md", run.stdout.rsplit("Next actions:", 1)[1])
+        shown = self.relay(project, "task", "show", task_id, check=True)
+        self.assertIn("\nNext actions:\n", shown.stdout)
+
+        closed = self.relay(
+            project, "orchestrator", "brief", "--phase", "close", check=True,
+        )
+        handoff = project / ".attention-relay" / "orchestrator-handoff.md"
+        self.assertTrue(handoff.exists())
+        self.assertIn("consumed_at: (not yet)", handoff.read_text())
+        self.assertIn("Start a fresh session", closed.stdout)
+        started = self.relay(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        )
+        self.assertIn("Current handoff:", started.stdout)
+        self.assertNotIn("consumed_at: (not yet)", handoff.read_text())
+
+    def test_handoff_start_and_close_lock_complete_update(self):
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_handoff_lock_probe")
+        events = []
+        handoff = (
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: test\n"
+            "done:\n- (none)\n"
+        )
+
+        class LockProbe:
+            def __init__(self, path):
+                self.name = Path(path).name
+
+            def __enter__(self):
+                events.append(("enter", self.name))
+
+            def __exit__(self, *_args):
+                events.append(("exit", self.name))
+
+        globals_ = module["orchestrator_start_brief"].__globals__
+        globals_["file_lock"] = LockProbe
+        globals_["read_handoff"] = lambda _relay_dir: events.append("read") or handoff
+        globals_["atomic_write"] = lambda *_args: events.append("write")
+        globals_["load_archived_tasks"] = lambda _relay_dir: events.append("archive") or []
+        globals_["task_lock"] = lambda *_args: self.fail(
+            "task lock nested in handoff lock"
+        )
+        globals_["now"] = lambda: "2026-01-01T00:00:01Z"
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_start_brief"]("/relay", [], consume_handoff=True)
+        self.assertEqual(events, [
+            ("enter", "orchestrator-handoff.lock"), "read", "write",
+            ("exit", "orchestrator-handoff.lock"),
+        ])
+        events.clear()
+        module["orchestrator_close_brief"]("/relay", [])
+        self.assertEqual(events, [
+            ("enter", "orchestrator-handoff.lock"), "read", "archive", "write",
+            ("exit", "orchestrator-handoff.lock"),
+        ])
+
+    def test_handoff_same_second_acceptance_is_emitted_once(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "same second", ["same-second/**"])
+        runtime = project / ".attention-relay"
+        boundary = "2026-01-01T00:00:00Z"
+        handoff_path = runtime / "orchestrator-handoff.md"
+        handoff_path.write_text(
+            "# Orchestrator handoff\n"
+            f"generated_at: {boundary}\n"
+            "consumed_at: (not yet)\n"
+            "goal: test\n"
+            "done:\n- (none)\n"
+        )
+        task = self.state(project, task_id)
+        task["history"].append({"event": "accepted", "at": boundary})
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_boundary_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["now"] = lambda: boundary
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_close_brief"](runtime, [task])
+        first = handoff_path.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+        module["orchestrator_close_brief"](runtime, [task])
+        second = handoff_path.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+        self.assertEqual(first.count(task_id) + second.count(task_id), 1)
+        self.assertIn(task_id, first)
+        self.assertNotIn(task_id, second)
+
+    def test_worker_manual_uses_installed_relay_commands(self):
+        worker = (ROOT / "framework" / "worker.md").read_text()
+        self.assertNotIn("`relay ", worker)
+        self.assertNotIn("`task finish ", worker)
+        self.assertIn("python3 .attention-relay/relay task brief", worker)
+        self.assertIn("python3 .attention-relay/relay task finish", worker)
+
+    def test_claude_code_hook_setup_prints_creates_merges_and_is_idempotent(self):
+        project = self.make_project()
+        printed = self.relay(project, "hooks", "claude-code", check=True)
+        fragment_text, instruction = printed.stdout.rsplit("\n", 2)[:2]
+        fragment = json.loads(fragment_text)
+        self.assertEqual(set(fragment["hooks"]), {"SessionStart", "UserPromptSubmit"})
+        self.assertIn(".attention-relay/relay hook-event", printed.stdout)
+        self.assertIn("Merge this fragment into .claude/settings.json", instruction)
+        for event in ("SessionStart", "UserPromptSubmit"):
+            self.assertNotIn("matcher", fragment["hooks"][event][0])
+
+        self.relay(project, "hooks", "claude-code", "--write", check=True)
+        created_path = project / ".claude" / "settings.json"
+        self.assertEqual(json.loads(created_path.read_text()), fragment)
+
+        merged_project = self.make_project("hooks-merge")
+        settings_path = merged_project / ".claude" / "settings.json"
+        settings_path.parent.mkdir()
+        unrelated = {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "existing-pre-tool"}],
+        }
+        existing_session = {
+            "hooks": [{"type": "command", "command": "existing-session"}],
+        }
+        settings_path.write_text(json.dumps({
+            "permissions": {"allow": ["Read"]},
+            "hooks": {
+                "PreToolUse": [unrelated],
+                "SessionStart": [existing_session],
+            },
+        }))
+        for _ in range(2):
+            self.relay(
+                merged_project, "hooks", "claude-code", "--write", check=True,
+            )
+        merged = json.loads(settings_path.read_text())
+        self.assertEqual(merged["permissions"], {"allow": ["Read"]})
+        self.assertEqual(merged["hooks"]["PreToolUse"], [unrelated])
+        self.assertEqual(merged["hooks"]["SessionStart"][0], existing_session)
+        self.assertEqual(len(merged["hooks"]["SessionStart"]), 2)
+        self.assertEqual(len(merged["hooks"]["UserPromptSubmit"]), 1)
+
+        invalid_project = self.make_project("hooks-invalid")
+        invalid_path = invalid_project / ".claude" / "settings.json"
+        invalid_path.parent.mkdir()
+        invalid_path.write_text("{not valid json\n")
+        before = invalid_path.read_text()
+        rejected = self.relay(
+            invalid_project, "hooks", "claude-code", "--write",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("cannot parse .claude/settings.json", rejected.stderr)
+        self.assertEqual(invalid_path.read_text(), before)
+
+    def test_claude_code_hook_events_match_brief_emit_json_and_fail_open(self):
+        project = self.make_project()
+        brief = self.relay(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        )
+        session = subprocess.run(
+            [project / ".attention-relay" / "relay", "hook-event", "session-start"],
+            cwd=project, input="not json", text=True, capture_output=True,
+        )
+        self.assertEqual(session.returncode, 0)
+        self.assertEqual(session.stderr, "")
+        self.assertEqual(session.stdout, brief.stdout)
+        prompt = subprocess.run(
+            [
+                project / ".attention-relay" / "relay", "hook-event",
+                "user-prompt-submit",
+            ],
+            cwd=project, input="{}", text=True, capture_output=True,
+        )
+        self.assertEqual(prompt.returncode, 0)
+        self.assertLessEqual(len(prompt.stdout), 9000)
+        payload = json.loads(prompt.stdout)
+        specific = payload["hookSpecificOutput"]
+        self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
+        self.assertTrue(specific["additionalContext"].startswith(
+            "attention-relay state:\nNext actions:\n",
+        ))
+
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_hook_cap_probe")
+        capped = module["cap_hook_output"]("first\n" + "x" * 10000 + "\nlast\n")
+        self.assertLessEqual(len(capped), 9000)
+        self.assertTrue(capped.startswith("first\n"))
+        self.assertTrue(capped.endswith("(truncated)\nlast\n"))
+        bounded_json = module["claude_user_prompt_output"](
+            "attention-relay state:\n" + "x" * 10000 + "\nlast",
+        )
+        self.assertLessEqual(len(bounded_json), 9000)
+        self.assertIn("(truncated)\nlast", json.loads(bounded_json)[
+            "hookSpecificOutput"
+        ]["additionalContext"])
+
+        broken_runtime = self.base / "empty-runtime"
+        broken_runtime.mkdir()
+        for name in ("session-start", "user-prompt-submit"):
+            broken = self.relay(
+                project, "hook-event", name, env={"RELAY_DIR": broken_runtime},
+            )
+            self.assertEqual((broken.returncode, broken.stdout, broken.stderr), (0, "", ""))
+        outside = self.command(
+            [SOURCE_RELAY, "hook-event", "session-start"], self.base,
+        )
+        self.assertEqual((outside.returncode, outside.stdout, outside.stderr), (0, "", ""))
+
+        worker_env = {
+            "RELAY_TASK_ID": "T999-worker", "RELAY_ATTEMPT": "1",
+            "RELAY_LEASE": "worker",
+        }
+        for command in (
+                ("hooks", "claude-code"),
+                ("hook-event", "session-start")):
+            denied = self.relay(project, *command, env=worker_env)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
+
+    def test_hook_cap_handles_edge_lines_and_preserves_normal_input(self):
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_hook_edges_probe")
+        cap = module["cap_hook_output"]
+        prompt_output = module["claude_user_prompt_output"]
+        normal = "first\nmiddle\nlast\n"
+        self.assertEqual(cap(normal), normal)
+        self.assertEqual(
+            json.loads(prompt_output(normal))["hookSpecificOutput"]["additionalContext"],
+            normal,
+        )
+
+        for impossible in (
+                "x" * 10000 + "\nlast\n",
+                "first\n" + "x" * 10000 + "\n"):
+            with self.subTest(edge=impossible[:5]):
+                self.assertEqual(cap(impossible), "")
+                self.assertEqual(prompt_output(impossible), "")
+
+        huge_middle = "first\n" + "x" * 10000 + "\nlast\n"
+        capped = cap(huge_middle)
+        self.assertLessEqual(len(capped), 9000)
+        self.assertTrue(capped.startswith("first\n"))
+        self.assertTrue(capped.endswith("(truncated)\nlast\n"))
+        encoded = prompt_output(huge_middle)
+        self.assertLessEqual(len(encoded), 9000)
+        context = json.loads(encoded)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(context.startswith("first\n"))
+        self.assertTrue(context.endswith("(truncated)\nlast\n"))
 
     def test_concurrent_run_claims_task_once(self):
         project = self.make_project()
@@ -519,7 +1062,7 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "once", ["once/**"])
         starts = self.base / "starts"
         env = dict(os.environ, STARTS=str(starts), FINISH_MARKER=str(self.base / "wait"))
-        commands = [str(project / ".agent-relay" / "relay"), "run", task_id]
+        commands = [str(project / ".attention-relay" / "relay"), "run", task_id]
         first = subprocess.Popen(commands, cwd=project, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         second = subprocess.Popen(commands, cwd=project, env=env, stdout=subprocess.PIPE,
@@ -537,7 +1080,7 @@ class RelayTests(unittest.TestCase):
         self.configure(project, worker)
         one = self.create_task(project, "alpha", ["alpha/**"])
         two = self.create_task(project, "beta", ["beta/**"])
-        relay = str(project / ".agent-relay" / "relay")
+        relay = str(project / ".attention-relay" / "relay")
         env = dict(os.environ, SLEEP_AFTER_FINISH="0.8")
         first = subprocess.Popen(
             [relay, "run", one], cwd=project, env=env,
@@ -568,7 +1111,7 @@ class RelayTests(unittest.TestCase):
 
     def test_invalid_command_fails_before_task_claim(self):
         project = self.make_project()
-        config = project / ".agent-relay" / "config.toml"
+        config = project / ".attention-relay" / "config.toml"
         config.write_text(
             '[commands]\nworker = "true {prompt} embedded{prompt}"\n'
             '[limits]\nmax_parallel = 1\n'
@@ -618,7 +1161,7 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "symlink artifact", ["src/**"])
         sentinel = self.base / "log-sentinel"
         sentinel.write_text("unchanged\n")
-        directory = project / ".agent-relay" / "work" / task_id
+        directory = project / ".attention-relay" / "work" / task_id
         directory.mkdir(parents=True)
         (directory / "attempt-1.log").symlink_to(sentinel)
         result = self.relay(project, "run", task_id)
@@ -645,7 +1188,7 @@ class RelayTests(unittest.TestCase):
     def test_stale_finalizer_cannot_overwrite_a_new_lease(self):
         project = self.make_project()
         task_id = self.create_task(project, "lease guard", ["src/**"])
-        runtime = project / ".agent-relay"
+        runtime = project / ".attention-relay"
         state_path = runtime / "tasks" / f"{task_id}.json"
         old_task = json.loads(state_path.read_text())
         old_task["status"] = "running"
@@ -683,7 +1226,7 @@ class RelayTests(unittest.TestCase):
             "max_parallel = 1\n"
             "worker_timeout_minutes = 1\n"
         )
-        (project / ".agent-relay" / "config.toml").write_text(config)
+        (project / ".attention-relay" / "config.toml").write_text(config)
         marker = self.base / "injected"
         scope = f"safe/$(touch {marker})/**"
         task_id = self.create_task(project, "literal prompt", [scope])
@@ -714,7 +1257,7 @@ class RelayTests(unittest.TestCase):
                 task_id = self.create_task(project, "interrupt", ["interrupt/**"])
                 marker = self.base / (name + "-late-marker")
                 process = subprocess.Popen(
-                    [str(project / ".agent-relay" / "relay"), "run", task_id],
+                    [str(project / ".attention-relay" / "relay"), "run", task_id],
                     cwd=project,
                     env=dict(os.environ, LATE_MARKER=str(marker)),
                     text=True,
@@ -768,7 +1311,7 @@ class RelayTests(unittest.TestCase):
         ]
         marker = self.base / "parallel-late-marker"
         process = subprocess.Popen(
-            [str(project / ".agent-relay" / "relay"), "run", *task_ids],
+            [str(project / ".attention-relay" / "relay"), "run", *task_ids],
             cwd=project, env=dict(os.environ, LATE_MARKER=str(marker)),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -804,7 +1347,7 @@ class RelayTests(unittest.TestCase):
         self.configure(project, worker)
         first = self.create_task(project, "first", ["first/**"])
         self.relay(project, "run", check=True)
-        self.relay(project, "task", "accept", first, check=True)
+        self.accept_task(project, first)
         second = self.create_task(project, "second", ["second/**"], [first])
         self.relay(project, "archive", check=True)
         dry = self.relay(project, "run", "--dry-run", check=True)
@@ -813,8 +1356,8 @@ class RelayTests(unittest.TestCase):
 
         third = self.create_task(project, "third", ["third/**"])
         self.assertTrue(third.startswith("T003-"), third)
-        second_path = project / ".agent-relay" / "tasks" / f"{second}.json"
-        third_path = project / ".agent-relay" / "tasks" / f"{third}.json"
+        second_path = project / ".attention-relay" / "tasks" / f"{second}.json"
+        third_path = project / ".attention-relay" / "tasks" / f"{third}.json"
         second_state = json.loads(second_path.read_text())
         third_state = json.loads(third_path.read_text())
         second_state["depends_on"] = [third]
@@ -831,7 +1374,7 @@ class RelayTests(unittest.TestCase):
             self.create_task(project, "archive one", ["one/**"]),
             self.create_task(project, "archive two", ["two/**"]),
         ]
-        runtime = project / ".agent-relay"
+        runtime = project / ".attention-relay"
         for task_id in task_ids:
             state_path = runtime / "tasks" / f"{task_id}.json"
             state = json.loads(state_path.read_text())
@@ -851,7 +1394,7 @@ class RelayTests(unittest.TestCase):
     def test_archive_defers_sigterm_until_transaction_is_complete(self):
         project = self.make_project()
         task_id = self.create_task(project, "archive signal", ["archive/**"])
-        runtime = project / ".agent-relay"
+        runtime = project / ".attention-relay"
         state_path = runtime / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
         state["status"] = "done"
@@ -906,8 +1449,87 @@ module["cmd_archive"](SimpleNamespace())
         self.configure(project, worker)
         task_id = self.create_task(project, "stage", ["new/**"])
         self.relay(project, "run", task_id, check=True)
-        diff = project / ".agent-relay" / "work" / task_id / "attempt-1.diff"
+        diff = project / ".attention-relay" / "work" / task_id / "attempt-1.diff"
         self.assertIn("new/staged.txt", diff.read_text())
+
+    def test_capsule_sandwich_brief_digest_and_retry_delta(self):
+        project = self.make_project()
+        worker = self.write_worker(GOOD_WORKER)
+        self.configure(project, worker)
+        task_id = self.create_task(project, "capsule", ["capsule/**"])
+        self.relay(project, "run", task_id, check=True)
+
+        work = project / ".attention-relay" / "work" / task_id
+        prompt = (work / "attempt-1.prompt.md").read_text()
+        brief = (work / "attempt-1.brief.md").read_text()
+        digest_line, capsule = brief.split("\n\n", 1)
+        digest = hashlib.sha256(capsule.encode()).hexdigest()
+        self.assertEqual(digest_line, f"Content digest: sha256:{digest}")
+        self.assertTrue(prompt.startswith(capsule))
+        self.assertTrue(prompt.endswith(capsule))
+        self.assertEqual(prompt.count(capsule), 2)
+
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_capsule_probe")
+        task = self.state(project, task_id)
+        spec = (project / ".attention-relay" / "tasks" / f"{task_id}.md").read_text()
+        self.assertEqual(module["compile_context_capsule"](task, spec), capsule)
+        self.assertEqual(module["compile_context_capsule"](task, spec), capsule)
+
+        self.relay(
+            project, "task", "return", task_id,
+            "--reason", "Preserve the capsule boundary", check=True,
+        )
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        self.relay(project, "run", task_id, check=True)
+        retry_prompt = (work / "attempt-2.prompt.md").read_text()
+        retry_brief = (work / "attempt-2.brief.md").read_text()
+        _retry_digest, retry_capsule = retry_brief.split("\n\n", 1)
+        self.assertTrue(retry_prompt.startswith(retry_capsule))
+        self.assertTrue(retry_prompt.endswith(retry_capsule))
+        self.assertIn("## Retry delta", retry_capsule)
+        self.assertIn("Preserve the capsule boundary", retry_capsule)
+        self.assertIn("attempt-1.report.md", retry_prompt)
+        self.assertNotEqual(retry_capsule, capsule)
+
+    def test_placeholder_and_empty_specs_are_rejected_by_run_and_validate(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        created = self.relay(
+            project, "task", "create", "--title", "unfinished spec", check=True,
+        )
+        task_id = created.stdout.split()[1]
+        run = self.relay(project, "run", task_id)
+        validation = self.relay(project, "validate")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertNotEqual(validation.returncode, 0)
+        shared = "Objective still contains the template placeholder"
+        self.assertIn(shared, run.stderr)
+        self.assertIn(shared, validation.stdout)
+        self.assertEqual(self.state(project, task_id)["status"], "queued")
+
+        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec.write_text(spec.read_text().replace(
+            "Replace this line with one clear outcome.", "",
+        ))
+        empty_run = self.relay(project, "run", task_id)
+        empty_validation = self.relay(project, "validate")
+        self.assertIn("Objective is empty", empty_run.stderr)
+        self.assertIn("Objective is empty", empty_validation.stdout)
+
+    def test_capsule_budget_overflow_is_rejected_by_run_and_validate(self):
+        project = self.make_project()
+        self.configure(
+            project, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=100,
+        )
+        task_id = self.create_task(project, "over budget", ["budget/**"])
+        run = self.relay(project, "run", task_id)
+        validation = self.relay(project, "validate")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertNotEqual(validation.returncode, 0)
+        for output in (run.stderr, validation.stdout):
+            self.assertIn("capsule_max_chars=100", output)
+            self.assertIn("exceeded by", output)
+        self.assertEqual(self.state(project, task_id)["status"], "queued")
 
     def test_memory_archive_and_prompt_spec_alignment(self):
         project = self.make_project()
@@ -929,6 +1551,8 @@ module["cmd_archive"](SimpleNamespace())
         with (ROOT / "framework" / "config.example.toml").open("rb") as source:
             config = tomllib.load(source)
         command = shlex.split(config["commands"]["worker"])
+        self.assertEqual(command.count("--ignore-rules"), 1)
+        self.assertIn("--ignore-rules", command)
         query = command.index("-q")
         self.assertEqual(command[query + 1], "{prompt}")
 

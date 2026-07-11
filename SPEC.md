@@ -1,6 +1,6 @@
-# Agent Relay specification
+# Attention Relay specification
 
-This file defines Agent Relay. The reference code in `framework/` and the
+This file defines Attention Relay. The reference code in `framework/` and the
 standalone creation prompt must implement the same behavior.
 
 ## Requirements
@@ -11,7 +11,7 @@ standalone creation prompt must implement the same behavior.
 - Python standard library only
 - A Git worktree without tracked submodules
 
-Agent Relay is one executable Python file plus Markdown and TOML templates. It
+Attention Relay is one executable Python file plus Markdown and TOML templates. It
 has no daemon, database, server, UI, plugin system, or package dependency.
 
 ## Runtime
@@ -19,19 +19,19 @@ has no daemon, database, server, UI, plugin system, or package dependency.
 `relay init <project>` requires the Git worktree root and creates:
 
 ```text
-.agent-relay/
+.attention-relay/
   relay
   orchestrator.md
   worker.md
   memory.md
   config.toml
   tasks/                 active task specs and JSON state
-  work/<task-id>/        prompt, log, report, result, and diffs per attempt
+  work/<task-id>/        prompt, log, briefs/token, report, result, and diffs
   archive/               completed task state and work
   .locks/                local state locks
 ```
 
-Initialization adds `.agent-relay/` to the project’s `.gitignore` once. It does
+Initialization adds `.attention-relay/` to the project’s `.gitignore` once. It does
 not replace existing files unless `--force` is used. `--force` refreshes the
 CLI and manuals but preserves `config.toml`, `memory.md`, tasks, and work.
 Initialization and normal commands reject symlinks anywhere in managed runtime
@@ -104,15 +104,17 @@ Lifecycle rules:
 
 1. `task create` creates a queued task.
 2. `run` claims the task as running before starting a worker.
-3. `task finish` writes an attempt result but leaves the task running.
+3. `task finish --brief TOKEN` writes an attempt result but leaves the task
+   running. By default, the token must come from a fresh report-phase brief.
 4. After the worker exits, Relay writes the diff and changes the task to the
    submitted worker status.
 5. Workers may submit only `needs_review`, `needs_decision`, `blocked`, or
    `failed`. `needs_review` requires a non-empty regular report file. Result
    status, note, timestamp, lease, and exact changed-path list must have the
    expected types.
-6. `task accept` changes only `needs_review` to `done`. It refuses live workers
-   and unresolved scope violations.
+6. `task accept --brief TOKEN` changes only `needs_review` to `done`. It refuses
+   live workers and unresolved scope violations and, by default, requires a
+   fresh review-phase orchestrator brief token bound to the current attempt.
 7. `task return --reason` queues another attempt and appends feedback to the
    task spec. Scope-violating paths must first match their pre-wave state.
 8. `task decide --answer` answers a worker question and queues another attempt.
@@ -185,6 +187,82 @@ attributed cryptographically.
 Approval records review state only. Worker edits are already in the shared
 working tree; `accept`, `return`, and `cancel` do not apply or revert patches.
 
+## Orchestrator phases and handoff
+
+`relay orchestrator brief --phase start|plan|run|review|close [ID]` is available
+only outside a leased worker. The orchestrator runs the matching brief before
+task creation, run, review/accept, and session close.
+
+- `start` prints a short role summary and a `Harness memory` notice of at most 12
+  lines. The notice offers Claude Code's `"autoMemoryEnabled": false`,
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `/memory`, and `"claudeMdExcludes"`
+  controls, including the managed-policy exclusion limit and the warning that
+  `claude --bare` disables hooks. It offers Hermes `--ignore-rules`, warns that
+  `--safe-mode` drops user config and `hermes memory reset` is destructive, and
+  says framework workers are already clean by default. The orchestrator relays
+  these choices in its first response and never auto-applies one. Start also
+  prints the current handoff when present, task counts, unresolved
+  decision/review ids, and one recommended next command. Under a dedicated
+  handoff leaf lock, it atomically marks the handoff consumed without deleting
+  it.
+- `plan` prints the task-spec quality checklist and a bounded queued/blocked
+  dependency graph.
+- `run` uses the read-only wave selection logic to print what would run and
+  cautions for overlapping scopes or unmet dependencies.
+- `review ID` is valid only for a `needs_review` task. Under the task lock it
+  compiles the task capsule, prints current report and diff paths, declared and
+  observed changed paths, and an accept/return/decide checklist. It atomically
+  stores and prints a new `Review token: <value>` bound to task id and attempt;
+  issuing another review brief replaces the token.
+- `close` uses the same dedicated handoff leaf lock to atomically write the
+  bounded `.attention-relay/orchestrator-handoff.md`, prints it, and reminds the
+  orchestrator to start a fresh session. The template carries the newest goal,
+  tasks accepted at or after the preceding handoff boundary except task ids
+  already in its `done` section, recent decision answers, queued and review
+  work, unresolved decisions, and an avoid placeholder.
+
+With the default accept gate enabled, `task accept --brief TOKEN` requires the
+stored token for that task's current attempt and consumes it only on successful
+accept. Missing, wrong, replaced, replayed, or stale-attempt tokens are rejected.
+Return, decide, and cancel remove any review token. With the gate disabled,
+accept retains its earlier behavior and ignores `--brief`.
+
+`relay status`, `relay task show`, and each real `relay run` end with a
+deterministic `Next actions` block of at most about six lines. It derives review
+report paths, decision ids, or create/run commands from current task state and
+contains no generic advice.
+
+## Optional Claude Code integration
+
+`relay hooks claude-code [--write]` is an orchestrator-only, opt-in setup
+command. Without `--write` it prints the exact JSON hook fragment and one-line
+merge instructions. With `--write` it atomically creates or merges
+`.claude/settings.json`, preserving the order and contents of existing hook
+arrays. It appends only missing Attention Relay entries, identified by their
+command strings, so repeated setup is idempotent. Invalid JSON is rejected
+without changing the file.
+
+The fragment registers exactly one command hook under each of `SessionStart`
+and `UserPromptSubmit`, using Claude Code's matcher-free `[{"hooks": [...]}]`
+shape. Commands invoke the project-local adapter through
+`"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event ...`.
+
+`relay hook-event session-start` emits the same plain stdout as the start-phase
+orchestrator brief; Claude adds that stdout to session context.
+`relay hook-event user-prompt-submit` emits `hookSpecificOutput` JSON whose
+`hookEventName` is `UserPromptSubmit` and whose `additionalContext` is an
+`attention-relay state:` line followed by the deterministic `Next actions`
+block. Both emitted outputs are always at most 9000 characters. Truncation
+retains the first and last lines and places `(truncated)` immediately before the
+last line; if both edge lines cannot fit, the adapter emits nothing and fails
+open.
+
+Hook events tolerate empty or malformed stdin, never write Relay state, and
+fail open: a missing or broken runtime exits successfully with no stdout or
+stderr, so Relay cannot break the host session. The adapter and setup commands
+are unavailable to leased workers. Claude's `--bare` mode disables hooks and
+therefore conflicts with this integration.
+
 ## Worker process
 
 The command in `config.toml` is parsed into arguments and launched without a
@@ -202,15 +280,44 @@ RELAY_DIR
 RELAY_ROOT
 ```
 
+Workers reprint the current attempt's launch capsule at each moment of action
+with `relay task brief ID --phase edit|verify|report`. The capsule is followed by
+a short phase-specific checklist. The command is available only to the matching
+leased worker while its task is running: task id, attempt, and lease must all
+match the worker environment.
+
+The report phase also prints `Brief token: <value>` and atomically stores the
+token under `work/<id>/`, bound to the current task id, attempt, and lease. A
+second report brief replaces it. Edit and verify briefs do not issue tokens.
+With the default finish gate enabled, `task finish` requires the current token
+as `--brief TOKEN` and consumes it after successfully writing the result. A
+missing, wrong, replaced, replayed, different-attempt, or different-lease token
+is rejected with instructions to run a fresh report brief.
+
 Each worker runs in a separate process group. Relay captures combined output,
 enforces `worker_timeout_minutes`, and terminates process groups on timeout or
 `SIGINT`, `SIGTERM`, or `SIGHUP` interruption. It signals every active group
 before one shared grace interval. Interrupted tasks become `failed` instead of
 remaining stale.
 
-The generated prompt identifies the task, attempt, root, scope, task spec,
-worker contract, report path, and finish command. It points to files instead of
-copying their contents.
+Before launch, Relay compiles a deterministic Critical Context Capsule from the
+task id, title, scope, and the existing `Objective`, `Acceptance criteria`, `Not
+allowed`, and `Verification` sections. The task spec remains the only
+hand-edited source; there is no capsule section in the task template. Empty
+objectives or acceptance criteria, and either section retaining its template
+placeholder line, are actionable launch errors. `validate` reports the same
+errors for queued tasks.
+
+On attempts after the first, the capsule also contains a `Retry delta` with only
+the newest entry from `Review feedback` and/or `Decisions`. The previous-attempt
+report remains a file pointer in the middle of the prompt. Relay places the
+byte-identical capsule at the exact beginning and end of the launch prompt,
+around the task metadata, file pointers, and finish mechanics. It also writes
+that capsule to `work/<id>/attempt-N.brief.md` with its SHA-256 content digest.
+The same task state therefore produces byte-identical capsule text.
+
+Capsules are never truncated. If one exceeds `capsule_max_chars`, launch and
+validation fail with the measured size and overflow.
 
 ## Config
 
@@ -218,15 +325,30 @@ copying their contents.
 
 ```toml
 [commands]
-worker = "hermes chat -Q -t terminal,file --source tool -q {prompt}"
+worker = "hermes chat -Q -t terminal,file --source tool --ignore-rules -q {prompt}"
 
 [limits]
 max_parallel = 3
+capsule_max_chars = 4000
 worker_timeout_minutes = 60
+
+[gates]
+finish_requires_brief = true
+accept_requires_brief = true
 ```
 
-`max_parallel` is a positive integer. The timeout is a non-negative number in
-minutes; zero disables it.
+The default worker command is harness-memory-clean: `--ignore-rules` suppresses
+automatic rules, saved memory, and preloaded skills while preserving the user's
+configured model and reasoning.
+
+`max_parallel` and `capsule_max_chars` are positive integers. The capsule limit
+defaults to 4000 characters. The timeout is a non-negative number in minutes;
+zero disables it.
+
+Both gate values must be booleans and default to `true` when absent.
+`finish_requires_brief = false` lets `task finish` work without a token;
+`accept_requires_brief = false` lets `task accept` work without a review token.
+Each disabled gate ignores its corresponding `--brief` argument.
 
 Optional `[tiers.<name>].command` values override the default worker command for
 a task with that tier. An unknown tier uses the default command.
@@ -266,7 +388,9 @@ and stub workers. It covers:
   changed-path attribution;
 - parallel workers, serialized run processes, leases, and duplicate-claim
   prevention;
-- reports, worker results, lifecycle guards, return, decide, and accept;
+- worker and orchestrator phase briefs, finish/review tokens and gates, handoff,
+  stdout next-action capsules, reports, worker results, lifecycle guards,
+  return, decide, and accept;
 - attempt-local Git diffs in clean, dirty, and unborn worktrees;
 - direct command execution without a shell;
 - process-group timeout, batched `SIGINT`/`SIGTERM` cleanup, and non-UTF-8

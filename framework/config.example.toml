@@ -1,21 +1,39 @@
-# Agent Relay worker configuration
+# Attention Relay worker configuration
 
 [commands]
 # The placeholder must be one complete argument. Relay does not use a shell.
-worker = "hermes chat -Q -t terminal,file --source tool -q {prompt}"
+# --ignore-rules skips auto-injection of AGENTS.md, SOUL.md, .cursorrules,
+# saved memory, and preloaded skills while keeping the user's configured
+# model/reasoning.
+# --safe-mode is NOT used because it also drops user config, losing the
+# configured model.
+worker = "hermes chat -Q -t terminal,file --source tool --ignore-rules -q {prompt}"
+
+# To inherit hermes memory/rules instead:
+# worker = "hermes chat -Q -t terminal,file --source tool -q {prompt}"
 
 # Other noninteractive agent CLIs work when they accept a prompt argument.
 # Verify their flags locally before use.
 # worker = "codex exec {prompt}"
+# Memory-clean Claude Code worker:
+# worker = "claude -p --bare {prompt}"
 
 # Optional commands for selected task tiers:
 # [tiers.cheap]
-# command = "hermes chat -Q -t terminal,file --source tool -m provider/model -q {prompt}"
+# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
 #
 # [tiers.premium]
-# command = "hermes chat -Q -t terminal,file --source tool -m provider/model -q {prompt}"
+# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
 
 [limits]
 max_parallel = 3
+# Maximum generated Critical Context Capsule size; over-budget tasks do not run.
+capsule_max_chars = 4000
 # Minutes; 0 disables the timeout.
 worker_timeout_minutes = 60
+
+[gates]
+# Require a fresh report-phase brief token before a worker can finish.
+finish_requires_brief = true
+# Require a fresh review-phase brief token before an orchestrator can accept.
+accept_requires_brief = true
