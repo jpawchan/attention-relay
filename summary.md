@@ -10,15 +10,13 @@ It coordinates worker CLIs; it is not an agent model, package manager, patch que
 
 ## Current state
 
-- Published at `https://github.com/jpawchan/attention-relay`, branch `main`, tag `v2.0.0` (2026-07-11).
-- The implementation is complete and CI is green (4 matrix jobs passed on the publish commit).
-- Local verification on 2026-07-12: the full end-to-end suite passes, covering strict configured tiers with per-task capsule/time limits and redacted tier inspection, mandatory close-handoff goals and bounded avoid notes, bounded phase receipts, the default-off strict sequence gate, archived receipt coverage, read-only aggregate stats, structured reports, evidence-bound review tokens, streaming diff stats, retry pointers, opt-in sanitized log tails, bounded decision questions, and post-compaction Claude Code state re-injection.
-- An independent audit found and fixed four defects before release: an unlocked handoff read-modify-write race, a soft hook-output cap, a same-second handoff boundary loss, and non-executable command forms in `worker.md`. All have regression tests.
-- The update release audit found five blocking malformed-input and validation defects; oversized JSON integers, indented report fences, lowercase credential labels, and non-finite timeouts are now fixed with regression coverage.
-- The previously unreproduced single-test error was caused by suite subprocesses inheriting the caller's stdin: hook-event reads blocked on non-EOF stdin until the 15-second harness timeout. The harness now uses `subprocess.DEVNULL` by default, while hook-event tests that supply JSON continue to pipe stdin explicitly.
-- Start briefs now provide bounded, missing-only onboarding for the optional conventional `hard`, `medium`, and `easy` tiers. They ask the user to choose models/providers, never write configuration, disappear once all three tiers exist, and are suppressed during post-compaction hook re-injection; `relay tiers` reports any missing conventional names.
-- No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) was deliberately deferred, not forgotten.
-- The upstream working copy on the author's machine contains a live, Git-ignored `.agent-relay/` (v1) runtime that was used to orchestrate this build. It is dev tooling, not part of the project; v2 installs create `.attention-relay/`.
+- This working copy is local `main` at 18 commits — 15 update commits AHEAD of the published `v2.0.0` tag at `https://github.com/jpawchan/attention-relay`. Nothing from the update program has been pushed; CI is green only at the publish commit and has not run on the update commits.
+- The 2026-07-12 update program landed, one reviewed commit per feature: submission preservation on post-submission worker exits, a canonical capsule builder with the `task capsule` preview, referenced-memory capsule summaries, evidence-manifest-bound review tokens, the default-on report-structure gate, the enriched review brief (diff stat, prior attempts, opt-in sanitized log tail), inline worker decision questions, bounded phase receipts + `relay stats` (+ default-off sequence gate), mandatory close `--goal` with bounded `--avoid` notes, strict tiers with per-tier limits and `relay tiers`, compaction-aware SessionStart hooks, `docs/context-placement.md`, and difficulty-level onboarding.
+- A read-only release audit (independent worker) found five blocking malformed-input/validation defects — oversized JSON integers stranding state and crashing briefs, indented report fences bypassing the report gate, lowercase credential labels leaking through the log-tail sanitizer, TOML `nan` timeouts — all fixed with regression coverage and the auditor's exact reproductions re-run dead.
+- The historic "unreproducible single-test flake" is solved: suite subprocesses inherited the caller's stdin, so hook-event reads blocked on non-EOF stdin until the 15-second harness timeout. The harness now passes `subprocess.DEVNULL` by default; hook-event tests that supply JSON still pipe stdin explicitly.
+- Local verification on 2026-07-12: all 98 end-to-end tests pass (~2 minutes), plus a fresh-project smoke (init → start brief → validate).
+- No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) remains deliberately deferred, not forgotten.
+- This repository contains its own live, Git-ignored `.attention-relay/` runtime with 19 completed tasks — the dogfooding install that orchestrated this very update program. It is dev tooling and audit history, not project source: do not edit, delete, or archive it casually.
 
 ## Run and verify
 
@@ -39,17 +37,20 @@ If you run the suite from inside a Relay-leased worker process, unset the inheri
 env -u RELAY_TASK_ID -u RELAY_ATTEMPT -u RELAY_LEASE -u RELAY_DIR -u RELAY_ROOT python3 tests/test_relay.py
 ```
 
-Disposable end-to-end smoke (verified this session):
+Disposable end-to-end smoke (verified this session). The `cd "$tmp"` matters:
+runtime discovery is `RELAY_DIR` env first, else a walk UP from the current
+directory — running a temp project's `relay` from inside this repo would
+silently target this repo's own runtime instead.
 
 ```bash
 tmp=$(mktemp -d) && git -C "$tmp" init -q && git -C "$tmp" config user.name T && git -C "$tmp" config user.email t@example.invalid
-echo seed > "$tmp/seed.txt" && git -C "$tmp" add . && git -C "$tmp" commit -qm seed
+echo seed > "$tmp/seed.txt" && git -C "$tmp" add -A && git -C "$tmp" commit -qm seed
 ./framework/relay init "$tmp"
-"$tmp/.attention-relay/relay" orchestrator brief --phase start
-"$tmp/.attention-relay/relay" validate && rm -rf "$tmp"
+(cd "$tmp" && .attention-relay/relay orchestrator brief --phase start && .attention-relay/relay validate)
+rm -rf "$tmp"
 ```
 
-Expected: init ends with `next: have your agent read .attention-relay/orchestrator.md and run .attention-relay/relay orchestrator brief --phase start`; the start brief prints the orchestrator role, a `Harness memory:` section, optional missing-level onboarding, and `Next actions:`; validate prints `ok: 0 active task(s)`.
+Expected: init ends with `next: have your agent read .attention-relay/orchestrator.md and run .attention-relay/relay orchestrator brief --phase start`; the start brief prints the orchestrator role, a `Harness memory:` section, a `Difficulty levels:` section (fresh installs have no level tiers), and `Next actions:`; validate prints `ok: 0 active task(s)`.
 Do not smoke-test a real worker unless the configured worker CLI and its credentials work locally.
 
 ## Stack
@@ -95,10 +96,10 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | --- | --- |
 | Runtime discovery, safety | `find_relay_dir`, `runtime_paths_are_safe`, `require_relay_dir`; `RELAY_DIRNAME = ".attention-relay"`. |
 | Locks and atomic state | `file_lock`, `task_lock`, `atomic_write`, `atomic_json`, `lock_path`. |
-| Config | `load_config`, `cfg_get`, the `configured_*` readers (including `configured_tier` and the default-off phase-sequence gate), `validate_worker_template`, `command_template`, `worker_argv`. |
-| Paths and review evidence | `report_path`, `result_path`, `diff_path`, `sha256_regular_file`, `build_review_evidence_manifest`, streaming `attempt_diff_summary`, bounded `bounded_log_tail`, `brief_token_path` (finish-brief-token.json), and `review_token_path` (review-brief-token.json). |
-| Capsule | `CAPSULE_SECTIONS`, `task_spec_sections`, `compile_context_capsule` (deterministic, budgeted, placeholder- and memory-reference-validating). |
-| Task lifecycle commands | `cmd_task_create`, `cmd_task_list/show`, `cmd_task_accept` (review-token gate), `cmd_task_return/decide/cancel` (invalidate review token), `cmd_task_finish` (finish-token gate), `cmd_task_brief` (worker phases + report token), `cmd_task_unlock`. |
+| Config | `load_config`, `cfg_get`, the `configured_*` readers (including `configured_tier` and the default-off phase-sequence gate), `validate_worker_template`, `command_template`, `worker_argv`; difficulty-level onboarding via `conventional_level_names` + `difficulty_levels_lines`. |
+| Paths and review evidence | `report_path`, `result_path`, `diff_path`, `sha256_regular_file`, `build_review_evidence_manifest`, streaming `attempt_diff_summary`, `sanitize_log_text` + bounded `bounded_log_tail`, `brief_token_path` (finish-brief-token.json), `review_token_path` (review-brief-token.json), and phase receipts via `phase_receipts_path` + `read_phase_receipts` (attempt-N.briefs.json). |
+| Capsule | `CAPSULE_SECTIONS`, `task_spec_sections`, `memory_index_entries`, `context_capsule_components` + `compile_context_capsule` (deterministic, budgeted, placeholder- and memory-reference-validating), `stored_context_capsule_components` (launch-snapshot parsing), `report_section_problems` (report gate parser). |
+| Task lifecycle commands | `cmd_task_create`, `cmd_task_list/show`, `cmd_task_capsule` (read-only preview, `--raw`), `cmd_task_accept` (review-token + evidence gate), `cmd_task_return/decide/cancel` (invalidate review token), `cmd_task_finish` (finish-token + report-shape gates), `cmd_task_brief` (worker phases, receipts, report token), `cmd_task_unlock`. |
 | Next-actions capsule | `flatten_bounded_text`, `decision_question`, `render_next_actions`, `say_next_actions` (tails `status`, `task show`, real `run`; globally budgets five review/decision/overflow lines). |
 | Orchestrator briefs | `orchestrator_start_brief` (consumes handoff under the `orchestrator-handoff` lock), `orchestrator_plan_brief`, `orchestrator_review_brief` (issues review token), `orchestrator_run_brief`, `orchestrator_close_brief` (writes the explicit bounded goal/avoid context under the same lock), `cmd_orchestrator_brief`. |
 | Claude Code hooks | `claude_code_hook_fragment`, `cmd_hooks_claude_code` (print/merge, idempotent), `cap_hook_output` (hard 9000-char cap, fail-open), `claude_user_prompt_output`, `cmd_hook_event`. |
@@ -188,6 +189,7 @@ orchestrator actions.
 - `--ignore-rules` in the default Hermes worker command is deliberate memory hygiene (keeps model config). Do not swap in `--safe-mode` (drops user config, loses the model) or `hermes memory reset` (destructive).
 - `claude --bare` conflicts with the hook integration (it disables hooks); the start brief and README state this — keep the warning when editing either.
 - Worker-facing command examples must use `python3 .attention-relay/relay ...` or `.attention-relay/relay ...`; bare `relay` is not on PATH in installed projects.
+- Runtime discovery is `RELAY_DIR` env first, else a walk up from the CURRENT directory — never the invoked binary's location. Invoking another project's `relay` from inside this repo targets this repo's runtime; `cd` into the intended project first (see the smoke).
 - Run the suite with `RELAY_*` unset if inside a leased worker (see Run and verify).
 - v1 invariants still apply: stdlib only; no Windows (`fcntl`, process groups); init target must be `git rev-parse --show-toplevel`; no submodules/Gitlinks; keep temp-index snapshots (not `git diff HEAD`); scopes case-fold; workers share one tree (no isolation); `accept` records review, `return` never reverts; don't hand-edit task JSON; archive preflight+rollback and signal masking stay; task numbers never reuse across archive.
 - `worker_timeout_minutes` default is 60: long-thinking workers on hard tasks can hit it; prefer smaller tasks or a deliberate per-tier override over raising it globally.
@@ -200,5 +202,6 @@ orchestrator actions.
 | Fix a capsule validation message | `compile_context_capsule` in `framework/relay`; capsule tests in `tests/test_relay.py`; SPEC.md + embedded copy only if wording is normative. |
 | Add a new orchestrator brief phase | `orchestrator_*_brief` functions + `cmd_orchestrator_brief` + `build_parser` in `framework/relay`; `framework/orchestrator.md`; SPEC.md + embedded copy; new tests. |
 | Change the default capsule budget | `configured_capsule_max_chars` in `framework/relay`; `framework/config.example.toml`; SPEC.md + embedded copy; budget tests in `tests/test_relay.py`. |
+| Add a field to `relay stats` output | `cmd_stats` + `stats_count_lines` in `framework/relay` (receipts via `read_phase_receipts`); SPEC.md stats sentences + embedded copy; stats fixture tests in `tests/test_relay.py`. |
 
-Last updated 2026-07-12 — Optional difficulty-level onboarding added without changing strict opt-in tier semantics.
+Last updated 2026-07-12 — Full re-verification after the update program: rewrote Current state (local-only commits vs published v2.0.0), fixed the smoke's runtime-discovery pitfall, and mapped the preview/receipts/levels helpers.
