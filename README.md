@@ -24,6 +24,9 @@ restrictions, verification commands, and summaries of worker-visible memory ids
 referenced in the task's Context section. This placement does not guarantee
 quality, but it can make critical context easier to recover.
 
+See [Context placement rationale](docs/context-placement.md) for the research,
+tradeoffs, and limits behind this design.
+
 Workers re-read the capsule before editing, verification, and reporting. The
 CLI stores bounded attempt-local command receipts for those phase briefs; an
 optional default-off gate can enforce edit → verify → report order. The

@@ -83,6 +83,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
 | `prompts/use-framework.md` | Short instruction that activates an installed orchestrator (read manual → start brief → memory choices). |
 | `skill/SKILL.md` | Portable skill metadata, install command, invariants. |
+| `docs/context-placement.md` | Research rationale, rejected alternatives, limits, and experiment requirements for capsule edge placement. |
 | `README.md` | Public page in the predecessor's question-led style. |
 | `summary.md` | This guide. |
 | `.github/workflows/ci.yml` | Only CI workflow. |
