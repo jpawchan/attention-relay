@@ -31,6 +31,12 @@ Do not re-enable memory injection unless the task spec says so.
    `--changed PATH` for every path in the report. Omit `--changed` only for
    no-change results.
 
+Relay always records one bounded, attempt-local receipt for every phase brief.
+The normal sequence remains edit, verify, then report. Configuration may make
+that order a strict gate; by default it is guidance only and no brief is blocked.
+When the gate is enabled, running a new edit brief after report invalidates the
+finish token, so run the report brief again before finishing.
+
 ## Rules
 
 - Change only Git-visible files in the task scope. Do not modify Git-ignored

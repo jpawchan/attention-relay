@@ -127,7 +127,9 @@ For each task in `needs_review`, issue a fresh review brief:
 It prints the stored launch capsule when available, current report, result, and
 diff paths with short SHA-256 digests, declared and observed paths, an aggregate
 and per-file diff stat, bounded prior-attempt report/diff pointers, a review
-checklist, and `Review token: <value>`. If current spec or memory inputs would
+checklist, current-attempt `Phase briefs: edit=N verify=N report=N` command-use
+counts (or `none recorded`), and `Review token: <value>`. These receipts show
+command use, not proof that the worker attended to the brief. If current spec or memory inputs would
 compile to a different capsule, it prints a drift warning while preserving the
 launch snapshot for review. If that fresh compilation fails, the stored launch
 capsule still permits review and the brief prints one bounded warning with the
@@ -234,12 +236,18 @@ relay task decide ID --answer TEXT
 relay task cancel ID [--reason TEXT]
 relay task unlock ID
 relay status
+relay stats
 relay validate
 relay archive
 relay memory index [--for worker|orchestrator]
 relay memory show M001
 relay memory add --for worker|orchestrator|both SUMMARY BODY
 ```
+
+`relay stats` is an orchestrator-only, read-only aggregate over active and
+archived tasks. It prints bounded deterministic status and attempt counts,
+failure/blocked reason codes without free text, launched-capsule size statistics,
+phase-receipt command-use coverage, and the post-submission warning count.
 
 ## Before consequential action
 

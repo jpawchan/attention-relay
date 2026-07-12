@@ -242,7 +242,11 @@ task creation, run, review/accept, and session close.
   fails the command. The report, result, and attempt diff must each be a regular,
   non-symlink file; an empty diff is valid. The brief prints their paths with the
   first 12 hexadecimal characters of each SHA-256 digest, plus declared and
-  observed changed paths. After those artifact lines it streams the diff to print
+  observed changed paths. It then prints current-attempt phase-brief command-use
+  counts as `Phase briefs: edit=N verify=N report=N`, using zero for an unrecorded
+  phase, or `Phase briefs: none recorded` when no valid receipt file exists.
+  Receipt coverage is evidence that the command ran, not proof of attention.
+  After those artifact lines it streams the diff to print
   an aggregate added/removed stat and at most 10 per-file add/delete/modify,
   binary, mode, or conservative `~` lines using the manifest's observed paths as
   the authoritative file list; an empty diff prints `Diff stat: no changes`.
@@ -288,6 +292,25 @@ line, stripped of ANSI and C0/C1 controls, bounded to 160 characters, and
 explicitly labeled `worker question:`; a missing or non-text question leaves an
 id-only decision line. The block otherwise derives report paths or create/run
 commands from current task state and contains no generic advice.
+
+`relay stats` is an orchestrator-only, read-only aggregate over active and
+archived task state and work. With no task state it prints exactly `no task data`.
+Otherwise it prints deterministic bounded sections for status counts, a
+histogram of tasks' current attempt numbers, failed/blocked reason-code counts,
+launched-capsule character sizes (minimum, lower-middle median for an even count,
+and maximum), per-phase receipt coverage, and a post-submission warning count.
+Status and count entries are sorted; variable count sections show at most 12
+entries and aggregate overflow as `other`.
+
+Failure/blocked reasons come from corresponding `worker_exited` history notes,
+falling back to current `last_note` when no such history exists. Only complete
+notes matching `^[a-z_]+(_\d+)?$` are printed as codes; every other value counts
+as `other`, so stats never emits worker free text, logs, tokens, or secrets.
+Capsule sizes come only from integer `capsule_chars` values on `launched` entries.
+Receipt coverage counts attempts represented by a launch or a valid receipt and
+is labeled `command-use evidence, not proof of attention`. Stats reads archived
+receipts from the work directories moved by `archive`; it acquires no
+write-capable lock and creates or changes no runtime file.
 
 ## Optional Claude Code integration
 
@@ -343,6 +366,16 @@ a short phase-specific checklist. The command is available only to the matching
 leased worker while its task is running: task id, attempt, and lease must all
 match the worker environment.
 
+Under the existing task lock, every successful phase brief atomically records
+bounded command-use evidence in `work/<id>/attempt-N.briefs.json`. The record
+contains only task id, attempt, lease, the stored capsule's `sha256:` digest, and
+at most one `edit`, `verify`, and `report` entry. Each phase entry has exactly
+`first_at`, `last_at`, and `count`; repetition preserves `first_at` and updates
+only `last_at` and `count`, so no receipt file accumulates entries, text, logs,
+tokens, or reusable secrets. A missing, malformed, stale-lease, or otherwise
+invalid receipt is treated as empty and replaced on the next successful brief,
+never allowed to crash that brief.
+
 The report phase also prints `Brief token: <value>` and atomically stores the
 token under `work/<id>/`, bound to the current task id, attempt, and lease. A
 second report brief replaces it. Edit and verify briefs do not issue tokens.
@@ -350,6 +383,15 @@ With the default finish gate enabled, `task finish` requires the current token
 as `--brief TOKEN` and consumes it after successfully writing the result. A
 missing, wrong, replaced, replayed, different-attempt, or different-lease token
 is rejected with instructions to run a fresh report brief.
+
+The optional `phase_sequence_requires_briefs` gate defaults to false. Recording
+always occurs, and while the gate is off edit, verify, and report retain their
+existing non-blocking behavior. When true, a verify brief requires a
+current-attempt edit receipt, and a report brief requires current-attempt edit
+and verify receipts; rejection names the exact missing `relay task brief ID
+--phase PHASE` remediation. A new edit receipt after a report receipt removes an
+outstanding finish token, requiring report to be briefed again. This is the only
+sequence-gate change to finish-token one-use semantics.
 
 For `needs_review`, a separate default-on report gate reads the report as UTF-8
 after finish-token identity checks and before writing the result or consuming the
@@ -403,6 +445,11 @@ that capsule to `work/<id>/attempt-N.brief.md` with its SHA-256 content digest.
 This immutable launch snapshot is the audit record; worker phase briefs reread
 it without consulting mutable spec or memory text.
 
+Prepared worker items retain that capsule digest and Unicode character count.
+Only after every preparation succeeds, the existing task-claim block records
+the integer count as `capsule_chars` on the `launched` history entry. Failed
+preparation therefore records no launch.
+
 Capsules are never truncated. If one exceeds `capsule_max_chars`, launch and
 validation fail with the measured size and overflow.
 
@@ -433,6 +480,7 @@ capsule_max_chars = 4000
 worker_timeout_minutes = 60
 
 [gates]
+phase_sequence_requires_briefs = false
 finish_requires_brief = true
 report_requires_sections = true
 accept_requires_brief = true
@@ -446,7 +494,8 @@ configured model and reasoning.
 defaults to 4000 characters. The timeout is a non-negative number in minutes;
 zero disables it.
 
-All gate values must be booleans and default to `true` when absent.
+All gate values must be booleans. `phase_sequence_requires_briefs` defaults to
+`false` when absent; the other three gates default to `true`.
 `finish_requires_brief = false` lets `task finish` work without a token;
 `report_requires_sections = false` restores free-form non-empty review reports;
 `accept_requires_brief = false` lets `task accept` work without a review token.
@@ -495,7 +544,8 @@ and stub workers. It covers:
   changed-path attribution;
 - parallel workers, serialized run processes, leases, and duplicate-claim
   prevention;
-- worker and orchestrator phase briefs, finish/review tokens and gates, structured
+- worker and orchestrator phase briefs, bounded receipts, optional phase order,
+  finish/review tokens and gates, structured
   review-report validation (including fences, CRLF, unreadable files, status
   matching, retry with the same token, and gate bypasses), handoff, stdout
   next-action capsules, worker results, lifecycle guards, return, decide, and
@@ -504,7 +554,8 @@ and stub workers. It covers:
 - direct command execution without a shell;
 - process-group timeout, batched `SIGINT`/`SIGTERM` cleanup, and non-UTF-8
   output handling;
-- memory, all-or-nothing archive preflight, and signal-safe archive completion;
+- read-only aggregate stats, memory, receipt-preserving all-or-nothing archive
+  preflight, and signal-safe archive completion;
 - exact equality between this specification and the contract embedded in the
   standalone creation prompt.
 <!-- END SPEC -->

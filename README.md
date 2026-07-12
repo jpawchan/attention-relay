@@ -25,6 +25,8 @@ referenced in the task's Context section. This placement does not guarantee
 quality, but it can make critical context easier to recover.
 
 Workers re-read the capsule before editing, verification, and reporting. The
+CLI stores bounded attempt-local command receipts for those phase briefs; an
+optional default-off gate can enforce edit → verify → report order. The
 report brief issues a fresh token bound to the current attempt and lease before
 `task finish`; the review brief binds its token to the current attempt and a
 SHA-256 manifest of the capsule and artifacts it displayed. `task accept`
@@ -36,6 +38,11 @@ The next start brief prints and consumes that handoff. Output from `status`,
 `task show`, and each completed real `run` also ends with a short, state-derived
 `Next actions` capsule.
 
+Orchestrators can run `.attention-relay/relay stats` for a read-only aggregate
+over active and archived status, attempts, reason codes, capsule sizes, phase
+receipt coverage, and post-submission warnings. Receipt coverage is command-use
+evidence, not proof of attention.
+
 ## How is this different from Agent Relay?
 
 - **Edge placement:** a deterministic task capsule appears at both ends of each
@@ -43,6 +50,8 @@ The next start brief prints and consumes that handoff. Output from `status`,
 - **Freshness gates:** finish can require a brief token for the current lease and
   attempt; accept can additionally bind its token to the exact displayed review
   evidence.
+- **Bounded evidence:** phase receipts and read-only stats expose command-use
+  coverage without storing prompts, logs, or tokens in receipt records.
 - **Handoff:** close and start briefs carry current state between orchestrator
   sessions.
 - **Claude Code hooks:** optional hooks inject the start brief and bounded next

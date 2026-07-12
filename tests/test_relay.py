@@ -817,6 +817,123 @@ class RelayTests(unittest.TestCase):
         self.assertNotEqual(replay.returncode, 0)
         self.assertIn("report-phase brief token is required", replay.stderr)
 
+    def test_phase_brief_receipts_are_bounded_and_malformed_files_are_replaced(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "brief receipts", ["receipts/**"])
+        env = self.lease_task(project, task_id, "receipt-lease")
+        receipt_path = (
+            project / ".attention-relay" / "work" / task_id
+            / "attempt-1.briefs.json"
+        )
+        receipt_path.write_text('{"phases": ["malformed"], "token": "must-disappear"}\n')
+
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "edit",
+            env=env, check=True,
+        )
+        first_size = receipt_path.stat().st_size
+        first = json.loads(receipt_path.read_text())
+        self.assertEqual(
+            set(first), {"task_id", "attempt", "lease", "capsule_digest", "phases"},
+        )
+        self.assertEqual(first["task_id"], task_id)
+        self.assertEqual(first["attempt"], 1)
+        self.assertEqual(first["lease"], "receipt-lease")
+        self.assertRegex(first["capsule_digest"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(set(first["phases"]), {"edit"})
+        self.assertEqual(first["phases"]["edit"]["count"], 1)
+        self.assertNotIn("token", receipt_path.read_text())
+
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "edit",
+            env=env, check=True,
+        )
+        second = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt_path.stat().st_size, first_size)
+        self.assertEqual(second["phases"]["edit"]["count"], 2)
+        self.assertEqual(
+            second["phases"]["edit"]["first_at"],
+            first["phases"]["edit"]["first_at"],
+        )
+
+    def test_phase_sequence_gate_enforces_order_and_edit_invalidates_report_token(self):
+        project = self.make_project()
+        config = project / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text().replace(
+            "phase_sequence_requires_briefs = false",
+            "phase_sequence_requires_briefs = true",
+        ))
+        task_id = self.create_task(project, "phase sequence", ["sequence/**"])
+        env = self.lease_task(project, task_id, "sequence-lease")
+
+        verify = self.relay(
+            project, "task", "brief", task_id, "--phase", "verify", env=env,
+        )
+        self.assertEqual(
+            verify.stderr,
+            f"error: phase sequence requires an edit brief; run `relay task brief "
+            f"{task_id} --phase edit`\n",
+        )
+        report = self.relay(
+            project, "task", "brief", task_id, "--phase", "report", env=env,
+        )
+        self.assertEqual(report.stderr, verify.stderr)
+
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "edit",
+            env=env, check=True,
+        )
+        report = self.relay(
+            project, "task", "brief", task_id, "--phase", "report", env=env,
+        )
+        self.assertEqual(
+            report.stderr,
+            f"error: phase sequence requires a verify brief; run `relay task brief "
+            f"{task_id} --phase verify`\n",
+        )
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "verify",
+            env=env, check=True,
+        )
+        _brief, stale_token = self.report_brief_token(project, task_id, env)
+        token_path = (
+            project / ".attention-relay" / "work" / task_id
+            / "finish-brief-token.json"
+        )
+        self.assertTrue(token_path.exists())
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "edit",
+            env=env, check=True,
+        )
+        self.assertFalse(token_path.exists())
+        stale = self.relay(
+            project, "task", "finish", task_id, "--status", "failed",
+            "--brief", stale_token, env=env,
+        )
+        self.assertIn("fresh report-phase brief token is required", stale.stderr)
+        _brief, fresh_token = self.report_brief_token(project, task_id, env)
+        self.relay(
+            project, "task", "finish", task_id, "--status", "failed",
+            "--brief", fresh_token, env=env, check=True,
+        )
+
+    def test_phase_sequence_gate_defaults_off_and_never_blocks_briefs(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "phase sequence off", ["sequence-off/**"])
+        env = self.lease_task(project, task_id, "sequence-off-lease")
+        self.report_brief_token(project, task_id, env)
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "verify",
+            env=env, check=True,
+        )
+        receipt_path = (
+            project / ".attention-relay" / "work" / task_id
+            / "attempt-1.briefs.json"
+        )
+        self.assertEqual(
+            set(json.loads(receipt_path.read_text())["phases"]), {"report", "verify"},
+        )
+
     def test_finish_gate_can_be_disabled(self):
         project = self.make_project()
         config = project / ".attention-relay" / "config.toml"
@@ -974,6 +1091,20 @@ class RelayTests(unittest.TestCase):
             validation.stdout,
         )
 
+    def test_non_boolean_phase_sequence_gate_fails_validate(self):
+        project = self.make_project("invalid-phase-sequence-gate")
+        config = project / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text().replace(
+            "phase_sequence_requires_briefs = false",
+            'phase_sequence_requires_briefs = "yes"',
+        ))
+        validation = self.relay(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        self.assertIn(
+            "config: phase_sequence_requires_briefs must be true or false",
+            validation.stdout,
+        )
+
     def test_return_then_retry_invalidates_report_brief_token(self):
         project = self.make_project()
         task_id = self.create_task(project, "retry brief", ["retry/**"])
@@ -1016,6 +1147,7 @@ class RelayTests(unittest.TestCase):
         self.assertIn("attempt-1.result.json", brief.stdout)
         self.assertIn("attempt-1.diff", brief.stdout)
         self.assertIn(f"review/{task_id}.txt", brief.stdout)
+        self.assertIn("Phase briefs: edit=0 verify=0 report=1", brief.stdout)
         for artifact in ("Report", "Result", "Diff"):
             self.assertRegex(brief.stdout, rf"- {artifact}: .* \(sha256:[0-9a-f]{{12}}\)")
         token_record = json.loads((
@@ -1272,8 +1404,10 @@ class RelayTests(unittest.TestCase):
         self.relay(project, "run", task_id, check=True)
         work = project / ".attention-relay" / "work" / task_id
         self.assertEqual((work / "attempt-1.diff").read_text(), "")
+        (work / "attempt-1.briefs.json").unlink()
         brief, token = self.review_brief_token(project, task_id)
         self.assertIn("Diff stat: no changes", brief.stdout)
+        self.assertIn("Phase briefs: none recorded", brief.stdout)
 
         spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
         spec.write_text(spec.read_text().replace(
@@ -1746,7 +1880,11 @@ class RelayTests(unittest.TestCase):
         self.assertNotEqual(self.relay(project, "validate").returncode, 0)
         result = self.relay(project, "run")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.state(project, task_id)["status"], "queued")
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "queued")
+        self.assertFalse(any(
+            entry.get("event") == "launched" for entry in state["history"]
+        ))
 
     def test_review_result_without_report_fails(self):
         project = self.make_project()
@@ -2070,6 +2208,120 @@ class RelayTests(unittest.TestCase):
         self.assertNotEqual(validation.returncode, 0)
         self.assertIn("dependency cycle", validation.stdout)
 
+    def test_stats_empty_runtime_is_read_only_and_denied_to_workers(self):
+        project = self.make_project()
+        runtime = project / ".attention-relay"
+
+        def snapshot():
+            return {
+                path.relative_to(runtime).as_posix(): path.read_bytes()
+                for path in runtime.rglob("*") if path.is_file()
+            }
+
+        before = snapshot()
+        stats = self.relay(project, "stats", check=True)
+        self.assertEqual(stats.stdout, "no task data\n")
+        self.assertEqual(snapshot(), before)
+        denied = self.relay(
+            project, "stats",
+            env={"RELAY_TASK_ID": "T999-worker", "RELAY_ATTEMPT": "1",
+                 "RELAY_LEASE": "worker"},
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
+
+    def test_stats_exact_mixed_outcomes_and_archived_receipt_coverage(self):
+        project = self.make_project()
+        runtime = project / ".attention-relay"
+        task_ids = [
+            self.create_task(project, "stats queued", ["queued/**"]),
+            self.create_task(project, "stats failed", ["failed/**"]),
+            self.create_task(project, "stats blocked", ["blocked/**"]),
+            self.create_task(project, "stats archived", ["archived/**"]),
+        ]
+        state_paths = [runtime / "tasks" / f"{task_id}.json" for task_id in task_ids]
+        states = [json.loads(path.read_text()) for path in state_paths]
+        states[0]["history"].append({
+            "event": "launched", "attempt": 1, "capsule_chars": 20,
+        })
+        states[1]["status"] = "failed"
+        states[1]["attempt"] = 2
+        states[1]["last_note"] = "private failure text must not appear"
+        states[1]["history"].extend([
+            {"event": "launched", "attempt": 1, "capsule_chars": 10},
+            {"event": "worker_exited", "status": "failed", "note": "worker_timeout"},
+            {"event": "launched", "attempt": 2, "capsule_chars": 30},
+            {"event": "worker_exited", "status": "failed",
+             "note": "private failure text must not appear"},
+        ])
+        states[2]["status"] = "blocked"
+        states[2]["last_note"] = "scope_violation"
+        states[2]["warning"] = "worker_exit_9_after_submission"
+        states[2]["history"].extend([
+            {"event": "launched", "attempt": 1, "capsule_chars": 40},
+            {"event": "worker_exited", "status": "blocked", "note": "scope_violation",
+             "warning": "worker_exit_9_after_submission"},
+        ])
+        states[3]["status"] = "done"
+        states[3]["history"].append({
+            "event": "launched", "attempt": 1, "capsule_chars": 50,
+        })
+        for path, state in zip(state_paths, states):
+            path.write_text(json.dumps(state))
+
+        digest = "sha256:" + "a" * 64
+
+        def write_receipt(task_id, attempt, phases):
+            work = runtime / "work" / task_id
+            work.mkdir(parents=True, exist_ok=True)
+            record = {
+                "task_id": task_id,
+                "attempt": attempt,
+                "lease": f"lease-{task_id}-{attempt}",
+                "capsule_digest": digest,
+                "phases": {
+                    phase: {"first_at": "2026-01-01T00:00:00Z",
+                            "last_at": "2026-01-01T00:00:00Z", "count": 1}
+                    for phase in phases
+                },
+            }
+            (work / f"attempt-{attempt}.briefs.json").write_text(json.dumps(record))
+
+        write_receipt(task_ids[0], 1, ("edit", "report"))
+        write_receipt(task_ids[1], 1, ("edit", "verify", "report"))
+        write_receipt(task_ids[1], 2, ("edit",))
+        write_receipt(task_ids[3], 1, ("report",))
+        self.relay(project, "archive", check=True)
+        archived_receipt = (
+            runtime / "archive" / f"{task_ids[3]}.work" / "attempt-1.briefs.json"
+        )
+        self.assertTrue(archived_receipt.exists())
+
+        stats = self.relay(project, "stats", check=True)
+        self.assertEqual(
+            stats.stdout,
+            "Status counts:\n"
+            "- blocked=1\n"
+            "- done=1\n"
+            "- failed=1\n"
+            "- queued=1\n"
+            "Attempts histogram:\n"
+            "- 1=3\n"
+            "- 2=1\n"
+            "Failure/blocked reason codes:\n"
+            "- other=1\n"
+            "- scope_violation=1\n"
+            "- worker_timeout=1\n"
+            "Capsule chars:\n"
+            "- min=10 median=30 max=50\n"
+            "Phase brief coverage (command-use evidence, not proof of attention):\n"
+            "- edit=3/5\n"
+            "- verify=1/5\n"
+            "- report=3/5\n"
+            "Post-submission warnings: 1\n",
+        )
+        self.assertNotIn("private failure text", stats.stdout)
+
     def test_archive_preflights_all_destinations_before_moving(self):
         project = self.make_project()
         task_ids = [
@@ -2167,6 +2419,11 @@ module["cmd_archive"](SimpleNamespace())
         digest_line, capsule = brief.split("\n\n", 1)
         digest = hashlib.sha256(capsule.encode()).hexdigest()
         self.assertEqual(digest_line, f"Content digest: sha256:{digest}")
+        launched = next(
+            entry for entry in self.state(project, task_id)["history"]
+            if entry.get("event") == "launched"
+        )
+        self.assertEqual(launched["capsule_chars"], len(capsule))
         self.assertTrue(prompt.startswith(capsule))
         self.assertTrue(prompt.endswith(capsule))
         self.assertEqual(prompt.count(capsule), 2)

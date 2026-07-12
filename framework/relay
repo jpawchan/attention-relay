@@ -256,6 +256,13 @@ def configured_accept_requires_brief(config):
     return required
 
 
+def configured_phase_sequence_requires_briefs(config):
+    required = cfg_get(config, "gates.phase_sequence_requires_briefs", False)
+    if not isinstance(required, bool):
+        raise ValueError("phase_sequence_requires_briefs must be true or false")
+    return required
+
+
 def command_template(config, task):
     tier = task.get("tier", "default")
     return (
@@ -538,6 +545,60 @@ def untrusted_log_tail_block(path, maximum=1500):
 
 def brief_token_path(relay_dir, task_id):
     return os.path.join(work_dir(relay_dir, task_id), "finish-brief-token.json")
+
+
+def phase_receipts_path(relay_dir, task_id, attempt, archived=False):
+    if archived:
+        directory = os.path.join(archive_dir(relay_dir), task_id + ".work")
+    else:
+        directory = work_dir(relay_dir, task_id)
+    return os.path.join(directory, "attempt-%d.briefs.json" % attempt)
+
+
+def read_phase_receipts(path, task_id=None, attempt=None, lease=None, capsule_digest=None):
+    """Read one bounded receipt record, returning None for any malformed shape."""
+    try:
+        value = read_json(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != {
+            "task_id", "attempt", "lease", "capsule_digest", "phases"}:
+        return None
+    if (
+            not isinstance(value.get("task_id"), str)
+            or isinstance(value.get("attempt"), bool)
+            or not isinstance(value.get("attempt"), int)
+            or value["attempt"] < 1
+            or not isinstance(value.get("lease"), str)
+            or not value["lease"]
+            or not isinstance(value.get("capsule_digest"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["capsule_digest"])
+            or not isinstance(value.get("phases"), dict)):
+        return None
+    if task_id is not None and value["task_id"] != task_id:
+        return None
+    if attempt is not None and value["attempt"] != attempt:
+        return None
+    if lease is not None and value["lease"] != lease:
+        return None
+    if capsule_digest is not None and value["capsule_digest"] != capsule_digest:
+        return None
+    phases = value["phases"]
+    if not set(phases).issubset(PHASE_CHECKLISTS):
+        return None
+    for receipt in phases.values():
+        if not isinstance(receipt, dict) or set(receipt) != {"first_at", "last_at", "count"}:
+            return None
+        if (
+                not isinstance(receipt.get("first_at"), str)
+                or not receipt["first_at"]
+                or not isinstance(receipt.get("last_at"), str)
+                or not receipt["last_at"]
+                or isinstance(receipt.get("count"), bool)
+                or not isinstance(receipt.get("count"), int)
+                or receipt["count"] < 1):
+            return None
+    return value
 
 
 def review_token_path(relay_dir, task_id):
@@ -1590,6 +1651,9 @@ def cmd_task_brief(args):
         die("task brief is available only inside a leased worker process")
     if worker_id != args.id:
         die("a worker may brief only its assigned task: {}".format(worker_id))
+    phase_sequence_requires_briefs = configured_phase_sequence_requires_briefs(
+        load_config(relay_dir),
+    )
     token = None
     with task_lock(relay_dir, args.id):
         task = load_task(relay_dir, args.id)
@@ -1606,6 +1670,45 @@ def cmd_task_brief(args):
         _digest, separator, capsule = stored_brief.partition("\n\n")
         if not separator or not capsule.startswith("# Critical Context Capsule"):
             die("current attempt capsule is missing or invalid; rerun the task")
+        capsule_digest = "sha256:" + hashlib.sha256(capsule.encode("utf-8")).hexdigest()
+        receipts_file = phase_receipts_path(relay_dir, task["id"], attempt)
+        receipts = read_phase_receipts(
+            receipts_file, task["id"], attempt, worker_lease, capsule_digest,
+        )
+        if receipts is None:
+            receipts = {
+                "task_id": task["id"],
+                "attempt": attempt,
+                "lease": worker_lease,
+                "capsule_digest": capsule_digest,
+                "phases": {},
+            }
+        phases = receipts["phases"]
+        if phase_sequence_requires_briefs:
+            required_phases = {
+                "verify": ("edit",),
+                "report": ("edit", "verify"),
+            }.get(args.phase, ())
+            for missing_phase in required_phases:
+                if missing_phase not in phases:
+                    die(
+                        "phase sequence requires {} {} brief; run `relay task brief {} "
+                        "--phase {}`".format(
+                            "an" if missing_phase == "edit" else "a",
+                            missing_phase, task["id"], missing_phase,
+                        )
+                    )
+        recorded_at = now()
+        previous = phases.get(args.phase)
+        phases[args.phase] = {
+            "first_at": previous["first_at"] if previous else recorded_at,
+            "last_at": recorded_at,
+            "count": previous["count"] + 1 if previous else 1,
+        }
+        atomic_json(receipts_file, receipts)
+        if phase_sequence_requires_briefs and args.phase == "edit":
+            with suppress(FileNotFoundError):
+                os.unlink(brief_token_path(relay_dir, task["id"]))
         if args.phase == "report":
             import secrets
 
@@ -1818,6 +1921,10 @@ def orchestrator_review_brief(relay_dir, task_id, include_log_tail=False):
                     omitted_prior_attempts += 1
         log = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.log" % attempt)
         log_tail = untrusted_log_tail_block(log) if include_log_tail else None
+        receipts = read_phase_receipts(
+            phase_receipts_path(relay_dir, task["id"], attempt),
+            task["id"], attempt,
+        )
         token = secrets.token_hex(32)
         token_record = dict(manifest)
         token_record["token"] = token
@@ -1857,6 +1964,13 @@ def orchestrator_review_brief(relay_dir, task_id, include_log_tail=False):
     say("- Observed changed paths: " + (
         ", ".join(observed) if observed else "(none recorded)"
     ))
+    if receipts is None:
+        say("Phase briefs: none recorded")
+    else:
+        say("Phase briefs: " + " ".join(
+            "{}={}".format(phase, receipts["phases"].get(phase, {}).get("count", 0))
+            for phase in ("edit", "verify", "report")
+        ))
     if not diff_summary["files"]:
         say("Diff stat: no changes")
     else:
@@ -2361,6 +2475,8 @@ def prepare_worker(relay_dir, config, task, memory_entries):
         "argv": argv,
         "prompt_file": prompt_file,
         "log_path": os.path.join(directory, "attempt-%d.log" % attempt),
+        "capsule_chars": len(capsule),
+        "capsule_digest": digest,
     }
 
 
@@ -2660,6 +2776,7 @@ def run_wave(args, relay_dir, context):
         except (OSError, RuntimeError, ValueError) as error:
             die(str(error))
         context["task_ids"] = [task["id"] for task in wave]
+        prepared_by_id = {item["task"]["id"]: item for item in prepared}
         for task in wave:
             with task_lock(relay_dir, task["id"]):
                 current = load_task(relay_dir, task["id"])
@@ -2670,7 +2787,8 @@ def run_wave(args, relay_dir, context):
                     "pid": None, "started_at": now(), "lease": context["lease"],
                 }
                 record(current, "launched", attempt=current.get("attempt", 1),
-                       lease=context["lease"])
+                       lease=context["lease"],
+                       capsule_chars=prepared_by_id[task["id"]]["capsule_chars"])
                 save_task(relay_dir, current)
 
     outcomes = {}
@@ -2785,6 +2903,146 @@ def cmd_status(args):
                 task["id"], task["status"], note, question, warning,
             ))
     say_next_actions(relay_dir)
+
+
+REASON_CODE_RE = re.compile(r"^[a-z_]+(_\d+)?$")
+POST_SUBMISSION_WARNING_RE = re.compile(r"^worker_exit_\d+_after_submission$")
+
+
+def stats_count_lines(counts, limit=12, numeric=False):
+    items = sorted(counts.items(), key=lambda item: item[0] if numeric else str(item[0]))
+    if len(items) > limit:
+        shown = items[:limit - 1]
+        omitted = sum(count for _name, count in items[limit - 1:])
+        existing_other = next((count for name, count in shown if name == "other"), 0)
+        shown = [(name, count) for name, count in shown if name != "other"]
+        shown.append(("other", existing_other + omitted))
+        items = shown
+    return ["- {}={}".format(name, count) for name, count in items] or ["- none"]
+
+
+def cmd_stats(args):
+    """Print bounded aggregate runtime evidence without write-capable locks."""
+    require_orchestrator()
+    relay_dir = require_relay_dir()
+    active = load_all_tasks(relay_dir)
+    archived = load_archived_tasks(relay_dir)
+    located_tasks = [(task, False) for task in active] + [
+        (task, True) for task in archived
+    ]
+    if not located_tasks:
+        say("no task data")
+        return
+
+    statuses = {}
+    attempts = {}
+    reasons = {}
+    capsule_chars = []
+    warning_count = 0
+    attempt_keys = set()
+    receipt_phases = {phase: set() for phase in ("edit", "verify", "report")}
+    receipt_name = re.compile(r"^attempt-(\d+)\.briefs\.json$")
+
+    for task, archived_task in located_tasks:
+        status = task.get("status")
+        status_code = status if status in STATUSES else "other"
+        statuses[status_code] = statuses.get(status_code, 0) + 1
+        attempt = task.get("attempt")
+        if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0:
+            attempts[attempt] = attempts.get(attempt, 0) + 1
+
+        relevant_exits = []
+        warning_entries = 0
+        history = task.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        for entry in history:
+            if not isinstance(entry, dict) or entry.get("event") not in {
+                    "launched", "worker_exited"}:
+                continue
+            entry_attempt = entry.get("attempt")
+            if entry.get("event") == "launched":
+                if (
+                        isinstance(entry_attempt, int)
+                        and not isinstance(entry_attempt, bool)
+                        and entry_attempt > 0):
+                    attempt_keys.add((task.get("id"), entry_attempt))
+                chars = entry.get("capsule_chars")
+                if isinstance(chars, int) and not isinstance(chars, bool) and chars >= 0:
+                    capsule_chars.append(chars)
+            else:
+                if entry.get("status") in {"failed", "blocked"}:
+                    relevant_exits.append(entry)
+                if (
+                        isinstance(entry.get("warning"), str)
+                        and POST_SUBMISSION_WARNING_RE.fullmatch(entry["warning"])):
+                    warning_count += 1
+                    warning_entries += 1
+        if relevant_exits:
+            for entry in relevant_exits:
+                note = entry.get("note")
+                code = note if isinstance(note, str) and REASON_CODE_RE.fullmatch(note) else "other"
+                reasons[code] = reasons.get(code, 0) + 1
+        elif status in {"failed", "blocked"}:
+            note = task.get("last_note")
+            code = note if isinstance(note, str) and REASON_CODE_RE.fullmatch(note) else "other"
+            reasons[code] = reasons.get(code, 0) + 1
+        if (
+                not warning_entries
+                and isinstance(task.get("warning"), str)
+                and POST_SUBMISSION_WARNING_RE.fullmatch(task["warning"])):
+            warning_count += 1
+
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+            continue
+        directory = (
+            os.path.join(archive_dir(relay_dir), task_id + ".work")
+            if archived_task else work_dir(relay_dir, task_id)
+        )
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            names = []
+        for name in names:
+            match = receipt_name.fullmatch(name)
+            if not match:
+                continue
+            receipt_attempt = int(match.group(1))
+            receipts = read_phase_receipts(
+                os.path.join(directory, name), task_id, receipt_attempt,
+            )
+            if receipts is None:
+                continue
+            key = (task_id, receipt_attempt)
+            attempt_keys.add(key)
+            for phase in receipt_phases:
+                if phase in receipts["phases"]:
+                    receipt_phases[phase].add(key)
+
+    say("Status counts:")
+    for line in stats_count_lines(statuses):
+        say(line)
+    say("Attempts histogram:")
+    for line in stats_count_lines(attempts, numeric=True):
+        say(line)
+    say("Failure/blocked reason codes:")
+    for line in stats_count_lines(reasons):
+        say(line)
+    say("Capsule chars:")
+    if capsule_chars:
+        ordered_chars = sorted(capsule_chars)
+        say("- min={} median={} max={}".format(
+            ordered_chars[0], ordered_chars[(len(ordered_chars) - 1) // 2],
+            ordered_chars[-1],
+        ))
+    else:
+        say("- none recorded")
+    say("Phase brief coverage (command-use evidence, not proof of attention):")
+    denominator = len(attempt_keys)
+    for phase in ("edit", "verify", "report"):
+        say("- {}={}/{}".format(phase, len(receipt_phases[phase]), denominator))
+    say("Post-submission warnings: {}".format(warning_count))
 
 
 def dependency_cycles(tasks):
@@ -2922,6 +3180,7 @@ def cmd_validate(args):
         configured_finish_requires_brief(config)
         configured_report_requires_sections(config)
         configured_accept_requires_brief(config)
+        configured_phase_sequence_requires_briefs(config)
         sample = {"tier": "default"}
         template = command_template(config, sample)
         if not isinstance(template, str) or not template.strip():
@@ -3273,6 +3532,9 @@ def build_parser():
 
     command = commands.add_parser("status", help="show tasks needing attention")
     command.set_defaults(function=cmd_status)
+
+    command = commands.add_parser("stats", help="show read-only aggregate task statistics")
+    command.set_defaults(function=cmd_stats)
 
     command = commands.add_parser("validate", help="check config and task state")
     command.set_defaults(function=cmd_validate)

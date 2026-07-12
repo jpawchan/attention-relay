@@ -33,6 +33,9 @@ capsule_max_chars = 4000
 worker_timeout_minutes = 60
 
 [gates]
+# Optionally require edit -> verify -> report phase-brief order. Receipts are
+# recorded regardless; the sequence gate is off by default.
+phase_sequence_requires_briefs = false
 # Require a fresh report-phase brief token before a worker can finish.
 finish_requires_brief = true
 # Require needs_review reports to use the exact worker.md section structure.
