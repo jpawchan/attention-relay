@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -230,8 +231,12 @@ def configured_limits(config, override=None):
 
 
 def configured_worker_timeout_minutes(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        raise ValueError("worker_timeout_minutes must be a non-negative number")
+    if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0):
+        raise ValueError("worker_timeout_minutes must be a finite non-negative number")
     return float(value)
 
 
@@ -539,6 +544,11 @@ SECRET_VALUE_RE = re.compile(
     r"(?i)(\b(?:brief|review|bearer|access|refresh|api|auth|session)[ _-]?"
     r"(?:token|key)?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|\S+)"
 )
+LABEL_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:password|passwd|pwd|secret|token|key|api_?key|auth|bearer|"
+    r"credential|cookie|session)\b\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
 BEARER_RE = re.compile(r"(?i)(\bbearer\s+)\S+")
 
 
@@ -551,6 +561,7 @@ def sanitize_log_text(text):
     text = ENV_ASSIGNMENT_RE.sub(r"\1[redacted]", text)
     text = ENV_COLON_RE.sub(r"\1[redacted]", text)
     text = SECRET_VALUE_RE.sub(r"\1[redacted]", text)
+    text = LABEL_ASSIGNMENT_RE.sub(r"\1[redacted]", text)
     text = BEARER_RE.sub(r"\1[redacted]", text)
     sensitive_names = re.compile(r"(?i)(token|secret|pass|key|auth|credential|cookie|session)")
     values = {
@@ -760,11 +771,23 @@ def report_section_problems(text, expected_status):
     """Return problems with the worker report template, without changing state."""
     sections = {name: None for name in REPORT_SECTIONS}
     current = None
-    fenced = False
+    fence_character = None
+    fence_length = 0
     for line in text.splitlines():
-        if line.startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and (line == "##" or line.startswith("## ")):
+        fence = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if fence_character is None and fence:
+            fence_character = fence.group(1)[0]
+            fence_length = len(fence.group(1))
+        elif fence_character is not None:
+            closing = re.fullmatch(r" {0,3}([`~]+)[ \t]*", line)
+            if (
+                    closing
+                    and closing.group(1)[0] == fence_character
+                    and set(closing.group(1)) == {fence_character}
+                    and len(closing.group(1)) >= fence_length):
+                fence_character = None
+                fence_length = 0
+        elif line == "##" or line.startswith("## "):
             name = line[3:] if line.startswith("## ") else ""
             if name in sections:
                 if sections[name] is None:
@@ -827,7 +850,13 @@ def read_json(path):
     if os.path.islink(path) or not os.path.isfile(path):
         raise OSError("not a regular JSON file: {}".format(path))
     with open(path, encoding="utf-8") as source:
-        return json.load(source)
+        text = source.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise
+    except ValueError as error:
+        raise json.JSONDecodeError(str(error), text, 0) from error
 
 
 def load_task(relay_dir, task_id, include_archive=False):

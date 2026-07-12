@@ -222,6 +222,23 @@ path.write_bytes(b"\xff\xfe")
 '''
 
 
+OVERSIZED_INTEGER_RESULT_WORKER = r'''
+import json
+import os
+from pathlib import Path
+
+rd = Path(os.environ["RELAY_DIR"])
+tid = os.environ["RELAY_TASK_ID"]
+attempt = os.environ["RELAY_ATTEMPT"]
+path = rd / "work" / tid / f"attempt-{attempt}.result.json"
+path.write_text(
+    '{"status":"failed","note":"otherwise valid","at":"now","lease":'
+    + json.dumps(os.environ["RELAY_LEASE"])
+    + ',"changed_paths":[],"oversized":' + "9" * 5000 + "}\n"
+)
+'''
+
+
 STAGE_WORKER = r'''
 import os
 from pathlib import Path
@@ -892,6 +909,31 @@ class RelayTests(unittest.TestCase):
             first["phases"]["edit"]["first_at"],
         )
 
+    def test_oversized_integer_phase_receipt_is_replaced(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "oversized receipt", ["receipts/**"])
+        env = self.lease_task(project, task_id, "oversized-receipt-lease")
+        work = project / ".attention-relay" / "work" / task_id
+        receipt_path = work / "attempt-1.briefs.json"
+        digest = (work / "attempt-1.brief.md").read_text().splitlines()[0].removeprefix(
+            "Content digest: ",
+        )
+        receipt_path.write_text(
+            '{"task_id":' + json.dumps(task_id)
+            + ',"attempt":1,"lease":"oversized-receipt-lease","capsule_digest":'
+            + json.dumps(digest)
+            + ',"phases":{"edit":{"first_at":"now","last_at":"now","count":'
+            + "9" * 5000 + "}}}\n"
+        )
+
+        self.relay(
+            project, "task", "brief", task_id, "--phase", "edit",
+            env=env, check=True,
+        )
+        replaced = json.loads(receipt_path.read_text())
+        self.assertEqual(set(replaced["phases"]), {"edit"})
+        self.assertEqual(replaced["phases"]["edit"]["count"], 1)
+
     def test_phase_sequence_gate_enforces_order_and_edit_invalidates_report_token(self):
         project = self.make_project()
         config = project / ".attention-relay" / "config.toml"
@@ -1059,6 +1101,50 @@ class RelayTests(unittest.TestCase):
         )
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("missing required report section `## Verification`", rejected.stderr)
+
+    def test_report_heading_inside_three_space_indented_fence_does_not_count(self):
+        project, task_id, env, report, token = self.prepare_finish("indented-fence")
+        report.write_text(
+            "# task report\n\n## Result\nneeds_review\n\n## Changes\n- changes\n\n"
+            "   ```\n## Verification\n- fake verification\n   ````\n\n"
+            "## Decisions and risks\n- none\n"
+        )
+        rejected = self.relay(
+            project, "task", "finish", task_id, "--status", "needs_review",
+            "--brief", token, env=env,
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("missing required report section `## Verification`", rejected.stderr)
+
+    def test_report_fence_closes_only_with_matching_character(self):
+        project, task_id, env, report, token = self.prepare_finish("fence-character")
+        report.write_text(
+            "# task report\n\n## Result\nneeds_review\n\n## Changes\n- changes\n\n"
+            "```\n~~~\n## Verification\n- fake verification\n```\n\n"
+            "## Decisions and risks\n- none\n"
+        )
+        rejected = self.relay(
+            project, "task", "finish", task_id, "--status", "needs_review",
+            "--brief", token, env=env,
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("missing required report section `## Verification`", rejected.stderr)
+        self.assertNotIn("missing required report section `## Decisions", rejected.stderr)
+
+    def test_report_fence_closes_only_at_opening_length_or_longer(self):
+        project, task_id, env, report, token = self.prepare_finish("fence-length")
+        report.write_text(
+            "# task report\n\n## Result\nneeds_review\n\n## Changes\n- changes\n\n"
+            "````\n```\n## Verification\n- fake verification\n````\n\n"
+            "## Decisions and risks\n- none\n"
+        )
+        rejected = self.relay(
+            project, "task", "finish", task_id, "--status", "needs_review",
+            "--brief", token, env=env,
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("missing required report section `## Verification`", rejected.stderr)
+        self.assertNotIn("missing required report section `## Decisions", rejected.stderr)
 
     def test_crlf_structured_report_is_accepted(self):
         project, task_id, env, report, token = self.prepare_finish("crlf-report")
@@ -1365,6 +1451,23 @@ class RelayTests(unittest.TestCase):
             "--include-log-tail is valid only for the review phase", rejected.stderr,
         )
 
+    def test_sanitize_log_text_redacts_lowercase_and_mixed_case_labels(self):
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_log_sanitizer_probe")
+        sanitize = module["sanitize_log_text"]
+        self.assertEqual(sanitize("password: hunter2\n"), "password: [redacted]\n")
+        labels = (
+            "password", "passwd", "pwd", "secret", "token", "key", "api_key",
+            "apikey", "auth", "bearer", "credential", "cookie", "session",
+        )
+        for label in labels:
+            mixed_case = label.title()
+            for separator in (":", "="):
+                with self.subTest(label=mixed_case, separator=separator):
+                    self.assertEqual(
+                        sanitize(f"{mixed_case}{separator} hunter2\n"),
+                        f"{mixed_case}{separator} [redacted]\n",
+                    )
+
     def test_review_token_invalidated_by_return_and_accept_gate_off(self):
         project = self.make_project()
         self.configure(project, self.write_worker(GOOD_WORKER))
@@ -1453,6 +1556,22 @@ class RelayTests(unittest.TestCase):
         self.relay(
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
+
+    def test_review_manifest_fresh_compile_accepts_without_stored_attempt_brief(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "fresh review capsule", ["fresh/**"])
+        self.relay(project, "run", task_id, check=True)
+        work = project / ".attention-relay" / "work" / task_id
+        (work / "attempt-1.brief.md").unlink()
+
+        brief, token = self.review_brief_token(project, task_id)
+        self.assertTrue(brief.stdout.startswith("# Critical Context Capsule\n"))
+        self.assertTrue((work / "review-brief-token.json").exists())
+        self.relay(
+            project, "task", "accept", task_id, "--brief", token, check=True,
+        )
+        self.assertEqual(self.state(project, task_id)["status"], "done")
 
     def test_review_brief_requires_regular_complete_evidence(self):
         module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_review_hash_probe")
@@ -2174,6 +2293,17 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(state["last_note"], "invalid_worker_output")
         self.assertNotIn("runner", state)
 
+    def test_oversized_integer_result_fails_without_stale_runner(self):
+        project = self.make_project()
+        worker = self.write_worker(OVERSIZED_INTEGER_RESULT_WORKER)
+        self.configure(project, worker)
+        task_id = self.create_task(project, "oversized integer output", ["src/**"])
+        self.relay(project, "run", task_id, check=True)
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "invalid_worker_output")
+        self.assertNotIn("runner", state)
+
     def test_nested_runtime_symlink_is_rejected_without_overwrite(self):
         project = self.make_project()
         worker = self.write_worker(GOOD_WORKER)
@@ -2354,11 +2484,37 @@ class RelayTests(unittest.TestCase):
         self.assertNotEqual(validation.returncode, 0)
         for message in (
                 "tier 'broken': no worker command configured",
-                "worker_timeout_minutes must be a non-negative number",
+                "worker_timeout_minutes must be a finite non-negative number",
                 "capsule_max_chars must be a positive integer",
                 "tier name must be non-blank",
                 "tier name 'default' is reserved"):
             self.assertIn(message, validation.stdout)
+
+    def test_non_finite_global_and_per_tier_timeouts_are_rejected(self):
+        message = "worker_timeout_minutes must be a finite non-negative number"
+        for value in ("nan", "inf"):
+            for location in ("global", "tier"):
+                with self.subTest(value=value, location=location):
+                    project = self.make_project(f"non-finite-{location}-{value}")
+                    self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+                    config = project / ".attention-relay" / "config.toml"
+                    if location == "global":
+                        config.write_text(config.read_text().replace(
+                            "worker_timeout_minutes = 1",
+                            f"worker_timeout_minutes = {value}",
+                        ))
+                    else:
+                        config.write_text(config.read_text() + (
+                            f"\n[tiers.bad]\nworker_timeout_minutes = {value}\n"
+                        ))
+
+                    validation = self.relay(project, "validate")
+                    self.assertEqual(validation.returncode, 1)
+                    self.assertIn(message, validation.stdout)
+                    tiers = self.relay(project, "tiers")
+                    self.assertEqual(tiers.returncode, 1)
+                    self.assertIn(message, tiers.stderr)
+                    self.assertNotIn(f"{value} minutes", tiers.stdout)
 
     def test_tiers_output_is_exact_read_only_redacted_and_worker_denied(self):
         project = self.make_project()

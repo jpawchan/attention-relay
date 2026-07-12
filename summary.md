@@ -14,6 +14,7 @@ It coordinates worker CLIs; it is not an agent model, package manager, patch que
 - The implementation is complete and CI is green (4 matrix jobs passed on the publish commit).
 - Local verification on 2026-07-12: the full end-to-end suite passes, covering strict configured tiers with per-task capsule/time limits and redacted tier inspection, mandatory close-handoff goals and bounded avoid notes, bounded phase receipts, the default-off strict sequence gate, archived receipt coverage, read-only aggregate stats, structured reports, evidence-bound review tokens, streaming diff stats, retry pointers, opt-in sanitized log tails, bounded decision questions, and post-compaction Claude Code state re-injection.
 - An independent audit found and fixed four defects before release: an unlocked handoff read-modify-write race, a soft hook-output cap, a same-second handoff boundary loss, and non-executable command forms in `worker.md`. All have regression tests.
+- The update release audit found five blocking malformed-input and validation defects; oversized JSON integers, indented report fences, lowercase credential labels, and non-finite timeouts are now fixed with regression coverage.
 - One single-test error was observed once in seven local suite runs under heavy parallel load and never reproduced (locally or in CI). If a test flakes in CI, suspect timing-sensitive lock/interleaving tests first.
 - No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) was deliberately deferred, not forgotten.
 - The upstream working copy on the author's machine contains a live, Git-ignored `.agent-relay/` (v1) runtime that was used to orchestrate this build. It is dev tooling, not part of the project; v2 installs create `.attention-relay/`.
@@ -29,7 +30,7 @@ python3 -m py_compile framework/relay tests/test_relay.py
 python3 tests/test_relay.py
 ```
 
-Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; the suite ends with `OK` (temp Git repos and stub workers, no network or live agent calls).
+Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; the unittest summary ends with `OK`, and the expected `[T001-lease-guard] stale finalizer ignored` probe diagnostic may follow it (temp Git repos and stub workers, no network or live agent calls).
 
 If you run the suite from inside a Relay-leased worker process, unset the inherited worker env first or fixtures will reject orchestrator commands:
 
@@ -76,7 +77,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
 | `framework/config.example.toml` | Default worker command (memory-clean Hermes), tiers, limits, gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
-| `tests/test_relay.py` | Canonical 86-test end-to-end suite and all stub worker fixtures. |
+| `tests/test_relay.py` | Canonical 96-test end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
 | `prompts/create-framework.md` | Standalone generation prompt with the embedded exact SPEC copy (BEGIN SPEC / END SPEC markers). |
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
@@ -192,4 +193,4 @@ Environment variables (all read/written in `framework/relay`): `RELAY_DIR` (runt
 | Add a new orchestrator brief phase | `orchestrator_*_brief` functions + `cmd_orchestrator_brief` + `build_parser` in `framework/relay`; `framework/orchestrator.md`; SPEC.md + embedded copy; new tests. |
 | Change the default capsule budget | `configured_capsule_max_chars` in `framework/relay`; `framework/config.example.toml`; SPEC.md + embedded copy; budget tests in `tests/test_relay.py`. |
 
-Last updated 2026-07-12 — Strict tiers, per-tier limits, and read-only tier inspection added.
+Last updated 2026-07-12 — Compaction-aware SessionStart re-grounding and the update release audit/fix cycle completed.

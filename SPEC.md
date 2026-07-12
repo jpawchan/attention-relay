@@ -405,8 +405,10 @@ sequence-gate change to finish-token one-use semantics.
 For `needs_review`, a separate default-on report gate reads the report as UTF-8
 after finish-token identity checks and before writing the result or consuming the
 token. It requires the exact level-2 headings `Result`, `Changes`,
-`Verification`, and `Decisions and risks` outside triple-backtick or triple-tilde
-fences. Result, Changes, and Verification bodies must be nonblank, and Result's
+`Verification`, and `Decisions and risks` outside fences opened by up to three
+leading spaces and three or more backticks or tildes. A fence closes only with up
+to three leading spaces and at least the opening run's length of the same
+character. Result, Changes, and Verification bodies must be nonblank, and Result's
 first nonblank body line must exactly equal the submitted status. Missing,
 non-regular, undecodable, or malformed reports are rejected with a precise
 problem and instructions to correct the report and refinish with the same token.
@@ -507,8 +509,8 @@ automatic rules, saved memory, and preloaded skills while preserving the user's
 configured model and reasoning.
 
 `max_parallel` and `capsule_max_chars` are positive integers. The capsule limit
-defaults to 4000 characters. The timeout is a non-negative number in minutes;
-zero disables it.
+defaults to 4000 characters. The timeout is a finite non-negative number in
+minutes; zero disables it.
 
 All gate values must be booleans. `phase_sequence_requires_briefs` defaults to
 `false` when absent; the other three gates default to `true`.
