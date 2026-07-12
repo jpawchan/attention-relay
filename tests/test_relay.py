@@ -287,7 +287,7 @@ class RelayTests(unittest.TestCase):
             merged.update({k: str(v) for k, v in env.items()})
         result = subprocess.run(
             [str(arg) for arg in argv], cwd=cwd, env=merged, text=True,
-            capture_output=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
         )
         if check and result.returncode:
             self.fail(
