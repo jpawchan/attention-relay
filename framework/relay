@@ -38,6 +38,7 @@ MANAGED_FILES = (
 )
 MANAGED_DIRS = ("tasks", "work", "archive", ".locks")
 HOOK_OUTPUT_MAX_CHARS = 9000
+HANDOFF_MAX_CHARS = 4000
 CLAUDE_COMPACT_NOTICE = (
     "attention-relay: context was compacted; state re-injected below."
 )
@@ -1906,6 +1907,77 @@ def limited_lines(values, limit=8):
     return rendered or ["(none)"]
 
 
+def handoff_task_line(task_id, title, outcome, include_outcome=True):
+    """Render one done value while preserving its id prefix and 240-char bound."""
+    prefix = task_id + ": "
+    suffix = ""
+    if include_outcome and outcome:
+        suffix = " — outcome: " + outcome
+    title_budget = max(0, 240 - len(prefix) - len(suffix))
+    bounded_title = flatten_bounded_text(title, title_budget)
+    return (prefix + bounded_title + suffix)[:240]
+
+
+def render_handoff(
+        generated_at, goal, working_tree, done, decisions, next_ids, unresolved,
+        notes, avoid_notes):
+    """Render a handoff with deterministic section-aware budget degradation."""
+    warning = {
+        True: "warning: uncommitted Git-visible changes at close",
+        None: "warning: working-tree check unavailable at close",
+    }.get(working_tree)
+    limits = {name: 8 for name in ("done", "decisions", "next", "unresolved")}
+
+    def build(include_outcomes):
+        sections = [
+            "# Orchestrator handoff", "generated_at: " + generated_at,
+            "consumed_at: (not yet)", "goal: " + goal,
+        ]
+        if warning:
+            sections.append(warning)
+        values_by_name = {
+            "done": [
+                handoff_task_line(task_id, title, outcome, include_outcomes)
+                for task_id, title, outcome in done
+            ],
+            "decisions": decisions,
+            "next": next_ids,
+            "unresolved": unresolved,
+        }
+        for name in ("done", "decisions", "next", "unresolved"):
+            sections.append(name + ":")
+            sections.extend(
+                "- " + line for line in limited_lines(
+                    values_by_name[name], limit=limits[name],
+                )
+            )
+        if notes:
+            sections.append("notes:")
+            sections.extend("- " + note for note in notes)
+        sections.append("avoid:")
+        sections.extend(
+            "- " + line for line in limited_lines(avoid_notes or ["(fill in)"])
+        )
+        return "\n".join(sections) + "\n"
+
+    content = build(include_outcomes=True)
+    if len(content) <= HANDOFF_MAX_CHARS:
+        return content
+
+    content = build(include_outcomes=False)
+    for group in (("done", "decisions"), ("next", "unresolved")):
+        while len(content) > HANDOFF_MAX_CHARS and any(limits[name] for name in group):
+            for name in group:
+                if len(content) <= HANDOFF_MAX_CHARS:
+                    break
+                if limits[name]:
+                    limits[name] -= 1
+                    content = build(include_outcomes=False)
+    if len(content) > HANDOFF_MAX_CHARS:
+        raise RuntimeError("bounded handoff fields exceed the 4000-character budget")
+    return content
+
+
 def orchestrator_start_brief(
         relay_dir, tasks, consume_handoff=True, include_levels_ask=True):
     say("Orchestrator role:")
@@ -2184,41 +2256,60 @@ def orchestrator_run_brief(relay_dir, tasks):
         say("- none")
 
 
-def orchestrator_close_brief(relay_dir, tasks, goal, avoid_notes):
+def working_tree_state(root):
+    """Return True for dirty, False for clean, and None when Git is unavailable."""
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    try:
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run(
+                [
+                    "git", "-C", root, "status", "--porcelain=v1",
+                    "--untracked-files=normal", "--ignore-submodules=none",
+                ],
+                env=env, stdout=output, stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if result.returncode:
+                return None
+            return output.tell() > 0
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def orchestrator_close_brief(
+        relay_dir, tasks, archived_tasks, goal, avoid_notes, notes, working_tree):
+    done_candidates = []
+    decisions = []
+    for task in tasks + archived_tasks:
+        for entry in task.get("history", []):
+            if entry.get("event") == "accepted":
+                done_candidates.append((
+                    entry.get("at", ""), task["id"], task.get("title", ""),
+                    flatten_bounded_text(entry.get("note", ""), 120),
+                ))
+            if entry.get("event") == "decided":
+                decisions.append((entry.get("at", ""), "{}: {}".format(
+                    task["id"], entry.get("answer", ""),
+                )))
+    decisions = [text for _at, text in sorted(decisions, reverse=True)]
+    next_ids = [task["id"] for task in tasks
+                if task.get("status") in {"queued", "needs_review"}]
+    unresolved = [task["id"] for task in tasks
+                  if task.get("status") == "needs_decision"]
     with file_lock(lock_path(relay_dir, "orchestrator-handoff")):
         previous = read_handoff(relay_dir)
         previous_at = handoff_field(previous, "generated_at")
         previous_done = handoff_done_ids(previous)
         done = {}
-        decisions = []
-        for task in tasks + load_archived_tasks(relay_dir):
-            for entry in task.get("history", []):
-                if entry.get("event") == "accepted" and (
-                        not previous_at or entry.get("at", "") >= previous_at):
-                    if task["id"] not in previous_done:
-                        done[task["id"]] = "{}: {}".format(
-                            task["id"], task.get("title", ""),
-                        )
-                if entry.get("event") == "decided":
-                    decisions.append((entry.get("at", ""), "{}: {}".format(
-                        task["id"], entry.get("answer", ""),
-                    )))
-        decisions = [text for _at, text in sorted(decisions, reverse=True)[:8]]
-        next_ids = [task["id"] for task in tasks
-                    if task.get("status") in {"queued", "needs_review"}]
-        unresolved = [task["id"] for task in tasks
-                      if task.get("status") == "needs_decision"]
-        sections = [
-            "# Orchestrator handoff", "generated_at: " + now(),
-            "consumed_at: (not yet)", "goal: " + goal,
-        ]
-        for name, values in (
-                ("done", sorted(done.values())), ("decisions", decisions),
-                ("next", next_ids), ("unresolved", unresolved),
-                ("avoid", avoid_notes or ["(fill in)"])):
-            sections.append(name + ":")
-            sections.extend("- " + line for line in limited_lines(values))
-        content = "\n".join(sections) + "\n"
+        for accepted_at, task_id, title, outcome in done_candidates:
+            if (
+                    (not previous_at or accepted_at >= previous_at)
+                    and task_id not in previous_done):
+                done[task_id] = (task_id, title, outcome)
+        content = render_handoff(
+            now(), goal, working_tree, sorted(done.values()), decisions,
+            next_ids, unresolved, notes, avoid_notes,
+        )
         atomic_write(orchestrator_handoff_path(relay_dir), content)
     say(content.rstrip())
     say("Start a fresh session, then run: relay orchestrator brief --phase start")
@@ -2234,9 +2325,17 @@ def cmd_orchestrator_brief(args):
         die("`--goal` is valid only for the close phase")
     if args.avoid and args.phase != "close":
         die("`--avoid` is valid only for the close phase")
+    if args.note and args.phase != "close":
+        die("`--note` is valid only for the close phase")
+    if args.phase == "review" and not args.id:
+        die("review phase requires a task id")
+    if args.id and args.phase != "review":
+        die("a task id is valid only for the review phase")
     if args.phase == "close":
         if len(args.avoid) > 5:
             die("at most 5 `--avoid` notes are allowed; consolidate them")
+        if len(args.note) > 3:
+            die("at most 3 `--note` values are allowed; consolidate them")
         goal = flatten_bounded_text(args.goal, 200)
         if not goal:
             die("`--phase close` requires a nonblank goal; add `--goal TEXT`")
@@ -2245,12 +2344,12 @@ def cmd_orchestrator_brief(args):
                 flatten_bounded_text(value, 200) for value in args.avoid
             ) if note
         ]
+        notes = []
+        for note in (flatten_bounded_text(value, 160) for value in args.note):
+            if note and note not in notes:
+                notes.append(note)
     if args.phase == "review":
-        if not args.id:
-            die("review phase requires a task id")
         orchestrator_review_brief(relay_dir, args.id, args.include_log_tail)
-    elif args.id:
-        die("a task id is valid only for the review phase")
     elif args.phase == "start":
         orchestrator_start_brief(relay_dir, tasks)
     elif args.phase == "plan":
@@ -2258,7 +2357,11 @@ def cmd_orchestrator_brief(args):
     elif args.phase == "run":
         orchestrator_run_brief(relay_dir, tasks)
     else:
-        orchestrator_close_brief(relay_dir, tasks, goal, avoid_notes)
+        archived_tasks = load_archived_tasks(relay_dir)
+        tree_state = working_tree_state(project_root(relay_dir))
+        orchestrator_close_brief(
+            relay_dir, tasks, archived_tasks, goal, avoid_notes, notes, tree_state,
+        )
 
 
 def claude_code_hook_fragment():
@@ -3813,6 +3916,10 @@ def build_parser():
     command.add_argument(
         "--avoid", metavar="TEXT", action="append", default=[],
         help="add a next-session avoid note (close phase only, repeatable)",
+    )
+    command.add_argument(
+        "--note", metavar="TEXT", action="append", default=[],
+        help="add trusted next-session context (close phase only, repeatable)",
     )
     command.set_defaults(function=cmd_orchestrator_brief)
 

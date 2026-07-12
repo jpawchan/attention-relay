@@ -1793,6 +1793,9 @@ class RelayTests(unittest.TestCase):
             "--avoid", "Preserve same-second dedupe",
             "--avoid", "Avoid placeholder context",
             "--avoid", "\x1b]0;title\x07" + "x" * 201,
+            "--note", "Trusted\noperator context",
+            "--note", "Trusted operator context",
+            "--note", "\x1b[31m" + "n" * 161,
             check=True,
         )
         handoff = project / ".attention-relay" / "orchestrator-handoff.md"
@@ -1800,6 +1803,17 @@ class RelayTests(unittest.TestCase):
         handoff_text = handoff.read_text()
         self.assertIn("consumed_at: (not yet)", handoff_text)
         self.assertIn("goal: Finish handoff context\n", handoff_text)
+        self.assertIn(
+            "goal: Finish handoff context\n"
+            "warning: uncommitted Git-visible changes at close\n"
+            "done:\n",
+            handoff_text,
+        )
+        notes_block = handoff_text.split("notes:\n", 1)[1].split("avoid:\n", 1)[0]
+        expected_notes = ["Trusted operator context", "n" * 159 + "…"]
+        self.assertEqual(
+            notes_block, "".join(f"- {note}\n" for note in expected_notes),
+        )
         avoid_block = handoff_text.split("avoid:\n", 1)[1]
         expected_avoids = [
             "Do not inherit old goals", "Keep locks unchanged",
@@ -1818,6 +1832,9 @@ class RelayTests(unittest.TestCase):
         self.assertIn("goal: Finish handoff context", started.stdout)
         for note in expected_avoids:
             self.assertIn("- " + note, started.stdout)
+        for note in expected_notes:
+            self.assertIn("- " + note, started.stdout)
+        self.assertIn("warning: uncommitted Git-visible changes at close", started.stdout)
         self.assertNotIn("consumed_at: (not yet)", handoff.read_text())
 
     def test_close_brief_validates_required_and_phase_scoped_context(self):
@@ -1849,8 +1866,24 @@ class RelayTests(unittest.TestCase):
             "error: at most 5 `--avoid` notes are allowed; consolidate them\n",
         )
 
+        too_many_notes = [
+            item
+            for number in range(4)
+            for item in ("--note", f"context {number}")
+        ]
+        rejected_notes = self.relay(
+            project, "orchestrator", "brief", "--phase", "close",
+            "--goal", "Continue the work", *too_many_notes,
+        )
+        self.assertNotEqual(rejected_notes.returncode, 0)
+        self.assertEqual(
+            rejected_notes.stderr,
+            "error: at most 3 `--note` values are allowed; consolidate them\n",
+        )
+
         for phase in ("start", "plan", "run", "review"):
-            for flag, value in (("--goal", "next"), ("--avoid", "risk")):
+            for flag, value in (
+                    ("--goal", "next"), ("--avoid", "risk"), ("--note", "fact")):
                 with self.subTest(phase=phase, flag=flag):
                     rejected = self.relay(
                         project, "orchestrator", "brief", "--phase", phase,
@@ -1864,7 +1897,7 @@ class RelayTests(unittest.TestCase):
 
         closed = self.relay(
             project, "orchestrator", "brief", "--phase", "close",
-            "--goal", "g" * 201, check=True,
+            "--goal", "g" * 201, "--note", " \n\t ", check=True,
         )
         handoff = project / ".attention-relay" / "orchestrator-handoff.md"
         goal_line = next(
@@ -1872,6 +1905,7 @@ class RelayTests(unittest.TestCase):
         )
         self.assertEqual(goal_line, "goal: " + "g" * 199 + "…")
         self.assertIn("avoid:\n- (fill in)\n", handoff.read_text())
+        self.assertNotIn("notes:", handoff.read_text())
         self.assertIn(goal_line, closed.stdout)
 
     def test_handoff_start_and_close_lock_complete_update(self):
@@ -1914,11 +1948,164 @@ class RelayTests(unittest.TestCase):
             ("exit", "orchestrator-handoff.lock"),
         ])
         events.clear()
-        module["orchestrator_close_brief"]("/relay", [], "next goal", [])
+        archived = globals_["load_archived_tasks"]("/relay")
+        module["orchestrator_close_brief"](
+            "/relay", [], archived, "next goal", [], [], False,
+        )
         self.assertEqual(events, [
-            ("enter", "orchestrator-handoff.lock"), "read", "archive", "write",
+            "archive", ("enter", "orchestrator-handoff.lock"), "read", "write",
             ("exit", "orchestrator-handoff.lock"),
         ])
+
+    def test_handoff_done_outcomes_are_matched_flattened_and_line_bounded(self):
+        project = self.make_project()
+        runtime = project / ".attention-relay"
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_outcome_probe")
+        accepted_at = "2026-01-01T00:00:00Z"
+        tasks = [
+            {
+                "id": "T900-long-outcome", "title": "t" * 400, "status": "done",
+                "history": [
+                    {"event": "accepted", "at": accepted_at,
+                     "note": " Shipped\n" + "o" * 140},
+                    {"event": "archived", "at": accepted_at,
+                     "note": "must not replace the accepted outcome"},
+                ],
+            },
+            {
+                "id": "T901-blank-outcome", "title": "blank note", "status": "done",
+                "history": [
+                    {"event": "accepted", "at": accepted_at, "note": " \n\t "},
+                    {"event": "worker_exited", "at": accepted_at,
+                     "note": "must not become an outcome"},
+                ],
+            },
+        ]
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "next goal", [], [], False,
+        )
+        content = (runtime / "orchestrator-handoff.md").read_text()
+        done_lines = content.split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0].splitlines()
+        long_line = next(line[2:] for line in done_lines if "T900-long-outcome" in line)
+        blank_line = next(line[2:] for line in done_lines if "T901-blank-outcome" in line)
+        self.assertLessEqual(len(long_line), 240)
+        self.assertTrue(long_line.startswith("T900-long-outcome: "))
+        self.assertTrue(long_line.endswith(" — outcome: Shipped " + "o" * 111 + "…"))
+        self.assertNotIn(" — outcome:", blank_line)
+        self.assertNotIn("must not", content)
+
+    def test_close_working_tree_warning_is_clean_dirty_or_unavailable(self):
+        clean = self.make_project("clean-warning")
+        self.git(clean, "add", ".gitignore")
+        self.git(clean, "commit", "-qm", "ignore runtime")
+        self.relay(
+            clean, "orchestrator", "brief", "--phase", "close",
+            "--goal", "clean close", check=True,
+        )
+        clean_handoff = (
+            clean / ".attention-relay" / "orchestrator-handoff.md"
+        ).read_text()
+        self.assertNotIn("warning:", clean_handoff)
+        self.assertIn("goal: clean close\ndone:\n", clean_handoff)
+
+        dirty = self.make_project("dirty-warning")
+        leaked_path = "private-path-must-not-leak.txt"
+        (dirty / leaked_path).write_text("dirty\n")
+        self.relay(
+            dirty, "orchestrator", "brief", "--phase", "close",
+            "--goal", "dirty close", check=True,
+        )
+        dirty_handoff = (
+            dirty / ".attention-relay" / "orchestrator-handoff.md"
+        ).read_text()
+        self.assertIn(
+            "goal: dirty close\n"
+            "warning: uncommitted Git-visible changes at close\n"
+            "done:\n",
+            dirty_handoff,
+        )
+        self.assertNotIn(leaked_path, dirty_handoff)
+
+        unavailable = self.make_project("unavailable-warning")
+        unavailable_result = self.relay(
+            unavailable, "orchestrator", "brief", "--phase", "close",
+            "--goal", "unavailable close",
+            env={"GIT_DIR": unavailable / "missing-git-dir"}, check=True,
+        )
+        unavailable_handoff = (
+            unavailable / ".attention-relay" / "orchestrator-handoff.md"
+        ).read_text()
+        self.assertIn(
+            "goal: unavailable close\n"
+            "warning: working-tree check unavailable at close\n"
+            "done:\n",
+            unavailable_handoff,
+        )
+        self.assertNotIn("fatal:", unavailable_result.stdout + unavailable_handoff)
+
+    def test_handoff_total_budget_degrades_whole_sections_in_order(self):
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_budget_probe")
+        done = [
+            (f"T{number:03d}-done", "t" * 240, "o" * 120)
+            for number in range(12)
+        ]
+        decisions = [f"T{number:03d}-decision: " + "d" * 240 for number in range(12)]
+        next_ids = [f"next-{number}-" + "n" * 240 for number in range(12)]
+        unresolved = [f"unresolved-{number}-" + "u" * 240 for number in range(12)]
+        notes = [character * 160 for character in "abc"]
+        avoid = [str(number) * 200 for number in range(5)]
+        content = module["render_handoff"](
+            "2026-01-01T00:00:00Z", "g" * 200, True, done, decisions,
+            next_ids, unresolved, notes, avoid,
+        )
+
+        def section(name, next_name):
+            return [
+                line[2:] for line in content.split(name + ":\n", 1)[1].split(
+                    next_name + ":\n", 1,
+                )[0].splitlines()
+            ]
+
+        self.assertLessEqual(len(content), 4000)
+        self.assertNotIn("outcome:", content)
+        self.assertEqual(section("done", "decisions"), ["+12 more"])
+        self.assertEqual(section("decisions", "next"), ["+12 more"])
+        for name, next_name in (("next", "unresolved"), ("unresolved", "notes")):
+            lines = section(name, next_name)
+            marker = next(line for line in lines if line.startswith("+"))
+            self.assertEqual(len(lines) - 1 + int(marker[1:].split()[0]), 12)
+        for note in notes:
+            self.assertIn("- " + note, content)
+        self.assertTrue(content.endswith("- " + avoid[-1] + "\n"))
+
+    def test_close_to_start_round_trip_includes_outcome_warning_and_notes(self):
+        project = self.make_project()
+        runtime = project / ".attention-relay"
+        task_id = self.create_task(project, "round trip outcome", ["round/**"])
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = "done"
+        task["history"].append({
+            "event": "accepted", "at": "2026-01-01T00:00:00Z",
+            "note": "Verified round-trip result",
+        })
+        state_path.write_text(json.dumps(task))
+        self.relay(
+            project, "orchestrator", "brief", "--phase", "close",
+            "--goal", "continue round trip", "--note", "User prefers the safe path",
+            check=True,
+        )
+        started = self.relay(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        )
+        for expected in (
+                f"{task_id}: round trip outcome — outcome: Verified round-trip result",
+                "warning: uncommitted Git-visible changes at close",
+                "notes:\n- User prefers the safe path",
+                "avoid:\n- (fill in)"):
+            self.assertIn(expected, started.stdout)
 
     def test_start_brief_and_hooks_do_not_write_beyond_handoff_consumption(self):
         project = self.make_project()
@@ -1977,22 +2164,30 @@ class RelayTests(unittest.TestCase):
             "done:\n- (none)\n"
         )
         task = self.state(project, task_id)
-        task["history"].append({"event": "accepted", "at": boundary})
+        task["history"].append({
+            "event": "accepted", "at": boundary,
+            "note": "Reviewer-confirmed result",
+        })
         module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_boundary_probe")
         globals_ = module["orchestrator_close_brief"].__globals__
         globals_["now"] = lambda: boundary
         globals_["say"] = lambda *_args: None
 
-        module["orchestrator_close_brief"](runtime, [task], "next goal", [])
+        module["orchestrator_close_brief"](
+            runtime, [task], [], "next goal", [], [], False,
+        )
         first = handoff_path.read_text().split("done:\n", 1)[1].split(
             "decisions:\n", 1,
         )[0]
-        module["orchestrator_close_brief"](runtime, [task], "next goal", [])
+        module["orchestrator_close_brief"](
+            runtime, [task], [], "next goal", [], [], False,
+        )
         second = handoff_path.read_text().split("done:\n", 1)[1].split(
             "decisions:\n", 1,
         )[0]
         self.assertEqual(first.count(task_id) + second.count(task_id), 1)
         self.assertIn(task_id, first)
+        self.assertIn(" — outcome: Reviewer-confirmed result", first)
         self.assertNotIn(task_id, second)
 
     def test_worker_manual_uses_installed_relay_commands(self):

@@ -10,11 +10,12 @@ It coordinates worker CLIs; it is not an agent model, package manager, patch que
 
 ## Current state
 
-- This working copy is local `main` at 18 commits — 15 update commits AHEAD of the published `v2.0.0` tag at `https://github.com/jpawchan/attention-relay`. Nothing from the update program has been pushed; CI is green only at the publish commit and has not run on the update commits.
+- The update program is published: `main` and tag `v2.1.0` are live at `https://github.com/jpawchan/attention-relay` with CI green (4 matrix jobs). Only the handoff-enrichment commit that followed the release is local; push it (and consider a tag) when ready.
 - The 2026-07-12 update program landed, one reviewed commit per feature: submission preservation on post-submission worker exits, a canonical capsule builder with the `task capsule` preview, referenced-memory capsule summaries, evidence-manifest-bound review tokens, the default-on report-structure gate, the enriched review brief (diff stat, prior attempts, opt-in sanitized log tail), inline worker decision questions, bounded phase receipts + `relay stats` (+ default-off sequence gate), mandatory close `--goal` with bounded `--avoid` notes, strict tiers with per-tier limits and `relay tiers`, compaction-aware SessionStart hooks, `docs/context-placement.md`, and difficulty-level onboarding.
+- Close handoffs now add matched acceptance outcomes, a fixed tri-state working-tree warning, and up to three trusted `--note` values. The writer has a 4000-character section-aware budget; task/archive loading, flag validation, and the Git check all remain outside the handoff leaf lock.
 - A read-only release audit (independent worker) found five blocking malformed-input/validation defects — oversized JSON integers stranding state and crashing briefs, indented report fences bypassing the report gate, lowercase credential labels leaking through the log-tail sanitizer, TOML `nan` timeouts — all fixed with regression coverage and the auditor's exact reproductions re-run dead.
 - The historic "unreproducible single-test flake" is solved: suite subprocesses inherited the caller's stdin, so hook-event reads blocked on non-EOF stdin until the 15-second harness timeout. The harness now passes `subprocess.DEVNULL` by default; hook-event tests that supply JSON still pipe stdin explicitly.
-- Local verification on 2026-07-12: all 98 end-to-end tests pass (~2 minutes), plus a fresh-project smoke (init → start brief → validate).
+- Local verification: all 102 end-to-end tests pass (~2 minutes), plus the prior fresh-project smoke (init → start brief → validate).
 - No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) remains deliberately deferred, not forgotten.
 - This repository contains its own live, Git-ignored `.attention-relay/` runtime with 19 completed tasks — the dogfooding install that orchestrated this very update program. It is dev tooling and audit history, not project source: do not edit, delete, or archive it casually.
 
@@ -79,7 +80,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
 | `framework/config.example.toml` | Default worker command (memory-clean Hermes), tiers, limits, gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
-| `tests/test_relay.py` | Canonical 98-test end-to-end suite and all stub worker fixtures. |
+| `tests/test_relay.py` | Canonical 102-test end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
 | `prompts/create-framework.md` | Standalone generation prompt with the embedded exact SPEC copy (BEGIN SPEC / END SPEC markers). |
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
@@ -101,7 +102,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | Capsule | `CAPSULE_SECTIONS`, `task_spec_sections`, `memory_index_entries`, `context_capsule_components` + `compile_context_capsule` (deterministic, budgeted, placeholder- and memory-reference-validating), `stored_context_capsule_components` (launch-snapshot parsing), `report_section_problems` (report gate parser). |
 | Task lifecycle commands | `cmd_task_create`, `cmd_task_list/show`, `cmd_task_capsule` (read-only preview, `--raw`), `cmd_task_accept` (review-token + evidence gate), `cmd_task_return/decide/cancel` (invalidate review token), `cmd_task_finish` (finish-token + report-shape gates), `cmd_task_brief` (worker phases, receipts, report token), `cmd_task_unlock`. |
 | Next-actions capsule | `flatten_bounded_text`, `decision_question`, `render_next_actions`, `say_next_actions` (tails `status`, `task show`, real `run`; globally budgets five review/decision/overflow lines). |
-| Orchestrator briefs | `orchestrator_start_brief` (consumes handoff under the `orchestrator-handoff` lock), `orchestrator_plan_brief`, `orchestrator_review_brief` (issues review token), `orchestrator_run_brief`, `orchestrator_close_brief` (writes the explicit bounded goal/avoid context under the same lock), `cmd_orchestrator_brief`. |
+| Orchestrator briefs | `orchestrator_start_brief` (consumes handoff under the `orchestrator-handoff` lock), `orchestrator_plan_brief`, `orchestrator_review_brief` (issues review token), `orchestrator_run_brief`, `working_tree_state` + `render_handoff` + `orchestrator_close_brief` (pre-lock close snapshot and 4000-character goal/outcome/warning/notes/avoid handoff), `cmd_orchestrator_brief`. |
 | Claude Code hooks | `claude_code_hook_fragment`, `cmd_hooks_claude_code` (print/merge, idempotent), `cap_hook_output` (hard 9000-char cap, fail-open), `claude_user_prompt_output`, `cmd_hook_event`. |
 | Git snapshots and scopes | `git_snapshot`, `git_changed_paths`, `git_tree_diff`, `normalize_scope`, `scopes_overlap`, `path_in_scopes`. |
 | Worker launch and waves | `WORKER_PROMPT`, `build_prompt` (capsule sandwich), `prepare_worker` (writes attempt-N.prompt.md + attempt-N.brief.md with sha256 digest), `run_one_worker`, `pick_wave`, `finalize_task`, `cmd_run`, `run_wave`. |
@@ -140,7 +141,7 @@ orchestrator brief --phase review ID -> diff stat/history + token/evidence manif
    |    task accept --brief TOKEN verifies evidence               <- gate (default on)
    v
 status/show/run output ends with "Next actions:"       <- recency edge, any harness
-orchestrator brief --phase close --goal TEXT [--avoid TEXT]... -> handoff written <- next session edge
+orchestrator brief --phase close --goal TEXT [--note TEXT]... [--avoid TEXT]... -> handoff written <- next session edge
 ```
 
 Statuses: `queued → running → needs_review → done`, or `needs_decision`/`blocked`/`failed → queued` (after decide/repair/return). Workers can submit only the four `WORKER_FINAL` statuses; only `task accept` records `done`.
@@ -181,9 +182,9 @@ orchestrator actions.
 - Template-placeholder specs refuse to launch and fail `validate`. Test fixtures must write real Objective/Acceptance criteria before `run`.
 - The finish, report-structure, and accept gates default ON; the phase-sequence gate defaults OFF. Phase receipts are always recorded. Stub workers that submit `needs_review` must write the exact worker.md report shape, call `task brief --phase report`, and pass the token to `finish`; orchestrator fixtures need `orchestrator brief --phase review ID` tokens for `accept` (or set the relevant gate key false in the fixture's config.toml).
 - Gate tokens are one-use and bound to (task, attempt, lease)/(task, attempt, review-evidence manifest); issuance, evidence verification, and consumption happen under the task lock. Do not weaken bindings — replay across attempts/leases must fail, and evidence mismatches must not consume review tokens.
-- The `orchestrator-handoff` lock is a leaf: both start-consume and close-generate hold it for their whole read-derive-write; never acquire task/scheduler locks while holding it.
+- The `orchestrator-handoff` lock is a leaf: start holds it for handoff consumption; close validates flags, loads active/archive state, gathers candidates, and checks Git before locking, then holds it only for previous-handoff read, dedupe/render, and atomic write. Never acquire task/scheduler locks while holding it.
 - Handoff `done` entries dedupe by task id against the previous handoff (same-second boundary). Don't simplify to a pure timestamp comparison; whole-second `now()` makes `>` and `>=` both wrong alone.
-- Every close brief requires a fresh explicit nonblank `--goal`; never restore goal inheritance. Goal and up to five repeatable `--avoid` notes use `flatten_bounded_text(..., 200)` before the handoff write.
+- Every close brief requires a fresh explicit nonblank `--goal`; never restore goal inheritance. Goal and up to five repeatable `--avoid` values use `flatten_bounded_text(..., 200)`. Up to three trusted `--note` values use 160 characters, omit blanks/duplicates and the empty section, and must not contain secrets; durable facts belong in memory or this guide. Done outcomes come only from the matched accepted-event note and use 120 characters. The writer drops outcome suffixes, then reduces done/decisions, then next/unresolved with accurate overflow markers to stay at most 4000 characters.
 - `cap_hook_output` returning `""` (and adapters emitting nothing, exit 0) is deliberate fail-open, spec'd behavior — don't "fix" silence into errors, and keep every emission ≤ 9000 chars including edge lines.
 - `hooks claude-code --write` must merge idempotently (detected by exact command string) and never drop existing entries; refusal on invalid JSON is intentional (no partial writes).
 - `--ignore-rules` in the default Hermes worker command is deliberate memory hygiene (keeps model config). Do not swap in `--safe-mode` (drops user config, loses the model) or `hermes memory reset` (destructive).

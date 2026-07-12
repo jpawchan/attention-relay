@@ -197,7 +197,8 @@ working tree; `accept`, `return`, and `cancel` do not apply or revert patches.
 `relay orchestrator brief --phase start|plan|run|review|close [ID]` is available
 only outside a leased worker. The orchestrator runs the matching brief before
 task creation, run, review/accept, and session close. Close is invoked as
-`relay orchestrator brief --phase close --goal TEXT [--avoid TEXT]...`.
+`relay orchestrator brief --phase close --goal TEXT [--note TEXT]...
+[--avoid TEXT]...`.
 
 - `start` prints a short role summary and a `Harness memory` notice of at most 12
   lines. The notice offers Claude Code's `"autoMemoryEnabled": false`,
@@ -272,15 +273,54 @@ task creation, run, review/accept, and session close. Close is invoked as
   five times. The goal and each avoid note are flattened with whitespace
   collapsed, ANSI and C0/C1 controls removed, and output bounded to 200
   characters. More than five avoid notes is an error that tells the caller to
-  consolidate them. `--goal` and `--avoid` are rejected for every non-close
-  phase, and a missing or sanitized-to-blank goal is rejected with an error that
-  says to add `--goal TEXT`. Close uses the same dedicated handoff leaf lock to
-  atomically write the bounded `.attention-relay/orchestrator-handoff.md`, prints
-  it, and reminds the orchestrator to start a fresh session. The template carries
-  the explicit goal, tasks accepted at or after the preceding handoff boundary
-  except task ids already in its `done` section, recent decision answers, queued
-  and review work, unresolved decisions, and one line per nonblank avoid note.
-  With no nonblank avoid notes, the avoid list contains one `(fill in)` line.
+  consolidate them. Close-only `--note TEXT` is repeatable at most three times;
+  a fourth value is rejected before any handoff lock. Each value is flattened by
+  `flatten_bounded_text(value, 160)`, sanitized blanks are omitted, and exact
+  sanitized duplicates are deduplicated in first-occurrence order. `--goal`,
+  `--avoid`, and `--note` are rejected for every non-close phase, and a missing
+  or sanitized-to-blank goal is rejected with an error that says to add
+  `--goal TEXT`.
+
+  After all flag validation and task loading, but before the handoff lock, close
+  runs the direct non-shell command `git -C ROOT status --porcelain=v1
+  --untracked-files=normal --ignore-submodules=none` with the inherited
+  environment except `GIT_OPTIONAL_LOCKS=0` and a five-second timeout. A zero
+  exit with no output is clean, a zero exit with any output is dirty, and a
+  nonzero exit, timeout, decode error, or launch error is unavailable. Dirty
+  emits exactly `warning: uncommitted Git-visible changes at close`; unavailable
+  emits exactly `warning: working-tree check unavailable at close`; clean emits
+  no warning. Git output and paths are never copied into the handoff.
+
+  Active and archived task snapshots and their acceptance/decision candidate
+  tuples are also gathered before the dedicated `orchestrator-handoff` leaf
+  lock. The lock covers only the previous-handoff read, boundary/id dedupe,
+  rendering, and atomic write; no task or scheduler lock is acquired beneath it.
+  A `done` entry is included only for a matched `accepted` history event at or
+  after (`>=`) the preceding `generated_at`, excluding ids already in the
+  preceding `done` section so same-second closes emit each id once. Its value
+  keeps the `ID: title` prefix and appends ` — outcome: TEXT` only when that exact
+  event's `note` flattens nonblank via `flatten_bounded_text(note, 120)`. No other
+  history event, report, or log is an outcome source. The title budget is
+  allocated before concatenation so the complete done value remains at most 240
+  characters.
+
+  The handoff field order is exactly the header, `generated_at`, `consumed_at`,
+  `goal`, the optional warning, `done`, `decisions`, `next`, `unresolved`, the
+  optional `notes`, and `avoid`. `notes:` is present only for nonempty sanitized
+  notes and never has a placeholder. With no nonblank avoid notes, `avoid:` has
+  one `(fill in)` line. List sections initially show at most eight values plus an
+  accurate `+N more` line.
+
+  The complete serialized handoff, including its final newline, is at most 4000
+  characters. If the initial rendering is larger, close re-renders with every
+  outcome suffix omitted. If still larger, it repeatedly lowers the displayed
+  done cap and then the decisions cap by one per pass, maintaining accurate
+  `+N more` counts, until the artifact fits or both caps reach zero. Only then it
+  applies the same per-pass reduction to next and then unresolved. Metadata,
+  goal, warning, notes, and avoid are never naively truncated or dropped. Close
+  atomically writes `.attention-relay/orchestrator-handoff.md`, prints it, and
+  reminds the orchestrator to start a fresh session. The 8000-character handoff
+  reader and hook-output cap are unchanged.
 
 With the default accept gate enabled, `task accept --brief TOKEN` requires the
 stored token for that task's current attempt. Under the task lock and before any
