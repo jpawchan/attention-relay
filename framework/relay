@@ -37,6 +37,9 @@ MANAGED_FILES = (
 )
 MANAGED_DIRS = ("tasks", "work", "archive", ".locks")
 HOOK_OUTPUT_MAX_CHARS = 9000
+CLAUDE_COMPACT_NOTICE = (
+    "attention-relay: context was compacted; state re-injected below."
+)
 CLAUDE_HOOK_COMMANDS = {
     "SessionStart": '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event session-start',
     "UserPromptSubmit": '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event user-prompt-submit',
@@ -2305,12 +2308,16 @@ def claude_user_prompt_output(context):
 def cmd_hook_event(args):
     require_orchestrator()
     try:
-        raw_input = sys.stdin.read()
+        hook_input = {}
+        raw_input = "" if sys.stdin.isatty() else sys.stdin.read(64 * 1024)
         if raw_input:
             try:
-                json.loads(raw_input)
+                parsed_input = json.loads(raw_input)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 pass
+            else:
+                if isinstance(parsed_input, dict):
+                    hook_input = parsed_input
         captured_out = io.StringIO()
         captured_error = io.StringIO()
         with redirect_stdout(captured_out), redirect_stderr(captured_error):
@@ -2330,7 +2337,10 @@ def cmd_hook_event(args):
             else:
                 context = "attention-relay state:\n" + render_next_actions(relay_dir)
         if args.name == "session-start":
-            output = cap_hook_output(captured_out.getvalue())
+            output = captured_out.getvalue()
+            if hook_input.get("source") == "compact":
+                output = CLAUDE_COMPACT_NOTICE + "\n" + output
+            output = cap_hook_output(output)
         else:
             output = claude_user_prompt_output(context)
         if output:

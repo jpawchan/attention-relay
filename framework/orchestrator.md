@@ -43,7 +43,9 @@ it into the project's existing settings without replacing other hooks:
 .attention-relay/relay hooks claude-code --write
 ```
 
-The `SessionStart` hook injects the start-phase orchestrator brief as context.
+The matcher-free `SessionStart` hook injects the start-phase orchestrator brief
+as context at startup and after automatic or manual compaction. Post-compaction
+injection is prefixed with an explicit notice that Relay state was re-injected.
 The `UserPromptSubmit` hook injects a bounded, state-derived `Next actions`
 capsule before Claude handles each prompt. That capsule uses one global budget
 of five content lines for reviews, decisions, and overflow markers; decision

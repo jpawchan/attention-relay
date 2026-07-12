@@ -128,10 +128,11 @@ settings:
 .attention-relay/relay hooks claude-code --write
 ```
 
-The `SessionStart` hook injects the start-phase orchestrator brief. The
-`UserPromptSubmit` hook injects a bounded, state-derived `Next actions` capsule
-before Claude handles each prompt. Repeated setup is idempotent and does not
-replace existing hook arrays.
+The matcher-free `SessionStart` hook injects the start-phase orchestrator brief
+at startup and re-injects it after automatic or manual compaction, with an
+explicit context-compacted notice. The `UserPromptSubmit` hook injects a bounded,
+state-derived `Next actions` capsule before Claude handles each prompt. Repeated
+setup is idempotent and does not replace existing hook arrays.
 
 The adapters cap output and fail open with no output if Relay state is missing
 or broken. Do not launch Claude with `--bare` when using this integration,

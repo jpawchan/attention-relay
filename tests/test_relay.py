@@ -1763,6 +1763,32 @@ class RelayTests(unittest.TestCase):
         self.assertIn("python3 .attention-relay/relay task brief", worker)
         self.assertIn("python3 .attention-relay/relay task finish", worker)
 
+    def test_claude_code_hook_fragment_is_exactly_two_matcher_free_commands(self):
+        project = self.make_project()
+        printed = self.relay(project, "hooks", "claude-code", check=True)
+        fragment_text = printed.stdout.rsplit("\n", 2)[0]
+        fragment = json.loads(fragment_text)
+        commands = {
+            "SessionStart": (
+                '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay '
+                "hook-event session-start"
+            ),
+            "UserPromptSubmit": (
+                '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay '
+                "hook-event user-prompt-submit"
+            ),
+        }
+
+        self.assertEqual(list(fragment), ["hooks"])
+        self.assertEqual(list(fragment["hooks"]), list(commands))
+        for event, command in commands.items():
+            entries = fragment["hooks"][event]
+            self.assertEqual(len(entries), 1)
+            self.assertNotIn("matcher", entries[0])
+            self.assertEqual(entries[0], {
+                "hooks": [{"type": "command", "command": command}],
+            })
+
     def test_claude_code_hook_setup_prints_creates_merges_and_is_idempotent(self):
         project = self.make_project()
         printed = self.relay(project, "hooks", "claude-code", check=True)
@@ -1817,6 +1843,48 @@ class RelayTests(unittest.TestCase):
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("cannot parse .claude/settings.json", rejected.stderr)
         self.assertEqual(invalid_path.read_text(), before)
+
+    def test_session_start_hook_marks_compaction_and_caps_reinjected_brief(self):
+        project = self.make_project()
+        brief = self.relay(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        ).stdout
+        command = [
+            project / ".attention-relay" / "relay", "hook-event", "session-start",
+        ]
+
+        for hook_input in ("", '{"source":"startup"}', "not json", "[]"):
+            with self.subTest(hook_input=hook_input):
+                session = subprocess.run(
+                    command, cwd=project, input=hook_input, text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(
+                    (session.returncode, session.stdout, session.stderr),
+                    (0, brief, ""),
+                )
+
+        notice = "attention-relay: context was compacted; state re-injected below."
+        compact = subprocess.run(
+            command, cwd=project, input='{"source":"compact"}', text=True,
+            capture_output=True,
+        )
+        self.assertEqual(compact.returncode, 0)
+        self.assertEqual(compact.stderr, "")
+        self.assertEqual(compact.stdout, notice + "\n" + brief)
+
+        (project / ".attention-relay" / "orchestrator-handoff.md").write_text(
+            "goal: " + "x" * 10000 + "\nlast handoff line\n"
+        )
+        capped = subprocess.run(
+            command, cwd=project, input='{"source":"compact"}', text=True,
+            capture_output=True,
+        )
+        self.assertEqual(capped.returncode, 0)
+        self.assertEqual(capped.stderr, "")
+        self.assertLessEqual(len(capped.stdout), 9000)
+        self.assertTrue(capped.stdout.startswith(notice + "\n"))
+        self.assertIn("\n(truncated)\n", capped.stdout)
 
     def test_claude_code_hook_events_match_brief_emit_json_and_fail_open(self):
         project = self.make_project()

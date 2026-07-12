@@ -328,8 +328,16 @@ and `UserPromptSubmit`, using Claude Code's matcher-free `[{"hooks": [...]}]`
 shape. Commands invoke the project-local adapter through
 `"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event ...`.
 
-`relay hook-event session-start` emits the same plain stdout as the start-phase
-orchestrator brief; Claude adds that stdout to session context.
+The matcher-free `SessionStart` entry fires at startup and after automatic or
+manual compaction; post-compaction stdin carries `"source": "compact"`. Claude
+adds SessionStart stdout back to session context. `relay hook-event
+session-start` normally emits the same plain stdout as the start-phase
+orchestrator brief. For a compact source, it prefixes that brief with the single
+line `attention-relay: context was compacted; state re-injected below.` so the
+new context is explicitly re-grounded. PreCompact stdout does not reach Claude's
+summarizer or the resulting context, so this integration intentionally has no
+PreCompact hook and re-injects state through the post-compaction SessionStart.
+
 `relay hook-event user-prompt-submit` emits `hookSpecificOutput` JSON whose
 `hookEventName` is `UserPromptSubmit` and whose `additionalContext` is an
 `attention-relay state:` line followed by the deterministic `Next actions`

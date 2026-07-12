@@ -5,14 +5,14 @@
 Attention Relay is a Python CLI for delegating scoped coding tasks to separate agent processes.
 One orchestrator agent creates tasks, runs dependency-ready workers in parallel waves, and reviews each report and Git diff.
 It is the v2 evolution of [agent-relay](https://github.com/jpawchan/agent-relay): everything v1 did, plus deliberate placement of critical context at the beginning and end of agent context windows (the "Lost in the Middle" / attention-decay response).
-Concretely: a generated Critical Context Capsule sandwiches every worker prompt, action-time re-briefs gate `task finish` and `task accept` behind one-use tokens, orchestrator sessions get phase briefs and a durable handoff, and optional Claude Code hooks inject state at the host session's edges.
+Concretely: a generated Critical Context Capsule sandwiches every worker prompt, action-time re-briefs gate `task finish` and `task accept` behind one-use tokens, orchestrator sessions get phase briefs and a durable handoff, and optional Claude Code hooks inject state at the host session's edges, including post-compaction re-grounding.
 It coordinates worker CLIs; it is not an agent model, package manager, patch queue, or security sandbox.
 
 ## Current state
 
 - Published at `https://github.com/jpawchan/attention-relay`, branch `main`, tag `v2.0.0` (2026-07-11).
 - The implementation is complete and CI is green (4 matrix jobs passed on the publish commit).
-- Local verification on 2026-07-12: all 86 end-to-end tests pass, covering strict configured tiers with per-task capsule/time limits and redacted tier inspection, mandatory close-handoff goals and bounded avoid notes, bounded phase receipts, the default-off strict sequence gate, archived receipt coverage, read-only aggregate stats, structured reports, evidence-bound review tokens, streaming diff stats, retry pointers, opt-in sanitized log tails, and bounded decision questions.
+- Local verification on 2026-07-12: the full end-to-end suite passes, covering strict configured tiers with per-task capsule/time limits and redacted tier inspection, mandatory close-handoff goals and bounded avoid notes, bounded phase receipts, the default-off strict sequence gate, archived receipt coverage, read-only aggregate stats, structured reports, evidence-bound review tokens, streaming diff stats, retry pointers, opt-in sanitized log tails, bounded decision questions, and post-compaction Claude Code state re-injection.
 - An independent audit found and fixed four defects before release: an unlocked handoff read-modify-write race, a soft hook-output cap, a same-second handoff boundary loss, and non-executable command forms in `worker.md`. All have regression tests.
 - One single-test error was observed once in seven local suite runs under heavy parallel load and never reproduced (locally or in CI). If a test flakes in CI, suspect timing-sensitive lock/interleaving tests first.
 - No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) was deliberately deferred, not forgotten.
@@ -61,7 +61,7 @@ Do not smoke-test a real worker unless the configured worker CLI and its credent
 | Processes | `subprocess.Popen(..., start_new_session=True)`; process-group signalling on timeout/interrupt. |
 | Configuration | TOML via `tomllib`; runtime state is JSON records plus Markdown specs/reports/briefs/handoff. |
 | Version control | Git CLI snapshots with a temporary `GIT_INDEX_FILE`; no Git library. |
-| Tests | `unittest`, 86 end-to-end cases in `tests/test_relay.py` with temp repos and embedded stub workers. |
+| Tests | `unittest` end-to-end cases in `tests/test_relay.py` with temp repos and embedded stub workers. |
 | CI | `.github/workflows/ci.yml`: push+PR, Ubuntu/macOS × Python 3.11/3.13, `checkout@v7`, `setup-python@v6`, 10-minute timeout. |
 | License | MIT (`LICENSE`). |
 
@@ -142,7 +142,7 @@ orchestrator brief --phase close --goal TEXT [--avoid TEXT]... -> handoff writte
 Statuses: `queued → running → needs_review → done`, or `needs_decision`/`blocked`/`failed → queued` (after decide/repair/return). Workers can submit only the four `WORKER_FINAL` statuses; only `task accept` records `done`.
 Scope enforcement, temp-index Git snapshots, leases, and archive semantics are inherited from v1 unchanged: every changed path outside the wave's scopes blocks the wave; declared `--changed` paths must equal the observed scoped diff case-insensitively.
 
-Claude Code integration (opt-in): `relay hooks claude-code [--write]` prints or merges two hooks into the project's `.claude/settings.json` — SessionStart runs `hook-event session-start` (start brief as stdout → session context) and UserPromptSubmit runs `hook-event user-prompt-submit` (JSON `additionalContext` with the Next-actions capsule). Both cap output at 9000 chars and emit nothing (exit 0) on any error.
+Claude Code integration (opt-in): `relay hooks claude-code [--write]` prints or merges two matcher-free hooks into the project's `.claude/settings.json` — SessionStart runs `hook-event session-start` (start brief as stdout → session context, including explicit state re-injection after automatic or manual compaction) and UserPromptSubmit runs `hook-event user-prompt-submit` (JSON `additionalContext` with the Next-actions capsule). Both cap output at 9000 chars and emit nothing (exit 0) on any error.
 
 ## Configuration
 
