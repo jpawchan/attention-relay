@@ -12,7 +12,7 @@ It coordinates worker CLIs; it is not an agent model, package manager, patch que
 
 - Published at `https://github.com/jpawchan/attention-relay`, branch `main`, tag `v2.0.0` (2026-07-11).
 - The implementation is complete and CI is green (4 matrix jobs passed on the publish commit).
-- Local verification on 2026-07-12: all 81 end-to-end tests pass, covering mandatory close-handoff goals and bounded avoid notes, bounded phase receipts, the default-off strict sequence gate, archived receipt coverage, read-only aggregate stats, structured reports, evidence-bound review tokens, streaming diff stats, retry pointers, opt-in sanitized log tails, and bounded decision questions.
+- Local verification on 2026-07-12: all 86 end-to-end tests pass, covering strict configured tiers with per-task capsule/time limits and redacted tier inspection, mandatory close-handoff goals and bounded avoid notes, bounded phase receipts, the default-off strict sequence gate, archived receipt coverage, read-only aggregate stats, structured reports, evidence-bound review tokens, streaming diff stats, retry pointers, opt-in sanitized log tails, and bounded decision questions.
 - An independent audit found and fixed four defects before release: an unlocked handoff read-modify-write race, a soft hook-output cap, a same-second handoff boundary loss, and non-executable command forms in `worker.md`. All have regression tests.
 - One single-test error was observed once in seven local suite runs under heavy parallel load and never reproduced (locally or in CI). If a test flakes in CI, suspect timing-sensitive lock/interleaving tests first.
 - No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) was deliberately deferred, not forgotten.
@@ -29,7 +29,7 @@ python3 -m py_compile framework/relay tests/test_relay.py
 python3 tests/test_relay.py
 ```
 
-Expected: the help usage line includes `stats`; py_compile is silent; the suite ends with `OK` (temp Git repos and stub workers, no network or live agent calls).
+Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; the suite ends with `OK` (temp Git repos and stub workers, no network or live agent calls).
 
 If you run the suite from inside a Relay-leased worker process, unset the inherited worker env first or fixtures will reject orchestrator commands:
 
@@ -61,7 +61,7 @@ Do not smoke-test a real worker unless the configured worker CLI and its credent
 | Processes | `subprocess.Popen(..., start_new_session=True)`; process-group signalling on timeout/interrupt. |
 | Configuration | TOML via `tomllib`; runtime state is JSON records plus Markdown specs/reports/briefs/handoff. |
 | Version control | Git CLI snapshots with a temporary `GIT_INDEX_FILE`; no Git library. |
-| Tests | `unittest`, 81 end-to-end cases in `tests/test_relay.py` with temp repos and embedded stub workers. |
+| Tests | `unittest`, 86 end-to-end cases in `tests/test_relay.py` with temp repos and embedded stub workers. |
 | CI | `.github/workflows/ci.yml`: push+PR, Ubuntu/macOS × Python 3.11/3.13, `checkout@v7`, `setup-python@v6`, 10-minute timeout. |
 | License | MIT (`LICENSE`). |
 
@@ -76,7 +76,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
 | `framework/config.example.toml` | Default worker command (memory-clean Hermes), tiers, limits, gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
-| `tests/test_relay.py` | Canonical 71-test end-to-end suite and all stub worker fixtures. |
+| `tests/test_relay.py` | Canonical 86-test end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
 | `prompts/create-framework.md` | Standalone generation prompt with the embedded exact SPEC copy (BEGIN SPEC / END SPEC markers). |
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
@@ -92,7 +92,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | --- | --- |
 | Runtime discovery, safety | `find_relay_dir`, `runtime_paths_are_safe`, `require_relay_dir`; `RELAY_DIRNAME = ".attention-relay"`. |
 | Locks and atomic state | `file_lock`, `task_lock`, `atomic_write`, `atomic_json`, `lock_path`. |
-| Config | `load_config`, `cfg_get`, the `configured_*` readers (including the default-off phase-sequence gate), `command_template`, `worker_argv`. |
+| Config | `load_config`, `cfg_get`, the `configured_*` readers (including `configured_tier` and the default-off phase-sequence gate), `validate_worker_template`, `command_template`, `worker_argv`. |
 | Paths and review evidence | `report_path`, `result_path`, `diff_path`, `sha256_regular_file`, `build_review_evidence_manifest`, streaming `attempt_diff_summary`, bounded `bounded_log_tail`, `brief_token_path` (finish-brief-token.json), and `review_token_path` (review-brief-token.json). |
 | Capsule | `CAPSULE_SECTIONS`, `task_spec_sections`, `compile_context_capsule` (deterministic, budgeted, placeholder- and memory-reference-validating). |
 | Task lifecycle commands | `cmd_task_create`, `cmd_task_list/show`, `cmd_task_accept` (review-token gate), `cmd_task_return/decide/cancel` (invalidate review token), `cmd_task_finish` (finish-token gate), `cmd_task_brief` (worker phases + report token), `cmd_task_unlock`. |
@@ -101,7 +101,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | Claude Code hooks | `claude_code_hook_fragment`, `cmd_hooks_claude_code` (print/merge, idempotent), `cap_hook_output` (hard 9000-char cap, fail-open), `claude_user_prompt_output`, `cmd_hook_event`. |
 | Git snapshots and scopes | `git_snapshot`, `git_changed_paths`, `git_tree_diff`, `normalize_scope`, `scopes_overlap`, `path_in_scopes`. |
 | Worker launch and waves | `WORKER_PROMPT`, `build_prompt` (capsule sandwich), `prepare_worker` (writes attempt-N.prompt.md + attempt-N.brief.md with sha256 digest), `run_one_worker`, `pick_wave`, `finalize_task`, `cmd_run`, `run_wave`. |
-| Validation, stats, archive, memory, CLI | `task_problems` (includes queued-capsule checks), read-only `cmd_stats`, `cmd_validate`, `cmd_archive`, `cmd_memory_*`, `cmd_init`, `build_parser`, `main`. |
+| Validation, tiers, stats, archive, memory, CLI | `task_problems` (includes strict tier and per-tier queued-capsule checks), read-only `cmd_tiers`/`cmd_stats`, `cmd_validate`, `cmd_archive`, `cmd_memory_*`, `cmd_init`, `build_parser`, `main`. |
 
 ## How it works
 
@@ -151,7 +151,9 @@ Claude Code integration (opt-in): `relay hooks claude-code [--write]` prints or 
 | Key | Purpose |
 | --- | --- |
 | `commands.worker` | Worker argv template with exactly one `{prompt}` or `{prompt_file}` argument; default is Hermes with `--ignore-rules` (memory-clean). |
-| `tiers.<name>.command` | Optional per-tier command override selected by a task's `tier`. |
+| `tiers.<name>.command` | Optional per-tier command override; non-default task tiers must be configured and limits-only tiers inherit the default command. |
+| `tiers.<name>.worker_timeout_minutes` | Optional per-tier worker timeout override; unset inherits the global timeout. |
+| `tiers.<name>.capsule_max_chars` | Optional per-tier capsule budget override; unset inherits the global budget. |
 | `limits.max_parallel` | Wave size (default 3). |
 | `limits.worker_timeout_minutes` | Worker timeout; 0 disables. |
 | `limits.capsule_max_chars` | Capsule budget (default 4000); overflow is a launch/validate error, never truncation. |
@@ -179,7 +181,7 @@ Environment variables (all read/written in `framework/relay`): `RELAY_DIR` (runt
 - Worker-facing command examples must use `python3 .attention-relay/relay ...` or `.attention-relay/relay ...`; bare `relay` is not on PATH in installed projects.
 - Run the suite with `RELAY_*` unset if inside a leased worker (see Run and verify).
 - v1 invariants still apply: stdlib only; no Windows (`fcntl`, process groups); init target must be `git rev-parse --show-toplevel`; no submodules/Gitlinks; keep temp-index snapshots (not `git diff HEAD`); scopes case-fold; workers share one tree (no isolation); `accept` records review, `return` never reverts; don't hand-edit task JSON; archive preflight+rollback and signal masking stay; task numbers never reuse across archive.
-- `worker_timeout_minutes` default is 60: long-thinking workers on hard tasks can hit it; prefer smaller tasks over raising it globally.
+- `worker_timeout_minutes` default is 60: long-thinking workers on hard tasks can hit it; prefer smaller tasks or a deliberate per-tier override over raising it globally.
 - An external provider failure (for example, HTTP 429 quota) after a fully valid submission preserves the submitted status and records a `worker_exit_N_after_submission` warning. Before accepting, reviewers must inspect the prominent review-brief warning and linked attempt log; failures before submission still surface as `failed` with `worker_exit_N` and require a return/retry.
 
 ## Guide self-test routes
@@ -190,4 +192,4 @@ Environment variables (all read/written in `framework/relay`): `RELAY_DIR` (runt
 | Add a new orchestrator brief phase | `orchestrator_*_brief` functions + `cmd_orchestrator_brief` + `build_parser` in `framework/relay`; `framework/orchestrator.md`; SPEC.md + embedded copy; new tests. |
 | Change the default capsule budget | `configured_capsule_max_chars` in `framework/relay`; `framework/config.example.toml`; SPEC.md + embedded copy; budget tests in `tests/test_relay.py`. |
 
-Last updated 2026-07-12 — Mandatory bounded close-handoff goals and avoid notes added.
+Last updated 2026-07-12 — Strict tiers, per-tier limits, and read-only tier inspection added.

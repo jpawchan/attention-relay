@@ -21,9 +21,17 @@ worker = "hermes chat -Q -t terminal,file --source tool --ignore-rules -q {promp
 # Optional commands for selected task tiers:
 # [tiers.cheap]
 # command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
+# worker_timeout_minutes = 30
+# capsule_max_chars = 3000
 #
 # [tiers.premium]
 # command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
+# worker_timeout_minutes = 90
+# capsule_max_chars = 6000
+#
+# A tier may override only limits and inherit [commands].worker:
+# [tiers.long_context]
+# capsule_max_chars = 8000
 
 [limits]
 max_parallel = 3

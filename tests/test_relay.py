@@ -144,6 +144,40 @@ subprocess.Popen([sys.executable, "-c",
 time.sleep(10)
 '''
 
+
+TIER_TIMEOUT_WORKER = r'''
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+root = Path(os.environ["RELAY_ROOT"])
+rd = Path(os.environ["RELAY_DIR"])
+tid = os.environ["RELAY_TASK_ID"]
+attempt = os.environ["RELAY_ATTEMPT"]
+task = json.loads((rd / "tasks" / f"{tid}.json").read_text())
+if task["tier"] == "short":
+    time.sleep(10)
+
+report = rd / "work" / tid / f"attempt-{attempt}.report.md"
+report.parent.mkdir(parents=True, exist_ok=True)
+brief = subprocess.run(
+    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    cwd=root, check=True, capture_output=True, text=True,
+)
+token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
+             if line.startswith("Brief token: "))
+report.write_text(
+    "# tier timeout report\n\n## Result\nneeds_review\n\n## Changes\n- no changes\n\n"
+    "## Verification\n- worker completed\n\n## Decisions and risks\n- none\n"
+)
+subprocess.run([sys.executable, str(rd / "relay"), "task", "finish", tid,
+                "--status", "needs_review", "--brief", token], cwd=root, check=True)
+'''
+
+
 RESULT_WITHOUT_REPORT_WORKER = r'''
 import json
 import os
@@ -287,16 +321,18 @@ class RelayTests(unittest.TestCase):
         )
         (project / ".attention-relay" / "config.toml").write_text(config)
 
-    def task_create_command(self, title, scope=None, depends_on=None):
+    def task_create_command(self, title, scope=None, depends_on=None, tier=None):
         args = ["task", "create", "--title", title]
         for item in scope or []:
             args += ["--scope", item]
         for item in depends_on or []:
             args += ["--depends-on", item]
+        if tier is not None:
+            args += ["--tier", tier]
         return args
 
-    def create_task(self, project, title, scope=None, depends_on=None):
-        args = self.task_create_command(title, scope, depends_on)
+    def create_task(self, project, title, scope=None, depends_on=None, tier=None):
+        args = self.task_create_command(title, scope, depends_on, tier)
         result = self.relay(project, *args, check=True)
         task_id = result.stdout.split()[1]
         spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
@@ -324,8 +360,8 @@ class RelayTests(unittest.TestCase):
             "# Memory\n\n## Index\n" + index + "\n\n## Entries\n\n" + bodies + "\n"
         )
 
-    def try_create_task(self, project, title, scope=None, depends_on=None):
-        args = self.task_create_command(title, scope, depends_on)
+    def try_create_task(self, project, title, scope=None, depends_on=None, tier=None):
+        args = self.task_create_command(title, scope, depends_on, tier)
         return self.relay(project, *args)
 
     def state(self, project, task_id):
@@ -1947,12 +1983,12 @@ class RelayTests(unittest.TestCase):
 
     def test_invalid_command_fails_before_task_claim(self):
         project = self.make_project()
+        task_id = self.create_task(project, "bad command", ["a/**"])
         config = project / ".attention-relay" / "config.toml"
         config.write_text(
             '[commands]\nworker = "true {prompt} embedded{prompt}"\n'
             '[limits]\nmax_parallel = 1\n'
         )
-        task_id = self.create_task(project, "bad command", ["a/**"])
         self.assertNotEqual(self.relay(project, "validate").returncode, 0)
         result = self.relay(project, "run")
         self.assertNotEqual(result.returncode, 0)
@@ -2149,6 +2185,153 @@ class RelayTests(unittest.TestCase):
         self.relay(project, "run", task_id, check=True)
         self.assertFalse(marker.exists())
         self.assertEqual(self.state(project, task_id)["status"], "needs_review")
+
+    def test_tiers_are_strict_at_create_validate_preview_and_launch(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        config = project / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text() + "\n[tiers.premium]\ncapsule_max_chars = 5000\n")
+
+        unknown = self.try_create_task(project, "unknown tier", tier="mystery")
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("unknown tier 'mystery'", unknown.stderr)
+        self.assertIn("known tiers: default, premium", unknown.stderr)
+        blank = self.try_create_task(project, "blank tier", tier="")
+        self.assertNotEqual(blank.returncode, 0)
+        self.assertIn("tier name must be non-blank", blank.stderr)
+
+        task_id = self.create_task(
+            project, "strict premium", ["premium/**"], tier="premium",
+        )
+        brief = self.relay(
+            project, "orchestrator", "brief", "--phase", "run", check=True,
+        )
+        dry = self.relay(project, "run", "--dry-run", check=True)
+        annotation = f"{task_id} [tier=premium]"
+        self.assertIn("Would run: " + annotation, brief.stdout)
+        self.assertIn("would run: " + annotation, dry.stdout)
+
+        state_path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["tier"] = "removed"
+        state_path.write_text(json.dumps(state))
+        validation = self.relay(project, "validate")
+        preview = self.relay(project, "task", "capsule", task_id)
+        launch = self.relay(project, "run", task_id)
+        for result in (validation, preview, launch):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unknown tier 'removed'", result.stdout + result.stderr)
+        self.assertEqual(self.state(project, task_id)["status"], "queued")
+
+    def test_per_tier_capsule_budget_controls_preview_validate_and_launch(self):
+        roomy = self.make_project("roomy-tier")
+        self.configure(
+            roomy, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=100,
+        )
+        config = roomy / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text() + "\n[tiers.roomy]\ncapsule_max_chars = 4000\n")
+        roomy_id = self.create_task(roomy, "roomy capsule", ["roomy/**"], tier="roomy")
+        preview = self.relay(roomy, "task", "capsule", roomy_id, check=True)
+        self.assertIn("of 4000 chars", preview.stdout)
+        self.relay(roomy, "validate", check=True)
+        self.relay(roomy, "run", roomy_id, check=True)
+        self.assertEqual(self.state(roomy, roomy_id)["status"], "needs_review")
+
+        tight = self.make_project("tight-tier")
+        self.configure(tight, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=4000)
+        config = tight / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text() + "\n[tiers.tight]\ncapsule_max_chars = 100\n")
+        tight_id = self.create_task(tight, "tight capsule", ["tight/**"], tier="tight")
+        results = (
+            self.relay(tight, "task", "capsule", tight_id),
+            self.relay(tight, "validate"),
+            self.relay(tight, "run", tight_id),
+        )
+        for result in results:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("capsule_max_chars=100", result.stdout + result.stderr)
+        self.assertEqual(self.state(tight, tight_id)["status"], "queued")
+
+    def test_one_wave_uses_each_limits_only_tier_timeout(self):
+        project = self.make_project()
+        self.configure(
+            project, self.write_worker(TIER_TIMEOUT_WORKER),
+            max_parallel=2, timeout_minutes=1,
+        )
+        config = project / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text() + (
+            "\n[tiers.short]\nworker_timeout_minutes = 0.005\n"
+            "\n[tiers.long]\nworker_timeout_minutes = 0.1\n"
+        ))
+        short = self.create_task(project, "short timeout", ["short/**"], tier="short")
+        long = self.create_task(project, "long timeout", ["long/**"], tier="long")
+        self.relay(project, "run", short, long, check=True)
+        self.assertEqual(self.state(project, short)["status"], "failed")
+        self.assertEqual(self.state(project, short)["last_note"], "worker_timeout")
+        self.assertEqual(self.state(project, long)["status"], "needs_review")
+
+    def test_validate_reports_every_malformed_unused_tier_setting_and_name(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        config = project / ".attention-relay" / "config.toml"
+        config.write_text(config.read_text() + (
+            "\n[tiers.broken]\n"
+            "command = \"\"\n"
+            "worker_timeout_minutes = \"never\"\n"
+            "capsule_max_chars = true\n"
+            "\n[tiers.\"\"]\ncapsule_max_chars = 100\n"
+            "\n[tiers.default]\ncapsule_max_chars = 200\n"
+        ))
+        validation = self.relay(project, "validate")
+        self.assertNotEqual(validation.returncode, 0)
+        for message in (
+                "tier 'broken': no worker command configured",
+                "worker_timeout_minutes must be a non-negative number",
+                "capsule_max_chars must be a positive integer",
+                "tier name must be non-blank",
+                "tier name 'default' is reserved"):
+            self.assertIn(message, validation.stdout)
+
+    def test_tiers_output_is_exact_read_only_redacted_and_worker_denied(self):
+        project = self.make_project()
+        worker = self.write_worker(NO_CHANGE_WORKER)
+        self.configure(project, worker, timeout_minutes=2.5, capsule_max_chars=4000)
+        config = project / ".attention-relay" / "config.toml"
+        tier_command = f"{sys.executable} {worker} --secret do-not-print {{prompt_file}}"
+        config.write_text(config.read_text() + (
+            "\n[tiers.alpha]\ncapsule_max_chars = 5000\n"
+            "\n[tiers.zeta]\n"
+            f"command = {json.dumps(tier_command)}\n"
+            "worker_timeout_minutes = 0\n"
+        ))
+        runtime = project / ".attention-relay"
+
+        def snapshot():
+            return {
+                path.relative_to(runtime).as_posix(): path.read_bytes()
+                for path in runtime.rglob("*") if path.is_file()
+            }
+
+        before = snapshot()
+        tiers = self.relay(project, "tiers", check=True)
+        executable = sys.executable
+        expected = (
+            f"Tier: default\nExecutable: {executable}\nCommand source: default\n"
+            "Worker timeout: 2.5 minutes\nCapsule budget: 4000 characters\n\n"
+            f"Tier: alpha\nExecutable: {executable}\nCommand source: default\n"
+            "Worker timeout: 2.5 minutes\nCapsule budget: 5000 characters\n\n"
+            f"Tier: zeta\nExecutable: {executable}\nCommand source: tier\n"
+            "Worker timeout: 0 minutes\nCapsule budget: 4000 characters\n"
+        )
+        self.assertEqual(tiers.stdout, expected)
+        self.assertNotIn("--secret", tiers.stdout)
+        self.assertNotIn("do-not-print", tiers.stdout)
+        self.assertEqual(snapshot(), before)
+        denied = self.relay(
+            project, "tiers", env={"RELAY_TASK_ID": "T999-worker"},
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
 
     def test_timeout_kills_worker_process_group(self):
         project = self.make_project()

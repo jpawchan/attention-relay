@@ -162,6 +162,7 @@ run scopes together when their fixed prefixes can address the same path.
 - the wave has not reached `max_parallel`.
 
 `run --dry-run` lists selected tasks and explains every skipped requested task.
+Selected tasks with a non-default tier are annotated with that resolved tier.
 
 Workers in a wave share the project working tree. Relay takes a Git tree
 snapshot before launch and another after all workers exit. Each attempt diff is
@@ -216,7 +217,8 @@ task creation, run, review/accept, and session close. Close is invoked as
 - `plan` prints the task-spec quality checklist and a bounded queued/blocked
   dependency graph.
 - `run` uses the read-only wave selection logic to print what would run and
-  cautions for overlapping scopes or unmet dependencies.
+  cautions for overlapping scopes or unmet dependencies. Selected tasks with a
+  non-default tier are annotated with that resolved tier.
 - `review ID` is valid only for a `needs_review` task. Under the task lock it
   freshly compiles the task capsule but displays the stored launch capsule when
   `attempt-N.brief.md` exists. If the fresh and stored capsules differ, it prints
@@ -304,6 +306,12 @@ Receipt coverage counts attempts represented by a launch or a valid receipt and
 is labeled `command-use evidence, not proof of attention`. Stats reads archived
 receipts from the work directories moved by `archive`; it acquires no
 write-capable lock and creates or changes no runtime file.
+
+`relay tiers` is orchestrator-only and read-only. It prints one deterministic
+block for `default` followed by each configured tier in sorted name order. Each
+block shows only the command executable (`argv[0]`, never its flags or remaining
+arguments), whether the command comes from `default` or the tier, the effective
+worker timeout in minutes, and the effective capsule budget in characters.
 
 ## Optional Claude Code integration
 
@@ -396,8 +404,9 @@ non-regular, undecodable, or malformed reports are rejected with a precise
 problem and instructions to correct the report and refinish with the same token.
 `needs_decision`, `blocked`, and `failed` reports are never structure-checked.
 
-Each worker runs in a separate process group. Relay captures combined output,
-enforces `worker_timeout_minutes`, and terminates process groups on timeout or
+Each worker runs in a separate process group. Relay captures combined output and
+enforces the task tier's effective `worker_timeout_minutes`, so workers in one
+wave may have different timeouts. It terminates process groups on timeout or
 `SIGINT`, `SIGTERM`, or `SIGHUP` interruption. It signals every active group
 before one shared grace interval. Interrupted tasks become `failed` instead of
 remaining stale. Timeout, interruption, and runner/launch errors override any
@@ -443,8 +452,9 @@ Only after every preparation succeeds, the existing task-claim block records
 the integer count as `capsule_chars` on the `launched` history entry. Failed
 preparation therefore records no launch.
 
-Capsules are never truncated. If one exceeds `capsule_max_chars`, launch and
-validation fail with the measured size and overflow.
+Capsules are never truncated. The budget resolves from each task's tier. If one
+exceeds the tier's effective `capsule_max_chars`, launch and validation fail
+with the measured size and overflow.
 
 `relay task capsule ID [--raw]` is a read-only, orchestrator-only preview. For a
 non-running active task it compiles the current spec prospectively. For a
@@ -472,6 +482,11 @@ max_parallel = 3
 capsule_max_chars = 4000
 worker_timeout_minutes = 60
 
+[tiers.premium]
+command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
+capsule_max_chars = 6000
+worker_timeout_minutes = 90
+
 [gates]
 phase_sequence_requires_briefs = false
 finish_requires_brief = true
@@ -494,8 +509,19 @@ All gate values must be booleans. `phase_sequence_requires_briefs` defaults to
 `accept_requires_brief = false` lets `task accept` work without a review token.
 Each disabled token gate ignores its corresponding `--brief` argument.
 
-Optional `[tiers.<name>].command` values override the default worker command for
-a task with that tier. An unknown tier uses the default command.
+The `default` tier is always available and uses `[commands].worker` plus the
+global limits. Each non-default task tier must have a matching `[tiers.<name>]`
+table; unknown and blank tier names are errors at creation, validation, preview,
+and launch rather than falling back to the default command. A literal
+`[tiers.default]` table is reserved and invalid.
+
+Each tier table may set `command`, `worker_timeout_minutes`, and
+`capsule_max_chars`. Unset keys inherit their global values, so a limits-only
+tier inherits `[commands].worker`. Tier commands obey the same one-placeholder
+rule as the default command. Tier limits obey the same type and range rules as
+their global counterparts. `validate` checks every configured tier, including
+unused tiers. `relay tiers` displays all effective settings without exposing
+command flags.
 
 ## Memory
 
@@ -545,9 +571,10 @@ and stub workers. It covers:
   accept;
 - attempt-local Git diffs in clean, dirty, and unborn worktrees;
 - direct command execution without a shell;
-- process-group timeout, batched `SIGINT`/`SIGTERM` cleanup, and non-UTF-8
-  output handling;
-- read-only aggregate stats, memory, receipt-preserving all-or-nothing archive
-  preflight, and signal-safe archive completion;
+- per-tier process-group timeouts, batched `SIGINT`/`SIGTERM` cleanup, and
+  non-UTF-8 output handling;
+- strict tier validation and read-only tier settings, aggregate stats, memory,
+  receipt-preserving all-or-nothing archive preflight, and signal-safe archive
+  completion;
 - exact equality between this specification and the contract embedded in the
   standalone creation prompt.

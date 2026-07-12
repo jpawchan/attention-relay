@@ -70,7 +70,13 @@ Before creating or editing task specs, run the plan brief:
 ```
 
 Only `--title` is required. An omitted scope means the whole project and cannot
-run beside another task.
+run beside another task. `default` is always available; every other `--tier`
+value must have a matching `[tiers.<name>]` config table. List the effective,
+redacted settings before assigning tiers when useful:
+
+```bash
+.attention-relay/relay tiers
+```
 
 Edit the generated task spec. It must contain:
 
@@ -101,9 +107,11 @@ not assign Git-ignored files, and do not ask workers to modify them.
 .attention-relay/relay run T003-specific-task
 ```
 
-The dry run shows the next wave and why tasks must wait. A real run blocks until
-the wave finishes. Separate real `run` processes serialize; parallelism happens
-inside one wave.
+The dry run shows the next wave and why tasks must wait, annotating selected
+non-default tiers. A real run blocks until the wave finishes. Separate real
+`run` processes serialize; parallelism happens inside one wave. Each worker uses
+its task tier's effective timeout and capsule budget, so one wave may contain
+different worker timeouts.
 
 Workers share the working tree. Relay keeps tasks marked `running` until every
 worker in the wave exits, captures attempt-local Git diffs, compares each
@@ -245,6 +253,7 @@ relay task cancel ID [--reason TEXT]
 relay task unlock ID
 relay status
 relay stats
+relay tiers
 relay validate
 relay archive
 relay memory index [--for worker|orchestrator]
@@ -256,6 +265,10 @@ relay memory add --for worker|orchestrator|both SUMMARY BODY
 archived tasks. It prints bounded deterministic status and attempt counts,
 failure/blocked reason codes without free text, launched-capsule size statistics,
 phase-receipt command-use coverage, and the post-submission warning count.
+
+`relay tiers` is orchestrator-only and read-only. It lists `default` first and
+then configured tiers by name with each effective command source, executable
+only (never command flags), timeout, and capsule budget.
 
 ## Before consequential action
 

@@ -223,13 +223,21 @@ def configured_limits(config, override=None):
     timeout = cfg_get(config, "limits.worker_timeout_minutes", 60)
     if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1:
         raise ValueError("max_parallel must be an integer of at least 1")
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+    return max_parallel, configured_worker_timeout_minutes(timeout)
+
+
+def configured_worker_timeout_minutes(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError("worker_timeout_minutes must be a non-negative number")
-    return max_parallel, float(timeout)
+    return float(value)
 
 
 def configured_capsule_max_chars(config):
     maximum = cfg_get(config, "limits.capsule_max_chars", 4000)
+    return validated_capsule_max_chars(maximum)
+
+
+def validated_capsule_max_chars(maximum):
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
         raise ValueError("capsule_max_chars must be a positive integer")
     return maximum
@@ -263,16 +271,24 @@ def configured_phase_sequence_requires_briefs(config):
     return required
 
 
-def command_template(config, task):
-    tier = task.get("tier", "default")
-    return (
-        cfg_get(config, "tiers.{}.command".format(tier), "")
-        or cfg_get(config, "commands.worker", "")
+def configured_tier_names(config):
+    tiers = config.get("tiers", {})
+    if not isinstance(tiers, dict):
+        raise ValueError("tiers must be a table")
+    if any(not isinstance(name, str) or not name.strip() for name in tiers):
+        raise ValueError("tier name must be non-blank")
+    if "default" in tiers:
+        raise ValueError("tier name 'default' is reserved")
+    return ["default", *sorted(tiers)]
+
+
+def unknown_tier_error(config, name):
+    return "unknown tier {!r}; known tiers: {}".format(
+        name, ", ".join(configured_tier_names(config)),
     )
 
 
-def worker_argv(config, task, prompt, prompt_file, root):
-    template = command_template(config, task)
+def validate_worker_template(template):
     if not isinstance(template, str) or not template.strip():
         raise ValueError("no worker command configured")
     try:
@@ -287,7 +303,61 @@ def worker_argv(config, task, prompt, prompt_file, root):
         if ("{prompt}" in token or "{prompt_file}" in token) and token not in (
                 "{prompt}", "{prompt_file}"):
             raise ValueError("the prompt placeholder must be a complete command argument")
-    index, placeholder = placeholders[0]
+    return argv
+
+
+def configured_tier(config, name):
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("tier name must be non-blank")
+    tiers = config.get("tiers", {})
+    if not isinstance(tiers, dict):
+        raise ValueError("tiers must be a table")
+    if name == "default":
+        if name in tiers:
+            raise ValueError("tier name 'default' is reserved")
+        section = {}
+    else:
+        if name not in tiers:
+            raise ValueError(unknown_tier_error(config, name))
+        section = tiers[name]
+        if not isinstance(section, dict):
+            raise ValueError("[tiers.{}] must be a table".format(name))
+
+    command_source = "tier" if "command" in section else "default"
+    template = section.get("command", cfg_get(config, "commands.worker", ""))
+    validate_worker_template(template)
+    timeout = configured_worker_timeout_minutes(section.get(
+        "worker_timeout_minutes",
+        cfg_get(config, "limits.worker_timeout_minutes", 60),
+    ))
+    capsule_max_chars = validated_capsule_max_chars(section.get(
+        "capsule_max_chars", cfg_get(config, "limits.capsule_max_chars", 4000),
+    ))
+    return {
+        "name": name,
+        "command": template,
+        "command_source": command_source,
+        "worker_timeout_minutes": timeout,
+        "capsule_max_chars": capsule_max_chars,
+    }
+
+
+def command_template(config, task):
+    return configured_tier(config, task.get("tier", "default"))["command"]
+
+
+def resolved_task_label(config, task):
+    tier = configured_tier(config, task.get("tier", "default"))["name"]
+    suffix = " [tier={}]".format(tier) if tier != "default" else ""
+    return task["id"] + suffix
+
+
+def worker_argv(config, task, prompt, prompt_file, root):
+    argv = validate_worker_template(command_template(config, task))
+    index, placeholder = next(
+        (index, token) for index, token in enumerate(argv)
+        if token in ("{prompt}", "{prompt_file}")
+    )
     argv[index] = prompt if placeholder == "{prompt}" else prompt_file
     executable = argv[0]
     if os.path.sep in executable:
@@ -1184,6 +1254,11 @@ def cmd_task_create(args):
     if not args.title.strip():
         die("task title cannot be empty")
     relay_dir = require_relay_dir()
+    tier_name = args.tier if args.tier is not None else "default"
+    try:
+        configured_tier(load_config(relay_dir), tier_name)
+    except ValueError as error:
+        die(str(error))
     with file_lock(lock_path(relay_dir, "scheduler")):
         task_id = next_task_id(relay_dir, args.title)
         try:
@@ -1210,7 +1285,7 @@ def cmd_task_create(args):
             "title": args.title,
             "status": "queued",
             "attempt": 1,
-            "tier": args.tier or "default",
+            "tier": tier_name,
             "scope": scopes,
             "depends_on": dependencies,
             "created_at": now(),
@@ -1343,7 +1418,12 @@ def cmd_task_capsule(args):
                 args.id,
             ))
     task = load_task(relay_dir, args.id)
-    maximum = configured_capsule_max_chars(load_config(relay_dir))
+    try:
+        maximum = configured_tier(
+            load_config(relay_dir), task.get("tier", "default"),
+        )["capsule_max_chars"]
+    except ValueError as error:
+        die(str(error))
     attempt = task.get("attempt", 1)
     if task.get("status") == "running":
         path = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt)
@@ -1855,7 +1935,7 @@ def compile_current_task_capsule(relay_dir, task):
     with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
         return compile_context_capsule(
             task, source.read(), memory_entries,
-            configured_capsule_max_chars(config),
+            configured_tier(config, task.get("tier", "default"))["capsule_max_chars"],
         )
 
 
@@ -2014,7 +2094,11 @@ def orchestrator_run_brief(relay_dir, tasks):
     busy_scopes = [task.get("scope", []) for task in tasks
                    if task.get("status") == "running"]
     wave, skipped = pick_wave(tasks, archived, [], max_parallel, busy_scopes)
-    say("Would run: " + (", ".join(task["id"] for task in wave) or "(nothing)"))
+    try:
+        labels = [resolved_task_label(config, task) for task in wave]
+    except ValueError as error:
+        die(str(error))
+    say("Would run: " + (", ".join(labels) or "(nothing)"))
     cautions = [(task_id, reason) for task_id, reason in skipped
                 if "scope conflicts" in reason or "waiting on" in reason]
     say("Cautions:")
@@ -2464,7 +2548,8 @@ def build_prompt(
 def prepare_worker(relay_dir, config, task, memory_entries):
     root = project_root(relay_dir)
     attempt = task.get("attempt", 1)
-    capsule_max_chars = configured_capsule_max_chars(config)
+    tier = configured_tier(config, task.get("tier", "default"))
+    capsule_max_chars = tier["capsule_max_chars"]
     with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
         capsule = compile_context_capsule(
             task, source.read(), memory_entries, capsule_max_chars,
@@ -2490,6 +2575,7 @@ def prepare_worker(relay_dir, config, task, memory_entries):
         "log_path": os.path.join(directory, "attempt-%d.log" % attempt),
         "capsule_chars": len(capsule),
         "capsule_digest": digest,
+        "timeout_minutes": tier["worker_timeout_minutes"],
     }
 
 
@@ -2756,7 +2842,7 @@ def run_wave(args, relay_dir, context):
     require_git_root(root)
     config = load_config(relay_dir)
     try:
-        max_parallel, timeout_minutes = configured_limits(config, args.max_parallel)
+        max_parallel, _timeout_minutes = configured_limits(config, args.max_parallel)
         _, memory_text = read_memory(relay_dir)
         memory_entries = memory_index_entries(memory_text)
     except ValueError as error:
@@ -2768,8 +2854,12 @@ def run_wave(args, relay_dir, context):
         busy_scopes = [task.get("scope", []) for task in tasks
                        if task.get("status") == "running"]
         wave, skipped = pick_wave(tasks, archived, args.ids, max_parallel, busy_scopes)
+        try:
+            labels = [resolved_task_label(config, task) for task in wave]
+        except ValueError as error:
+            die(str(error))
         if args.dry_run:
-            say("would run: %s" % (", ".join(task["id"] for task in wave) or "(nothing)"))
+            say("would run: %s" % (", ".join(labels) or "(nothing)"))
             for task_id, reason in skipped:
                 say("  skip {}: {}".format(task_id, reason))
             return
@@ -2814,7 +2904,7 @@ def run_wave(args, relay_dir, context):
         executor = ThreadPoolExecutor(max_workers=len(wave))
         futures = {
             executor.submit(
-                run_one_worker, relay_dir, item, timeout_minutes, stop_event,
+                run_one_worker, relay_dir, item, item["timeout_minutes"], stop_event,
             ): item["task"]
             for item in prepared
         }
@@ -2932,6 +3022,35 @@ def stats_count_lines(counts, limit=12, numeric=False):
         shown.append(("other", existing_other + omitted))
         items = shown
     return ["- {}={}".format(name, count) for name, count in items] or ["- none"]
+
+
+def formatted_number(value):
+    return "{:g}".format(value)
+
+
+def cmd_tiers(args):
+    """Print effective tier settings without exposing worker command flags."""
+    require_orchestrator()
+    relay_dir = require_relay_dir()
+    config = load_config(relay_dir)
+    try:
+        names = configured_tier_names(config)
+        blocks = []
+        for name in names:
+            tier = configured_tier(config, name)
+            executable = validate_worker_template(tier["command"])[0]
+            blocks.append("\n".join((
+                "Tier: " + name,
+                "Executable: " + executable,
+                "Command source: " + tier["command_source"],
+                "Worker timeout: {} minutes".format(formatted_number(
+                    tier["worker_timeout_minutes"],
+                )),
+                "Capsule budget: {} characters".format(tier["capsule_max_chars"]),
+            )))
+    except ValueError as error:
+        die(str(error))
+    say("\n\n".join(blocks))
 
 
 def cmd_stats(args):
@@ -3083,8 +3202,7 @@ def dependency_cycles(tasks):
     return cycles
 
 
-def task_problems(
-        relay_dir, task, known_tasks, memory_entries, capsule_max_chars=None):
+def task_problems(relay_dir, task, known_tasks, memory_entries, config=None):
     problems = []
     task_id = task.get("id")
     prefix = str(task_id or "unknown") + ": "
@@ -3099,6 +3217,12 @@ def task_problems(
     for field in ("title", "tier", "created_at", "updated_at"):
         if not isinstance(task.get(field), str) or not task[field]:
             problems.append(prefix + "{} must be non-empty text".format(field))
+    tier = None
+    if config is not None and isinstance(task.get("tier"), str) and task.get("tier"):
+        try:
+            tier = configured_tier(config, task["tier"])
+        except ValueError as error:
+            problems.append(prefix + str(error))
     if not isinstance(task.get("history"), list):
         problems.append(prefix + "history must be a list")
     if valid_id and not os.path.exists(task_json_path(relay_dir, task_id)):
@@ -3152,13 +3276,13 @@ def task_problems(
             problems.append(prefix + "scope violation baseline is missing")
     elif task.get("scope_baseline"):
         problems.append(prefix + "scope baseline exists without violations")
-    if valid_id and task.get("status") == "queued" and capsule_max_chars is not None:
+    if valid_id and task.get("status") == "queued" and tier is not None:
         spec_path = task_md_path(relay_dir, task_id)
         if os.path.exists(spec_path):
             try:
                 with open(spec_path, encoding="utf-8") as source:
                     compile_context_capsule(
-                        task, source.read(), memory_entries, capsule_max_chars,
+                        task, source.read(), memory_entries, tier["capsule_max_chars"],
                     )
             except (OSError, UnicodeDecodeError, ValueError) as error:
                 problems.append(str(error))
@@ -3184,34 +3308,57 @@ def cmd_validate(args):
                 )
         except RuntimeError as error:
             problems.append("repository: " + str(error))
-    capsule_max_chars = None
+    config = None
     memory_entries = ()
     try:
         config = load_config(relay_dir)
-        configured_limits(config)
-        capsule_max_chars = configured_capsule_max_chars(config)
-        configured_finish_requires_brief(config)
-        configured_report_requires_sections(config)
-        configured_accept_requires_brief(config)
-        configured_phase_sequence_requires_briefs(config)
-        sample = {"tier": "default"}
-        template = command_template(config, sample)
-        if not isinstance(template, str) or not template.strip():
-            problems.append("config: missing worker command")
-        else:
-            tokens = shlex.split(template)
-            placeholders = [token for token in tokens if token in ("{prompt}", "{prompt_file}")]
-            embedded = [
-                token for token in tokens
-                if ("{prompt}" in token or "{prompt_file}" in token)
-                and token not in ("{prompt}", "{prompt_file}")
-            ]
-            if len(placeholders) != 1:
-                problems.append("config: worker command needs one prompt placeholder")
-            if embedded:
-                problems.append("config: prompt placeholder must be a complete argument")
-    except (SystemExit, ValueError) as error:
+    except SystemExit as error:
         problems.append("config: {}".format(error))
+    if config is not None:
+        for validator in (
+                configured_limits, configured_capsule_max_chars,
+                configured_finish_requires_brief, configured_report_requires_sections,
+                configured_accept_requires_brief, configured_phase_sequence_requires_briefs):
+            try:
+                validator(config)
+            except ValueError as error:
+                problems.append("config: {}".format(error))
+        try:
+            configured_tier(config, "default")
+        except ValueError as error:
+            problems.append("config: default tier: {}".format(error))
+        tiers = config.get("tiers", {})
+        if not isinstance(tiers, dict):
+            problems.append("config: tiers must be a table")
+        else:
+            for name in sorted(tiers):
+                if not name.strip():
+                    problems.append("config: tier name must be non-blank")
+                    continue
+                if name == "default":
+                    problems.append("config: tier name 'default' is reserved")
+                    continue
+                section = tiers[name]
+                prefix = "config: tier {!r}: ".format(name)
+                before = len(problems)
+                if not isinstance(section, dict):
+                    problems.append(prefix + "[tiers.{}] must be a table".format(name))
+                    continue
+                for key, validator in (
+                        ("command", validate_worker_template),
+                        ("worker_timeout_minutes", configured_worker_timeout_minutes),
+                        ("capsule_max_chars", validated_capsule_max_chars)):
+                    if key not in section:
+                        continue
+                    try:
+                        validator(section[key])
+                    except ValueError as error:
+                        problems.append(prefix + str(error))
+                if len(problems) == before:
+                    try:
+                        configured_tier(config, name)
+                    except ValueError as error:
+                        problems.append(prefix + str(error))
     try:
         _, memory_text = read_memory(relay_dir)
         memory_entries = memory_index_entries(memory_text)
@@ -3252,8 +3399,7 @@ def cmd_validate(args):
             seen_numbers[number] = task_id
     for task in active:
         problems.extend(task_problems(
-            relay_dir, task, known, memory_entries,
-            capsule_max_chars=capsule_max_chars,
+            relay_dir, task, known, memory_entries, config=config,
         ))
         task_id = task.get("id")
         if isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id):
@@ -3548,6 +3694,9 @@ def build_parser():
 
     command = commands.add_parser("stats", help="show read-only aggregate task statistics")
     command.set_defaults(function=cmd_stats)
+
+    command = commands.add_parser("tiers", help="show effective worker tier settings")
+    command.set_defaults(function=cmd_tiers)
 
     command = commands.add_parser("validate", help="check config and task state")
     command.set_defaults(function=cmd_validate)

@@ -43,6 +43,12 @@ over active and archived status, attempts, reason codes, capsule sizes, phase
 receipt coverage, and post-submission warnings. Receipt coverage is command-use
 evidence, not proof of attention.
 
+Task tiers are explicit rather than fallback labels. `default` uses the global
+worker command and limits; each other tier must be configured and may override
+the command, worker timeout, and capsule budget independently. Run
+`.attention-relay/relay tiers` to inspect effective settings without printing
+worker command flags.
+
 ## How is this different from Agent Relay?
 
 - **Edge placement:** a deterministic task capsule appears at both ends of each
