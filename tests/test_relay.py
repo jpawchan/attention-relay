@@ -1609,6 +1609,128 @@ module["cmd_archive"](SimpleNamespace())
             self.assertIn("exceeded by", output)
         self.assertEqual(self.state(project, task_id)["status"], "queued")
 
+    def test_task_capsule_running_raw_uses_stored_launch_and_denies_worker(self):
+        project = self.make_project()
+        task_id = self.create_task(project, "stored capsule", ["capsule/**"])
+        env = self.lease_task(project, task_id, "stored-capsule-lease")
+        brief = (
+            project / ".attention-relay" / "work" / task_id / "attempt-1.brief.md"
+        ).read_text()
+        _digest_header, stored_capsule = brief.split("\n\n", 1)
+        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec.write_text(spec.read_text().replace(
+            "Complete the stored capsule task.", "This changed after launch.",
+        ))
+
+        raw = self.relay(project, "task", "capsule", task_id, "--raw", check=True)
+        self.assertEqual(raw.stdout.encode(), stored_capsule.encode())
+        shown = self.relay(project, "task", "capsule", task_id, check=True)
+        self.assertTrue(shown.stdout.startswith(stored_capsule + "\n\nCapsule diagnostics:\n"))
+        self.assertIn("Source: launch (attempt 1)\n", shown.stdout)
+        self.assertIn(
+            "Digest: sha256:" + hashlib.sha256(stored_capsule.encode()).hexdigest(),
+            shown.stdout,
+        )
+        denied = self.relay(project, "task", "capsule", task_id, env=env)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
+
+    def test_task_capsule_prospective_preview_matches_launch_and_writes_nothing(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "prospective capsule", ["preview/**"])
+        runtime = project / ".attention-relay"
+
+        def snapshot():
+            return {
+                str(path.relative_to(runtime)): (
+                    path.is_dir(), path.stat().st_mtime_ns,
+                    b"" if path.is_dir() else path.read_bytes(),
+                )
+                for path in runtime.rglob("*")
+            }
+
+        before = snapshot()
+        shown = self.relay(project, "task", "capsule", task_id, check=True)
+        self.assertEqual(snapshot(), before)
+        self.assertIn("Source: current spec (prospective)\n", shown.stdout)
+        prospective = self.relay(
+            project, "task", "capsule", task_id, "--raw", check=True,
+        ).stdout
+        self.assertEqual(snapshot(), before)
+
+        self.relay(project, "run", task_id, check=True)
+        brief = runtime / "work" / task_id / "attempt-1.brief.md"
+        _digest_header, launched = brief.read_text().split("\n\n", 1)
+        self.assertEqual(prospective, launched)
+
+    def test_task_capsule_diagnostics_count_unicode_characters(self):
+        project = self.make_project()
+        title = "aperçu 😀 東京"
+        task_id = self.create_task(project, title, ["café/**"])
+        shown = self.relay(project, "task", "capsule", task_id, check=True)
+        task_line = f"Task: {task_id}: {title}"
+        scope_line = "Scope: café/**"
+        objective = f"## Objective\nComplete the {title} task."
+        self.assertIn(f"- Task: {len(task_line)} chars\n", shown.stdout)
+        self.assertIn(f"- Scope: {len(scope_line)} chars\n", shown.stdout)
+        self.assertIn(f"- Objective: {len(objective)} chars\n", shown.stdout)
+        capsule, diagnostics = shown.stdout.split("\n\nCapsule diagnostics:\n", 1)
+        self.assertIn(f"Capsule: {len(capsule)} of 4000 chars", diagnostics)
+        self.assertRegex(diagnostics, r"Digest: sha256:[0-9a-f]{64}\n")
+
+    def test_task_capsule_over_budget_reports_all_diagnostics_and_raw_is_empty(self):
+        project = self.make_project()
+        self.configure(
+            project, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=100,
+        )
+        task_id = self.create_task(project, "preview overflow", ["budget/**"])
+        shown = self.relay(project, "task", "capsule", task_id)
+        self.assertNotEqual(shown.returncode, 0)
+        self.assertTrue(shown.stdout.startswith("# Critical Context Capsule\n"))
+        self.assertRegex(
+            shown.stdout, r"Capsule: \d+ of 100 chars \(\d+ chars overflow\)",
+        )
+        for label in (
+                "Header", "Task", "Scope", "Objective", "Acceptance criteria",
+                "Not allowed", "Verification"):
+            self.assertRegex(shown.stdout, rf"- {label}: \d+ chars\n")
+        self.assertRegex(shown.stdout, r"Digest: sha256:[0-9a-f]{64}\n")
+        self.assertIn("Source: current spec (prospective)\n", shown.stdout)
+        self.assertIn("capsule_max_chars=100", shown.stderr)
+
+        raw = self.relay(project, "task", "capsule", task_id, "--raw")
+        self.assertNotEqual(raw.returncode, 0)
+        self.assertEqual(raw.stdout, "")
+        self.assertIn("capsule_max_chars=100", raw.stderr)
+
+    def test_task_capsule_errors_pass_through_and_reject_unknown_or_archived(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        created = self.relay(
+            project, "task", "create", "--title", "unfinished preview", check=True,
+        )
+        unfinished = created.stdout.split()[1]
+        preview = self.relay(project, "task", "capsule", unfinished)
+        launch = self.relay(project, "run", unfinished)
+        self.assertNotEqual(preview.returncode, 0)
+        self.assertEqual(preview.stderr, launch.stderr)
+        self.assertIn("Objective still contains the template placeholder", preview.stderr)
+
+        unknown = self.relay(project, "task", "capsule", "T999-not-here")
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("no such task: T999-not-here", unknown.stderr)
+
+        archived = self.create_task(project, "archived preview", ["archive/**"])
+        state_path = project / ".attention-relay" / "tasks" / f"{archived}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "done"
+        state_path.write_text(json.dumps(state))
+        self.relay(project, "archive", check=True)
+        rejected = self.relay(project, "task", "capsule", archived)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(f"{archived} is archived", rejected.stderr)
+
     def test_memory_archive_and_prompt_spec_alignment(self):
         project = self.make_project()
         self.relay(project, "memory", "add", "--for", "worker",

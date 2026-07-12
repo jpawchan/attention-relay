@@ -328,6 +328,19 @@ The same task state therefore produces byte-identical capsule text.
 Capsules are never truncated. If one exceeds `capsule_max_chars`, launch and
 validation fail with the measured size and overflow.
 
+`relay task capsule ID [--raw]` is a read-only, orchestrator-only preview. For a
+non-running active task it compiles the current spec prospectively. For a
+running task it reads the stored `attempt-N.brief.md` launch capsule and never
+recompiles mutable spec text. Unknown and archived ids are rejected.
+
+Default output prints the complete capsule followed by its measured size,
+headroom or overflow, per-section Unicode character counts, SHA-256 digest, and
+source. It is never truncated, and an over-budget preview exits nonzero after
+printing all diagnostics. `--raw` prints only the exact capsule bytes; when the
+capsule is over budget it prints no stdout and exits nonzero. Empty required
+sections and template placeholders retain the same errors used by launch and
+validation. Preview creates or changes no file or task state.
+
 ## Config
 
 `config.toml` contains:

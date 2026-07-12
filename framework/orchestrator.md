@@ -73,6 +73,14 @@ Edit the generated task spec. It must contain:
 - exact, targeted verification commands;
 - explicit permission for any new dependency or sensitive change.
 
+Preview the exact prospective capsule and its section/budget diagnostics before
+launch; use `--raw` when only byte-comparable capsule output is needed:
+
+```bash
+.attention-relay/relay task capsule <id>
+.attention-relay/relay task capsule <id> --raw
+```
+
 Use dependencies only when one task needs another task’s result. Use separate
 scopes for independent work. Scopes cover Git-visible worktree files only. Do
 not assign Git-ignored files, and do not ask workers to modify them.
@@ -183,6 +191,7 @@ entries.
 relay task create --title T [--scope G]... [--depends-on ID]... [--tier N]
 relay task list [--json]
 relay task show ID
+relay task capsule ID [--raw]
 relay hooks claude-code [--write]
 relay orchestrator brief --phase start|plan|run|close
 relay orchestrator brief --phase review ID

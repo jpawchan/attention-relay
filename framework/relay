@@ -581,8 +581,41 @@ def latest_task_spec_entry(text):
     return ""
 
 
-def compile_context_capsule(task, spec, capsule_max_chars=4000):
-    """Compile a deterministic, bounded capsule from canonical task sections."""
+def render_context_capsule(parts):
+    """Render ordered capsule parts using the canonical separators."""
+    rendered = []
+    for index, (label, text) in enumerate(parts):
+        if index == 0:
+            rendered.append(text)
+        elif label == "Task":
+            rendered.append("\n\n" + text)
+        elif label == "Scope":
+            rendered.append("\n" + text)
+        else:
+            rendered.append("\n\n" + text)
+    return "".join(rendered)
+
+
+def capsule_components_result(parts, capsule_max_chars):
+    """Return rendered text and measurements for ordered capsule parts."""
+    if isinstance(capsule_max_chars, bool) or not isinstance(capsule_max_chars, int) \
+            or capsule_max_chars < 1:
+        raise ValueError("capsule_max_chars must be a positive integer")
+    capsule = render_context_capsule(parts)
+    size = len(capsule)
+    return {
+        "text": capsule,
+        "parts": tuple(parts),
+        "section_chars": tuple((label, len(text)) for label, text in parts),
+        "chars": size,
+        "maximum": capsule_max_chars,
+        "overflow": max(0, size - capsule_max_chars),
+        "headroom": max(0, capsule_max_chars - size),
+    }
+
+
+def context_capsule_components(task, spec, capsule_max_chars=4000):
+    """Build a deterministic capsule and measurements without enforcing its budget."""
     if isinstance(capsule_max_chars, bool) or not isinstance(capsule_max_chars, int) \
             or capsule_max_chars < 1:
         raise ValueError("capsule_max_chars must be a positive integer")
@@ -605,13 +638,14 @@ def compile_context_capsule(task, spec, capsule_max_chars=4000):
 
     scope = ", ".join(task.get("scope", [])) or "whole project"
     parts = [
-        "# Critical Context Capsule",
-        "",
-        "Task: {}: {}".format(task_id, task.get("title", "")),
-        "Scope: " + scope,
+        ("Header", "# Critical Context Capsule"),
+        ("Task", "Task: {}: {}".format(task_id, task.get("title", ""))),
+        ("Scope", "Scope: " + scope),
     ]
     for name in CAPSULE_SECTIONS:
-        parts.extend(("", "## " + name, sections.get(name, "") or "(none)"))
+        parts.append((name, "## {}\n{}".format(
+            name, sections.get(name, "") or "(none)",
+        )))
     if task.get("attempt", 1) > 1:
         feedback = latest_task_spec_entry(sections.get("Review feedback", ""))
         decision = latest_task_spec_entry(sections.get("Decisions", ""))
@@ -620,17 +654,61 @@ def compile_context_capsule(task, spec, capsule_max_chars=4000):
             retry.append("Review feedback: " + feedback)
         if decision:
             retry.append("Decision: " + decision)
-        parts.extend(("", "## Retry delta", "\n".join(retry) or "(none recorded)"))
-    capsule = "\n".join(parts)
-    size = len(capsule)
-    if size > capsule_max_chars:
-        raise ValueError(
-            "{}: critical context capsule is {} characters; capsule_max_chars={} "
-            "is exceeded by {} characters".format(
-                task_id, size, capsule_max_chars, size - capsule_max_chars,
-            )
+        parts.append(("Retry delta", "## Retry delta\n" + (
+            "\n".join(retry) or "(none recorded)"
+        )))
+    return capsule_components_result(parts, capsule_max_chars)
+
+
+def stored_context_capsule_components(capsule, capsule_max_chars=4000):
+    """Measure a stored launch capsule without consulting mutable task spec text."""
+    labels = (*CAPSULE_SECTIONS, "Retry delta")
+    matches = list(re.finditer(
+        r"(?:^|\n\n)## ({})\n".format("|".join(map(re.escape, labels))), capsule,
+    ))
+    found = [match.group(1) for match in matches]
+    if found not in [list(CAPSULE_SECTIONS), [*CAPSULE_SECTIONS, "Retry delta"]]:
+        raise ValueError("stored capsule sections are missing or invalid")
+    prefix = capsule[:matches[0].start()]
+    header, separator, task_scope = prefix.partition("\n\n")
+    task_scope_lines = task_scope.splitlines()
+    if (header != "# Critical Context Capsule" or not separator
+            or len(task_scope_lines) < 2
+            or not task_scope_lines[0].startswith("Task: ")
+            or not task_scope_lines[-1].startswith("Scope: ")):
+        raise ValueError("stored capsule header is missing or invalid")
+    parts = [
+        ("Header", header),
+        ("Task", "\n".join(task_scope_lines[:-1])),
+        ("Scope", task_scope_lines[-1]),
+    ]
+    for index, match in enumerate(matches):
+        start = match.start() + (2 if capsule.startswith("\n\n", match.start()) else 0)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(capsule)
+        parts.append((match.group(1), capsule[start:end]))
+    result = capsule_components_result(parts, capsule_max_chars)
+    if result["text"] != capsule:
+        raise ValueError("stored capsule separators are invalid")
+    return result
+
+
+def capsule_budget_error(task_id, result):
+    return (
+        "{}: critical context capsule is {} characters; capsule_max_chars={} "
+        "is exceeded by {} characters".format(
+            task_id, result["chars"], result["maximum"], result["overflow"],
         )
-    return capsule
+    )
+
+
+def compile_context_capsule(task, spec, capsule_max_chars=4000):
+    """Compile a deterministic, bounded capsule from canonical task sections."""
+    result = context_capsule_components(task, spec, capsule_max_chars)
+    if result["overflow"]:
+        raise ValueError(
+            capsule_budget_error(task.get("id", "unknown"), result)
+        )
+    return result["text"]
 
 
 def cmd_task_create(args):
@@ -742,6 +820,66 @@ def cmd_task_show(args):
     task = load_task(relay_dir, args.id, include_archive=True)
     say(json.dumps(task, indent=2))
     say_next_actions(relay_dir)
+
+
+def cmd_task_capsule(args):
+    require_orchestrator()
+    relay_dir = require_relay_dir()
+    active_path = task_json_path(relay_dir, args.id)
+    if not os.path.exists(active_path):
+        archived_path = os.path.join(archive_dir(relay_dir), args.id + ".json")
+        if os.path.exists(archived_path):
+            die("{} is archived; capsule preview is available only for active tasks".format(
+                args.id,
+            ))
+    task = load_task(relay_dir, args.id)
+    maximum = configured_capsule_max_chars(load_config(relay_dir))
+    attempt = task.get("attempt", 1)
+    if task.get("status") == "running":
+        path = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt)
+        with open(path, encoding="utf-8") as source:
+            stored_brief = source.read()
+        _digest, separator, capsule = stored_brief.partition("\n\n")
+        if not separator or not capsule.startswith("# Critical Context Capsule"):
+            die("current attempt capsule is missing or invalid; rerun the task")
+        try:
+            result = stored_context_capsule_components(capsule, maximum)
+        except ValueError:
+            die("current attempt capsule is missing or invalid; rerun the task")
+        source_label = "launch (attempt {})".format(attempt)
+    else:
+        with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+            result = context_capsule_components(task, source.read(), maximum)
+        capsule = result["text"]
+        source_label = "current spec (prospective)"
+
+    digest = hashlib.sha256(capsule.encode("utf-8")).hexdigest()
+    if args.raw:
+        if result["overflow"]:
+            print("error: " + capsule_budget_error(task["id"], result), file=sys.stderr)
+            raise SystemExit(1)
+        sys.stdout.buffer.write(capsule.encode("utf-8"))
+        sys.stdout.buffer.flush()
+        return
+
+    say(capsule)
+    say()
+    say("Capsule diagnostics:")
+    if result["overflow"]:
+        budget_detail = "{} chars overflow".format(result["overflow"])
+    else:
+        budget_detail = "{} chars headroom".format(result["headroom"])
+    say("Capsule: {} of {} chars ({})".format(
+        result["chars"], result["maximum"], budget_detail,
+    ))
+    say("Sections:")
+    for label, count in result["section_chars"]:
+        say("- {}: {} chars".format(label, count))
+    say("Digest: sha256:" + digest)
+    say("Source: " + source_label)
+    if result["overflow"]:
+        print("error: " + capsule_budget_error(task["id"], result), file=sys.stderr)
+        raise SystemExit(1)
 
 
 def append_md_section(relay_dir, task_id, section, text):
@@ -2435,6 +2573,11 @@ def build_parser():
     command = task_commands.add_parser("show", help="show task state")
     command.add_argument("id")
     command.set_defaults(function=cmd_task_show)
+
+    command = task_commands.add_parser("capsule", help="preview a task capsule and its budget")
+    command.add_argument("id")
+    command.add_argument("--raw", action="store_true", help="print only the capsule bytes")
+    command.set_defaults(function=cmd_task_capsule)
 
     command = task_commands.add_parser("accept", help="approve reviewed work")
     command.add_argument("id")
