@@ -111,12 +111,15 @@ For each task in `needs_review`, issue a fresh review brief:
 .attention-relay/relay orchestrator brief --phase review <id>
 ```
 
-It prints the stored launch capsule when available, current report and diff
-paths, declared and observed paths, a review checklist, and
-`Review token: <value>`. If current spec or memory inputs would compile to a
-different capsule, it prints a drift warning while preserving the launch
-snapshot for review. Read the report and diff; read full files only when those
-artifacts are not enough.
+It prints the stored launch capsule when available, current report, result, and
+diff paths with short SHA-256 digests, declared and observed paths, a review
+checklist, and `Review token: <value>`. If current spec or memory inputs would
+compile to a different capsule, it prints a drift warning while preserving the
+launch snapshot for review. If that fresh compilation fails, the stored launch
+capsule still permits review and the brief prints one bounded warning with the
+error. Without a stored launch capsule, compilation failure stops the brief.
+Read the report and diff; read full files only when those artifacts are not
+enough.
 
 Compare the report with the diff. Check the verification evidence. For a retried
 task, review its earlier attempt diffs too; returning a task does not revert its
@@ -134,9 +137,12 @@ Then run one command:
 Do not accept unverified work. For auth, payments, migrations, or other risky
 changes, create a separate read-only review task for a strong worker.
 
-The review token is bound to the current task attempt and is consumed by a
-successful accept. Run a fresh review brief after a return or if the token is
-missing, wrong, replaced, or already used.
+The review token is bound to the current task attempt and to a manifest of the
+displayed capsule, report, result, diff, and declared/observed changed paths. A
+successful accept consumes it. If any evidence changed, acceptance refuses
+without consuming the token; inspect the change and run a fresh review brief.
+Also run a fresh brief after a return or if the token is missing, wrong,
+replaced, or already used.
 
 ## Close and hand off
 

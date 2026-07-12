@@ -488,6 +488,8 @@ class RelayTests(unittest.TestCase):
             project, "task", "create", "--title", "", "--scope", "empty/**",
         )
         self.assertNotEqual(empty_title.returncode, 0)
+        truncated = self.create_task(project, "x" * 39 + " next", ["slug/**"])
+        self.assertEqual(truncated, "T006-" + "x" * 39)
         for value in ("0", "-1"):
             result = self.relay(project, "run", "--dry-run", "--max-parallel", value)
             self.assertNotEqual(result.returncode, 0, value)
@@ -721,8 +723,24 @@ class RelayTests(unittest.TestCase):
         brief, first_token = self.review_brief_token(project, task_id)
         self.assertTrue(brief.stdout.startswith("# Critical Context Capsule\n"))
         self.assertIn("attempt-1.report.md", brief.stdout)
+        self.assertIn("attempt-1.result.json", brief.stdout)
         self.assertIn("attempt-1.diff", brief.stdout)
         self.assertIn(f"review/{task_id}.txt", brief.stdout)
+        for artifact in ("Report", "Result", "Diff"):
+            self.assertRegex(brief.stdout, rf"- {artifact}: .* \(sha256:[0-9a-f]{{12}}\)")
+        token_record = json.loads((
+            project / ".attention-relay" / "work" / task_id
+            / "review-brief-token.json"
+        ).read_text())
+        self.assertEqual(token_record["token"], first_token)
+        self.assertEqual(token_record["task_id"], task_id)
+        self.assertEqual(token_record["attempt"], 1)
+        self.assertEqual(
+            set(token_record["evidence"]),
+            {"capsule", "report", "result", "diff", "declared", "observed"},
+        )
+        for name in ("capsule", "report", "result", "diff"):
+            self.assertRegex(token_record["evidence"][name], r"^sha256:[0-9a-f]{64}$")
         _replacement, current_token = self.review_brief_token(project, task_id)
         for token in ("wrong", first_token):
             rejected = self.relay(
@@ -786,7 +804,158 @@ class RelayTests(unittest.TestCase):
         config.write_text(config.read_text() + "\n[gates]\naccept_requires_brief = false\n")
         gate_off_id = self.create_task(gate_off, "accept gate off", ["gate-off/**"])
         self.relay(gate_off, "run", gate_off_id, check=True)
+        gate_off_report = (
+            gate_off / ".attention-relay" / "work" / gate_off_id
+            / "attempt-1.report.md"
+        )
+        gate_off_report.write_text(gate_off_report.read_text() + "changed without brief\n")
         self.relay(gate_off, "task", "accept", gate_off_id, check=True)
+
+    def test_review_evidence_mutations_reject_without_consuming_token(self):
+        for artifact in ("report.md", "result.json", "diff"):
+            with self.subTest(artifact=artifact):
+                project = self.make_project("mutated-" + artifact.replace(".", "-"))
+                self.configure(project, self.write_worker(GOOD_WORKER))
+                task_id = self.create_task(project, "mutate " + artifact, ["mutate/**"])
+                self.relay(project, "run", task_id, check=True)
+                _brief, token = self.review_brief_token(project, task_id)
+                token_path = (
+                    project / ".attention-relay" / "work" / task_id
+                    / "review-brief-token.json"
+                )
+                evidence_path = (
+                    token_path.parent / f"attempt-1.{artifact}"
+                )
+                evidence_path.write_text(evidence_path.read_text() + "\n")
+
+                rejected = self.relay(
+                    project, "task", "accept", task_id, "--brief", token,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn(
+                    "review evidence changed; run a fresh review brief",
+                    rejected.stderr,
+                )
+                self.assertEqual(json.loads(token_path.read_text())["token"], token)
+                self.assertEqual(self.state(project, task_id)["status"], "needs_review")
+
+                _fresh, fresh_token = self.review_brief_token(project, task_id)
+                self.relay(
+                    project, "task", "accept", task_id,
+                    "--brief", fresh_token, check=True,
+                )
+
+    def test_review_manifest_uses_launch_capsule_and_accepts_empty_diff(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "empty evidence diff", ["empty/**"])
+        self.relay(project, "run", task_id, check=True)
+        work = project / ".attention-relay" / "work" / task_id
+        self.assertEqual((work / "attempt-1.diff").read_text(), "")
+        _brief, token = self.review_brief_token(project, task_id)
+
+        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec.write_text(spec.read_text().replace(
+            f"Complete the empty evidence diff task.",
+            "Complete the edited specification task.",
+        ))
+        self.relay(
+            project, "task", "accept", task_id, "--brief", token, check=True,
+        )
+
+    def test_review_brief_requires_regular_complete_evidence(self):
+        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_review_hash_probe")
+        digest_file = self.base / "digest.bin"
+        digest_file.write_bytes(b"x" * (1024 * 1024 + 17))
+        self.assertEqual(
+            module["sha256_regular_file"](digest_file),
+            hashlib.sha256(digest_file.read_bytes()).hexdigest(),
+        )
+        with self.assertRaises(OSError):
+            module["sha256_regular_file"](self.base)
+        digest_link = self.base / "digest-link"
+        digest_link.symlink_to(digest_file)
+        with self.assertRaises(OSError):
+            module["sha256_regular_file"](digest_link)
+
+        for missing in ("report.md", "result.json", "diff"):
+            with self.subTest(missing=missing):
+                project = self.make_project("missing-" + missing.replace(".", "-"))
+                self.configure(project, self.write_worker(GOOD_WORKER))
+                task_id = self.create_task(project, "missing " + missing, ["missing/**"])
+                self.relay(project, "run", task_id, check=True)
+                work = project / ".attention-relay" / "work" / task_id
+                (work / f"attempt-1.{missing}").unlink()
+                rejected = self.relay(
+                    project, "orchestrator", "brief", "--phase", "review", task_id,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse((work / "review-brief-token.json").exists())
+
+        project = self.make_project("symlink-report")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(project, "symlink report", ["symlink/**"])
+        self.relay(project, "run", task_id, check=True)
+        work = project / ".attention-relay" / "work" / task_id
+        report = work / "attempt-1.report.md"
+        external = self.base / "external-report.md"
+        external.write_text(report.read_text())
+        report.unlink()
+        report.symlink_to(external)
+        rejected = self.relay(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("symlink", rejected.stderr.lower())
+        self.assertFalse((work / "review-brief-token.json").exists())
+
+    def test_review_brief_survives_fresh_capsule_compile_failure(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        self.write_memory(project, [("M001", "W", "Launch-only fact", "Full body")])
+        task_id = self.create_task(project, "stored capsule fallback", ["fallback/**"])
+        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec.write_text(spec.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            "Memory: M001.",
+        ))
+        self.relay(project, "run", task_id, check=True)
+        self.write_memory(project, [])
+
+        brief, token = self.review_brief_token(project, task_id)
+        self.assertIn("Launch-only fact", brief.stdout)
+        self.assertEqual(brief.stdout.count("WARNING:"), 1)
+        self.assertIn("referenced memory id M001 is missing", brief.stdout)
+        self.assertLess(len(next(
+            line for line in brief.stdout.splitlines() if line.startswith("WARNING:")
+        )), 600)
+        self.relay(
+            project, "task", "accept", task_id, "--brief", token, check=True,
+        )
+
+        no_launch = self.make_project("no-launch-capsule")
+        task_id = self.create_task(no_launch, "no launch compile", ["none/**"])
+        runtime = no_launch / ".attention-relay"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = "needs_review"
+        state_path.write_text(json.dumps(task))
+        work = runtime / "work" / task_id
+        work.mkdir(parents=True)
+        (work / "attempt-1.report.md").write_text("report\n")
+        (work / "attempt-1.result.json").write_text(json.dumps({"changed_paths": []}))
+        (work / "attempt-1.diff").write_text("")
+        spec = runtime / "tasks" / f"{task_id}.md"
+        spec.write_text(spec.read_text().replace(
+            f"Complete the no launch compile task.",
+            "Replace this line with one clear outcome.",
+        ))
+        failed = self.relay(
+            no_launch, "orchestrator", "brief", "--phase", "review", task_id,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("template placeholder", failed.stderr)
+        self.assertFalse((work / "review-brief-token.json").exists())
 
     def test_orchestrator_phase_handoff_and_next_action_capsules(self):
         project = self.make_project()

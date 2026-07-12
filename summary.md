@@ -12,7 +12,7 @@ It coordinates worker CLIs; it is not an agent model, package manager, patch que
 
 - Published at `https://github.com/jpawchan/attention-relay`, branch `main`, tag `v2.0.0` (2026-07-11).
 - The implementation is complete and CI is green (4 matrix jobs passed on the publish commit).
-- Local verification on 2026-07-12: all 56 end-to-end tests pass in ~64 seconds; a full live orchestration loop (init → start brief → gated worker finish → gated accept → close/start handoff → validate → archive) was exercised manually.
+- Local verification on 2026-07-12: all 60 end-to-end tests pass; review tokens are bound to SHA-256 evidence manifests, and a full live orchestration loop (init → start brief → gated worker finish → gated accept → close/start handoff → validate → archive) was exercised manually.
 - An independent audit found and fixed four defects before release: an unlocked handoff read-modify-write race, a soft hook-output cap, a same-second handoff boundary loss, and non-executable command forms in `worker.md`. All have regression tests.
 - One single-test error was observed once in seven local suite runs under heavy parallel load and never reproduced (locally or in CI). If a test flakes in CI, suspect timing-sensitive lock/interleaving tests first.
 - No known unfinished feature path. A `relay orchestrate` launcher (framework-owned orchestrator process) was deliberately deferred, not forgotten.
@@ -29,7 +29,7 @@ python3 -m py_compile framework/relay tests/test_relay.py
 python3 tests/test_relay.py
 ```
 
-Expected: the help usage line lists `{init,task,run,status,validate,archive,orchestrator,hooks,hook-event,memory}`; py_compile is silent; the suite ends with `Ran 56 tests` and `OK` (~64 s, temp Git repos and stub workers, no network or live agent calls).
+Expected: the help usage line lists `{init,task,run,status,validate,archive,orchestrator,hooks,hook-event,memory}`; py_compile is silent; the suite ends with `Ran 60 tests` and `OK` (temp Git repos and stub workers, no network or live agent calls).
 
 If you run the suite from inside a Relay-leased worker process, unset the inherited worker env first or fixtures will reject orchestrator commands:
 
@@ -61,7 +61,7 @@ Do not smoke-test a real worker unless the configured worker CLI and its credent
 | Processes | `subprocess.Popen(..., start_new_session=True)`; process-group signalling on timeout/interrupt. |
 | Configuration | TOML via `tomllib`; runtime state is JSON records plus Markdown specs/reports/briefs/handoff. |
 | Version control | Git CLI snapshots with a temporary `GIT_INDEX_FILE`; no Git library. |
-| Tests | `unittest`, 56 end-to-end cases in `tests/test_relay.py` with temp repos and embedded stub workers. |
+| Tests | `unittest`, 60 end-to-end cases in `tests/test_relay.py` with temp repos and embedded stub workers. |
 | CI | `.github/workflows/ci.yml`: push+PR, Ubuntu/macOS × Python 3.11/3.13, `checkout@v7`, `setup-python@v6`, 10-minute timeout. |
 | License | MIT (`LICENSE`). |
 
@@ -76,7 +76,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
 | `framework/config.example.toml` | Default worker command (memory-clean Hermes), tiers, limits, gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
-| `tests/test_relay.py` | Canonical 56-test end-to-end suite and all stub worker fixtures. |
+| `tests/test_relay.py` | Canonical 60-test end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
 | `prompts/create-framework.md` | Standalone generation prompt with the embedded exact SPEC copy (BEGIN SPEC / END SPEC markers). |
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
@@ -93,7 +93,7 @@ Relay itself makes no HTTP requests. The configured worker command (default: Her
 | Runtime discovery, safety | `find_relay_dir`, `runtime_paths_are_safe`, `require_relay_dir`; `RELAY_DIRNAME = ".attention-relay"`. |
 | Locks and atomic state | `file_lock`, `task_lock`, `atomic_write`, `atomic_json`, `lock_path`. |
 | Config | `load_config`, `cfg_get`, `configured_limits`, `configured_capsule_max_chars`, `configured_finish_requires_brief`, `configured_accept_requires_brief`, `command_template`, `worker_argv`. |
-| Paths for artifacts | `brief_token_path` (finish-brief-token.json), `review_token_path` (review-brief-token.json), `orchestrator_handoff_path` (orchestrator-handoff.md), `report_path`, `result_path`. |
+| Paths and review evidence | `report_path`, `result_path`, `diff_path`, `sha256_regular_file`, `build_review_evidence_manifest`, `brief_token_path` (finish-brief-token.json), and `review_token_path` (review-brief-token.json). |
 | Capsule | `CAPSULE_SECTIONS`, `task_spec_sections`, `compile_context_capsule` (deterministic, budgeted, placeholder- and memory-reference-validating). |
 | Task lifecycle commands | `cmd_task_create`, `cmd_task_list/show`, `cmd_task_accept` (review-token gate), `cmd_task_return/decide/cancel` (invalidate review token), `cmd_task_finish` (finish-token gate), `cmd_task_brief` (worker phases + report token), `cmd_task_unlock`. |
 | Next-actions capsule | `render_next_actions`, `say_next_actions` (tails `status`, `task show`, real `run`). |
@@ -132,8 +132,8 @@ worker: task brief --phase edit|verify|report          <- action-time re-briefs 
    v
 finalize: attempt diff vs wave snapshot, scope check
    v
-orchestrator brief --phase review ID -> Review token   <- re-read criteria at the decision edge
-   |    task accept --brief TOKEN                      <- gate (default on)
+orchestrator brief --phase review ID -> token + evidence manifest <- decision edge
+   |    task accept --brief TOKEN verifies evidence               <- gate (default on)
    v
 status/show/run output ends with "Next actions:"       <- recency edge, any harness
 orchestrator brief --phase close -> handoff written    <- next session's beginning edge
@@ -166,7 +166,7 @@ Environment variables (all read/written in `framework/relay`): `RELAY_DIR` (runt
 - The capsule is always GENERATED from the spec's existing sections (`Objective`, `Acceptance criteria`, `Not allowed`, `Verification`, latest feedback/decision) plus summaries for up to six worker-visible memory ids referenced only in `Context`. Never add a hand-edited capsule section, copy full memory bodies, or duplicate criteria; the stored launch capsule is the immutable audit snapshot and review warns on input drift.
 - Template-placeholder specs refuse to launch and fail `validate`. Test fixtures must write real Objective/Acceptance criteria before `run`.
 - Both gates default ON. Stub workers in tests must call `task brief --phase report` and pass the token to `finish`; orchestrator fixtures need `orchestrator brief --phase review ID` tokens for `accept` (or set the gate key false in the fixture's config.toml).
-- Gate tokens are one-use and bound to (task, attempt, lease)/(task, attempt); issuance and consumption happen under the task lock. Do not weaken bindings — replay across attempts/leases must fail.
+- Gate tokens are one-use and bound to (task, attempt, lease)/(task, attempt, review-evidence manifest); issuance, evidence verification, and consumption happen under the task lock. Do not weaken bindings — replay across attempts/leases must fail, and evidence mismatches must not consume review tokens.
 - The `orchestrator-handoff` lock is a leaf: both start-consume and close-generate hold it for their whole read-derive-write; never acquire task/scheduler locks while holding it.
 - Handoff `done` entries dedupe by task id against the previous handoff (same-second boundary). Don't simplify to a pure timestamp comparison; whole-second `now()` makes `>` and `>=` both wrong alone.
 - `cap_hook_output` returning `""` (and adapters emitting nothing, exit 0) is deliberate fail-open, spec'd behavior — don't "fix" silence into errors, and keep every emission ≤ 9000 chars including edge lines.
@@ -187,4 +187,4 @@ Environment variables (all read/written in `framework/relay`): `RELAY_DIR` (runt
 | Add a new orchestrator brief phase | `orchestrator_*_brief` functions + `cmd_orchestrator_brief` + `build_parser` in `framework/relay`; `framework/orchestrator.md`; SPEC.md + embedded copy; new tests. |
 | Change the default capsule budget | `configured_capsule_max_chars` in `framework/relay`; `framework/config.example.toml`; SPEC.md + embedded copy; budget tests in `tests/test_relay.py`. |
 
-Last updated 2026-07-12 — Referenced-memory capsules, strict memory-index validation, and immutable review snapshots documented (56 tests).
+Last updated 2026-07-12 — Evidence-bound review tokens, resilient stored-capsule review, and safe slug truncation documented (60 tests).

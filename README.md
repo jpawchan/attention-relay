@@ -26,8 +26,10 @@ quality, but it can make critical context easier to recover.
 
 Workers re-read the capsule before editing, verification, and reporting. The
 report brief issues a fresh token bound to the current attempt and lease before
-`task finish`; the review brief does the same for `task accept` and the current
-attempt.
+`task finish`; the review brief binds its token to the current attempt and a
+SHA-256 manifest of the capsule and artifacts it displayed. `task accept`
+recomputes that manifest and refuses changed review evidence without consuming
+the token, so the reviewer can inspect the change and issue a fresh brief.
 
 At session close, the orchestrator writes a bounded handoff from current state.
 The next start brief prints and consumes that handoff. Output from `status`,
@@ -38,8 +40,9 @@ The next start brief prints and consumes that handoff. Output from `status`,
 
 - **Edge placement:** a deterministic task capsule appears at both ends of each
   worker prompt.
-- **Freshness gates:** finish and accept can require brief tokens bound to the
-  current action and attempt.
+- **Freshness gates:** finish can require a brief token for the current lease and
+  attempt; accept can additionally bind its token to the exact displayed review
+  evidence.
 - **Handoff:** close and start briefs carry current state between orchestrator
   sessions.
 - **Claude Code hooks:** optional hooks inject the start brief and bounded next

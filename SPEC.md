@@ -217,11 +217,18 @@ task creation, run, review/accept, and session close.
   freshly compiles the task capsule but displays the stored launch capsule when
   `attempt-N.brief.md` exists. If the fresh and stored capsules differ, it prints
   one bounded warning that spec or memory inputs drifted and that the launch
-  capsule is shown. With no stored brief it displays the fresh capsule. It also
-  prints current report and diff paths, declared and observed changed paths, and
-  an accept/return/decide checklist. It atomically stores and prints a new
-  `Review token: <value>` bound to task id and attempt; issuing another review
-  brief replaces the token.
+  capsule is shown. If fresh compilation fails while a stored launch capsule
+  exists, review continues with that stored capsule and one bounded warning that
+  includes the compile error; without a stored brief, compilation failure still
+  fails the command. The report, result, and attempt diff must each be a regular,
+  non-symlink file; an empty diff is valid. The brief prints their paths with the
+  first 12 hexadecimal characters of each SHA-256 digest, plus declared and
+  observed changed paths and an accept/return/decide checklist.
+  Under the same lock, it builds an evidence manifest containing task id,
+  attempt, the displayed capsule SHA-256, report SHA-256, result SHA-256,
+  attempt-diff SHA-256, and sorted declared and observed changed-path lists. It
+  atomically stores that manifest beside a new `Review token: <value>`; issuing
+  another review brief replaces both token and manifest.
 - `close` uses the same dedicated handoff leaf lock to atomically write the
   bounded `.attention-relay/orchestrator-handoff.md`, prints it, and reminds the
   orchestrator to start a fresh session. The template carries the newest goal,
@@ -230,10 +237,14 @@ task creation, run, review/accept, and session close.
   work, unresolved decisions, and an avoid placeholder.
 
 With the default accept gate enabled, `task accept --brief TOKEN` requires the
-stored token for that task's current attempt and consumes it only on successful
-accept. Missing, wrong, replaced, replayed, or stale-attempt tokens are rejected.
-Return, decide, and cancel remove any review token. With the gate disabled,
-accept retains its earlier behavior and ignores `--brief`.
+stored token for that task's current attempt. Under the task lock and before any
+state change, it recomputes the manifest using the capsule the review brief would
+display and requires full equality with the stored manifest. A mismatch is
+rejected with `review evidence changed; run a fresh review brief` without
+consuming the token. Equality proceeds to acceptance and one-use token
+consumption. Missing, wrong, replaced, replayed, or stale-attempt tokens are
+rejected. Return, decide, and cancel remove any review token and manifest. With
+the gate disabled, accept bypasses the manifest exactly as it bypasses `--brief`.
 
 `relay status`, `relay task show`, and each real `relay run` end with a
 deterministic `Next actions` block of at most about six lines. It derives review

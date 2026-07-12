@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -304,12 +305,74 @@ def result_path(relay_dir, task_id, attempt):
     return os.path.join(work_dir(relay_dir, task_id), "attempt-%d.result.json" % attempt)
 
 
+def diff_path(relay_dir, task_id, attempt):
+    return os.path.join(work_dir(relay_dir, task_id), "attempt-%d.diff" % attempt)
+
+
 def brief_token_path(relay_dir, task_id):
     return os.path.join(work_dir(relay_dir, task_id), "finish-brief-token.json")
 
 
 def review_token_path(relay_dir, task_id):
     return os.path.join(work_dir(relay_dir, task_id), "review-brief-token.json")
+
+
+def sha256_regular_file(path):
+    """Return a streaming SHA-256 hex digest for a non-symlink regular file."""
+    if os.path.islink(path):
+        raise OSError("not a regular file: {}".format(path))
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("not a regular file: {}".format(path))
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def build_review_evidence_manifest(relay_dir, task, capsule):
+    """Build the immutable evidence description used by the review accept gate."""
+    attempt = task.get("attempt", 1)
+    report = report_path(relay_dir, task["id"], attempt)
+    result_file = result_path(relay_dir, task["id"], attempt)
+    diff = diff_path(relay_dir, task["id"], attempt)
+    hashes = {
+        "report": sha256_regular_file(report),
+        "result": sha256_regular_file(result_file),
+        "diff": sha256_regular_file(diff),
+    }
+    result = read_json(result_file)
+    if sha256_regular_file(result_file) != hashes["result"]:
+        raise OSError("review result changed while its manifest was built")
+    declared = worker_changed_paths(result.get("changed_paths"))
+    if declared is None:
+        raise ValueError("review result changed_paths are missing or invalid")
+    worker_exit = latest_worker_exit(task)
+    observed = worker_exit.get("observed_paths", [])
+    if not isinstance(observed, list) or not all(isinstance(path, str) for path in observed):
+        raise ValueError("review observed changed paths are invalid")
+    return {
+        "task_id": task["id"],
+        "attempt": attempt,
+        "evidence": {
+            "capsule": "sha256:" + hashlib.sha256(capsule.encode("utf-8")).hexdigest(),
+            "report": "sha256:" + hashes["report"],
+            "result": "sha256:" + hashes["result"],
+            "diff": "sha256:" + hashes["diff"],
+            "declared": sorted(declared),
+            "observed": sorted(observed),
+        },
+    }
 
 
 def orchestrator_handoff_path(relay_dir):
@@ -385,7 +448,7 @@ def load_archived_tasks(relay_dir):
 
 def slugify(title):
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    return slug[:40] or "task"
+    return slug[:40].strip("-") or "task"
 
 
 def validate_task_id(task_id):
@@ -989,6 +1052,17 @@ def cmd_task_accept(args):
                     "orchestrator brief --phase review {}`, then pass its token as "
                     "`--brief TOKEN`".format(task["id"])
                 )
+            try:
+                capsule, _capsule_drifted, _compile_warning = displayed_review_capsule(
+                    relay_dir, task,
+                )
+                current_manifest = build_review_evidence_manifest(relay_dir, task, capsule)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                die("review evidence changed; run a fresh review brief")
+            stored_manifest = dict(stored)
+            stored_manifest.pop("token", None)
+            if current_manifest != stored_manifest:
+                die("review evidence changed; run a fresh review brief")
         task["status"] = "done"
         record(task, "accepted", note=args.note or "")
         save_task(relay_dir, task)
@@ -1308,6 +1382,46 @@ def latest_worker_exit(task):
     return {}
 
 
+def compile_current_task_capsule(relay_dir, task):
+    config = load_config(relay_dir)
+    _, memory_text = read_memory(relay_dir)
+    memory_entries = memory_index_entries(memory_text)
+    with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+        return compile_context_capsule(
+            task, source.read(), memory_entries,
+            configured_capsule_max_chars(config),
+        )
+
+
+def displayed_review_capsule(relay_dir, task, check_fresh=False):
+    """Select the capsule review displays, optionally checking current-input drift."""
+    attempt = task.get("attempt", 1)
+    brief_file = os.path.join(
+        work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt,
+    )
+    if os.path.lexists(brief_file):
+        if os.path.islink(brief_file) or not os.path.isfile(brief_file):
+            raise OSError("current attempt capsule is missing or invalid; rerun the task")
+        with open(brief_file, encoding="utf-8") as source:
+            stored_brief = source.read()
+        _digest, separator, stored_capsule = stored_brief.partition("\n\n")
+        if not separator or not stored_capsule.startswith("# Critical Context Capsule"):
+            raise ValueError("current attempt capsule is missing or invalid; rerun the task")
+        if not check_fresh:
+            return stored_capsule, False, None
+        try:
+            fresh_capsule = compile_current_task_capsule(relay_dir, task)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+            error_text = " ".join(str(error).split())[:400]
+            warning = (
+                "capsule inputs could not be compiled since launch; showing launch "
+                "capsule: " + error_text
+            )
+            return stored_capsule, False, warning
+        return stored_capsule, fresh_capsule != stored_capsule, None
+    return compile_current_task_capsule(relay_dir, task), False, None
+
+
 def orchestrator_review_brief(relay_dir, task_id):
     import secrets
 
@@ -1316,45 +1430,24 @@ def orchestrator_review_brief(relay_dir, task_id):
         if task.get("status") != "needs_review":
             die("{} is {}, not needs_review".format(task["id"], task.get("status")))
         attempt = task.get("attempt", 1)
-        config = load_config(relay_dir)
-        _, memory_text = read_memory(relay_dir)
-        memory_entries = memory_index_entries(memory_text)
-        with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
-            fresh_capsule = compile_context_capsule(
-                task, source.read(), memory_entries,
-                configured_capsule_max_chars(config),
-            )
-        brief_file = os.path.join(
-            work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt,
+        capsule, capsule_drifted, compile_warning = displayed_review_capsule(
+            relay_dir, task, check_fresh=True,
         )
-        capsule = fresh_capsule
-        capsule_drifted = False
-        if os.path.isfile(brief_file):
-            with open(brief_file, encoding="utf-8") as source:
-                stored_brief = source.read()
-            _digest, separator, stored_capsule = stored_brief.partition("\n\n")
-            if not separator or not stored_capsule.startswith("# Critical Context Capsule"):
-                die("current attempt capsule is missing or invalid; rerun the task")
-            capsule = stored_capsule
-            capsule_drifted = fresh_capsule != stored_capsule
-        result = {}
-        result_file = result_path(relay_dir, task["id"], attempt)
-        if os.path.isfile(result_file):
-            try:
-                result = read_json(result_file)
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                result = {}
+        manifest = build_review_evidence_manifest(relay_dir, task, capsule)
         worker_exit = latest_worker_exit(task)
-        observed = worker_exit.get("observed_paths")
         token = secrets.token_hex(32)
-        atomic_json(review_token_path(relay_dir, task["id"]), {
-            "task_id": task["id"], "attempt": attempt, "token": token,
-        })
+        token_record = dict(manifest)
+        token_record["token"] = token
+        atomic_json(review_token_path(relay_dir, task["id"]), token_record)
     root = project_root(relay_dir)
     report = report_path(relay_dir, task["id"], attempt)
-    diff = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.diff" % attempt)
+    result_file = result_path(relay_dir, task["id"], attempt)
+    diff = diff_path(relay_dir, task["id"], attempt)
+    evidence = manifest["evidence"]
     say(capsule)
-    if capsule_drifted:
+    if compile_warning:
+        say("\nWARNING: " + compile_warning)
+    elif capsule_drifted:
         say(
             "\nWARNING: capsule inputs drifted since launch (spec or memory changed); "
             "showing launch capsule"
@@ -1365,14 +1458,22 @@ def orchestrator_review_brief(relay_dir, task_id):
             worker_exit.get("exit_code"), os.path.relpath(log, root),
         ))
     say("\nReview artifacts:")
-    say("- Report: " + os.path.relpath(report, root))
-    say("- Diff: " + os.path.relpath(diff, root))
-    declared = result.get("changed_paths") if isinstance(result, dict) else None
+    say("- Report: {} (sha256:{})".format(
+        os.path.relpath(report, root), evidence["report"][7:19],
+    ))
+    say("- Result: {} (sha256:{})".format(
+        os.path.relpath(result_file, root), evidence["result"][7:19],
+    ))
+    say("- Diff: {} (sha256:{})".format(
+        os.path.relpath(diff, root), evidence["diff"][7:19],
+    ))
+    declared = evidence["declared"]
+    observed = evidence["observed"]
     say("- Declared changed paths: " + (
-        ", ".join(declared) if isinstance(declared, list) and declared else "(none)"
+        ", ".join(declared) if declared else "(none)"
     ))
     say("- Observed changed paths: " + (
-        ", ".join(observed) if isinstance(observed, list) and observed else "(none recorded)"
+        ", ".join(observed) if observed else "(none recorded)"
     ))
     say("Review checklist:")
     say("- Compare the report, diff, and declared/observed paths to the criteria.")
@@ -2223,7 +2324,7 @@ def run_wave(args, relay_dir, context):
             root, before_tree, after_tree, task.get("scope", []), changed,
         )
         directory = work_dir(relay_dir, task["id"])
-        atomic_write(os.path.join(directory, "attempt-%d.diff" % attempt), diff)
+        atomic_write(diff_path(relay_dir, task["id"], attempt), diff)
         if violations:
             atomic_write(
                 os.path.join(directory, "attempt-%d.violations.diff" % attempt),
