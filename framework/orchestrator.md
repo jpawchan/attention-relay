@@ -149,14 +149,19 @@ marks it consumed without deleting it.
 - `failed`: read the attempt log, fix the cause, then return the task. A
   `changed_paths_mismatch` means the worker's declared paths did not match the
   observed scoped diff; inspect the other reports and diffs before retrying.
+- post-submission warning: a worker exited nonzero after submitting a fully valid
+  result, so Relay preserved the submitted status. Inspect the prominent warning
+  and attempt log in the review brief before accepting or returning the task.
 - `blocked`: read `attempt-N.violations.diff` when present, restore every
   out-of-scope path, resolve any other blocker, then return the task.
 - `needs_decision`: answer with `task decide`.
 - stale `running`: confirm the process is gone, then use `task unlock`.
 
-A timed-out, interrupted, or invalid worker is marked failed. Relay handles
-`SIGINT`, `SIGTERM`, and `SIGHUP`; after an abrupt kill, confirm the worker is
-gone and use `task unlock`. Never edit task JSON by hand.
+A timed-out, interrupted, launch-failed, or invalid worker is marked failed even
+if it wrote a result. An ordinary nonzero exit preserves a fully valid submitted
+status with a warning. Relay handles `SIGINT`, `SIGTERM`, and `SIGHUP`; after an
+abrupt kill, confirm the worker is gone and use `task unlock`. Never edit task
+JSON by hand.
 
 ## Memory
 

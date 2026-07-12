@@ -45,7 +45,10 @@ Do not re-enable memory injection unless the task spec says so.
 - Report failed checks and risks. Never include secrets.
 
 Relay keeps the task running until your process exits. Calling `task finish`
-submits your result; it does not approve the task.
+submits your result; it does not approve the task. If the process then exits
+nonzero, Relay preserves the submitted status only when the result passes every
+normal validation check, and records a post-submission warning for the reviewer.
+Timeout, interruption, and runner or launch errors still fail the attempt.
 
 ## Report
 

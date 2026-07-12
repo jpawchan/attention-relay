@@ -122,8 +122,12 @@ Lifecycle rules:
 2. `run` claims the task as running before starting a worker.
 3. `task finish --brief TOKEN` writes an attempt result but leaves the task
    running. By default, the token must come from a fresh report-phase brief.
-4. After the worker exits, Relay writes the diff and changes the task to the
-   submitted worker status.
+4. After the worker exits, Relay writes the diff and validates any submitted
+   result before applying its worker status. Timeout, interruption, and
+   runner/launch errors unconditionally become `failed`. An ordinary nonzero
+   exit with no result becomes `failed` with `worker_exit_N`; with a result,
+   validation takes precedence. A fully valid result preserves its submitted
+   status and records `worker_exit_N_after_submission` as a warning.
 5. Workers may submit only `needs_review`, `needs_decision`, `blocked`, or
    `failed`. `needs_review` requires a non-empty regular report file. Result
    status, note, timestamp, lease, and exact changed-path list must have the
@@ -314,7 +318,12 @@ Each worker runs in a separate process group. Relay captures combined output,
 enforces `worker_timeout_minutes`, and terminates process groups on timeout or
 `SIGINT`, `SIGTERM`, or `SIGHUP` interruption. It signals every active group
 before one shared grace interval. Interrupted tasks become `failed` instead of
-remaining stale.
+remaining stale. Timeout, interruption, and runner/launch errors override any
+submitted result. For an ordinary nonzero exit, Relay first applies every normal
+result check, including report, scope, and changed-path validation. Invalid
+submissions retain their normal failure, while a fully valid submission retains
+its worker status with a structured `worker_exit_N_after_submission` warning in
+task state, status output, history, and the review brief.
 
 Before launch, Relay compiles a deterministic Critical Context Capsule from the
 task id, title, scope, and the existing `Objective`, `Acceptance criteria`, `Not

@@ -97,6 +97,8 @@ if marker:
     (target / "after-finish.txt").write_text("late but in scope\n")
 if os.environ.get("SLEEP_AFTER_FINISH"):
     time.sleep(float(os.environ["SLEEP_AFTER_FINISH"]))
+if os.environ.get("EXIT_CODE"):
+    raise SystemExit(int(os.environ["EXIT_CODE"]))
 '''
 
 NO_CHANGE_WORKER = r'''
@@ -1142,6 +1144,82 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "invalid_worker_output")
         self.assertIsInstance(state["last_note"], str)
+
+    def test_valid_submission_survives_nonzero_exit_with_review_warning(self):
+        project = self.make_project()
+        worker = self.write_worker(GOOD_WORKER)
+        self.configure(project, worker)
+        task_id = self.create_task(project, "submitted before exit", ["src/**"])
+        self.relay(project, "run", task_id, env={"EXIT_CODE": "1"}, check=True)
+
+        state = self.state(project, task_id)
+        warning = "worker_exit_1_after_submission"
+        self.assertEqual(state["status"], "needs_review")
+        self.assertEqual(state["warning"], warning)
+        worker_exit = state["history"][-1]
+        self.assertEqual(worker_exit["event"], "worker_exited")
+        self.assertEqual(worker_exit["exit_code"], 1)
+        self.assertEqual(worker_exit["warning"], warning)
+
+        status = self.relay(project, "status", check=True)
+        self.assertIn(f"WARNING: {warning}", status.stdout)
+        brief, token = self.review_brief_token(project, task_id)
+        self.assertIn("WARNING: Worker exited with code 1 after submission", brief.stdout)
+        self.assertIn(
+            f".attention-relay/work/{task_id}/attempt-1.log", brief.stdout,
+        )
+        self.relay(
+            project, "task", "accept", task_id, "--brief", token, check=True,
+        )
+        self.assertEqual(self.state(project, task_id)["status"], "done")
+
+    def test_nonzero_exit_without_result_keeps_worker_exit_failure(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker("raise SystemExit(1)\n"))
+        task_id = self.create_task(project, "exit without result", ["src/**"])
+        self.relay(project, "run", task_id, check=True)
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "worker_exit_1")
+        self.assertNotIn("warning", state)
+
+    def test_nonzero_exit_with_malformed_result_is_invalid_output(self):
+        project = self.make_project()
+        worker = self.write_worker(MALFORMED_OUTPUT_WORKER + "\nraise SystemExit(1)\n")
+        self.configure(project, worker)
+        task_id = self.create_task(project, "malformed before exit", ["src/**"])
+        self.relay(project, "run", task_id, check=True)
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "invalid_worker_output")
+        self.assertNotIn("warning", state)
+
+    def test_timeout_overrides_valid_submission(self):
+        project = self.make_project()
+        worker = self.write_worker(GOOD_WORKER)
+        self.configure(project, worker, max_parallel=1, timeout_minutes=0.02)
+        task_id = self.create_task(project, "submitted before timeout", ["src/**"])
+        self.relay(
+            project, "run", task_id, env={"SLEEP_AFTER_FINISH": "10"}, check=True,
+        )
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "worker_timeout")
+        self.assertNotIn("warning", state)
+
+    def test_nonzero_exit_does_not_override_changed_paths_mismatch(self):
+        project = self.make_project()
+        worker = self.write_worker(GOOD_WORKER.replace(
+            "for path in changed:\n",
+            "changed.append('src/not-observed.txt')\nfor path in changed:\n",
+        ))
+        self.configure(project, worker)
+        task_id = self.create_task(project, "mismatch before exit", ["src/**"])
+        self.relay(project, "run", task_id, env={"EXIT_CODE": "1"}, check=True)
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "changed_paths_mismatch")
+        self.assertNotIn("warning", state)
 
     def test_non_utf8_result_fails_without_stale_runner(self):
         project = self.make_project()

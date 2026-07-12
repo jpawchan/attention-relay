@@ -1139,7 +1139,8 @@ def orchestrator_review_brief(relay_dir, task_id):
                 result = read_json(result_file)
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 result = {}
-        observed = latest_worker_exit(task).get("observed_paths")
+        worker_exit = latest_worker_exit(task)
+        observed = worker_exit.get("observed_paths")
         token = secrets.token_hex(32)
         atomic_json(review_token_path(relay_dir, task["id"]), {
             "task_id": task["id"], "attempt": attempt, "token": token,
@@ -1148,6 +1149,11 @@ def orchestrator_review_brief(relay_dir, task_id):
     report = report_path(relay_dir, task["id"], attempt)
     diff = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.diff" % attempt)
     say(capsule)
+    if task.get("warning"):
+        log = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.log" % attempt)
+        say("\nWARNING: Worker exited with code {} after submission; inspect log: {}".format(
+            worker_exit.get("exit_code"), os.path.relpath(log, root),
+        ))
     say("\nReview artifacts:")
     say("- Report: " + os.path.relpath(report, root))
     say("- Diff: " + os.path.relpath(diff, root))
@@ -1737,7 +1743,8 @@ def finalize_task(
     attempt = task.get("attempt", 1)
     submitted = None
     path = result_path(relay_dir, task["id"], attempt)
-    if os.path.exists(path):
+    result_exists = os.path.exists(path)
+    if result_exists:
         try:
             submitted = read_json(path)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -1753,6 +1760,7 @@ def finalize_task(
             return False
         current.pop("runner", None)
         note = ""
+        warning = ""
         declared_paths = (
             worker_changed_paths(submitted.get("changed_paths"))
             if isinstance(submitted, dict) else None
@@ -1763,7 +1771,7 @@ def finalize_task(
             status, note = "failed", "worker_timeout"
         elif outcome.get("error"):
             status, note = "failed", "worker_error: " + outcome["error"]
-        elif outcome.get("returncode") != 0:
+        elif outcome.get("returncode") != 0 and not result_exists:
             status, note = "failed", "worker_exit_{}".format(outcome.get("returncode"))
         elif (
                 not isinstance(submitted, dict)
@@ -1785,22 +1793,37 @@ def finalize_task(
         else:
             status = submitted["status"]
             note = submitted.get("note", "")
+            if outcome.get("returncode") != 0:
+                warning = "worker_exit_{}_after_submission".format(
+                    outcome.get("returncode"),
+                )
         current["status"] = status
         if note:
             current["last_note"] = note
         else:
             current.pop("last_note", None)
+        if warning:
+            current["warning"] = warning
+        else:
+            current.pop("warning", None)
         if violations:
             current["scope_violations"] = list(violations)
             current["scope_baseline"] = baseline_tree
         else:
             current.pop("scope_violations", None)
             current.pop("scope_baseline", None)
-        record(
-            current, "worker_exited", status=status,
-            exit_code=outcome.get("returncode"), note=note,
-            declared_paths=declared_paths, observed_paths=list(observed_paths),
-        )
+        if warning:
+            record(
+                current, "worker_exited", status=status,
+                exit_code=outcome.get("returncode"), note=note, warning=warning,
+                declared_paths=declared_paths, observed_paths=list(observed_paths),
+            )
+        else:
+            record(
+                current, "worker_exited", status=status,
+                exit_code=outcome.get("returncode"), note=note,
+                declared_paths=declared_paths, observed_paths=list(observed_paths),
+            )
         save_task(relay_dir, current)
     say("[{}] {}{}".format(
         task["id"], status, " ({})".format(note) if note else "",
@@ -2015,7 +2038,10 @@ def cmd_status(args):
             say("  running: {} pid={} {}".format(task["id"], pid, state))
         elif task["status"] in WORKER_FINAL:
             note = " - " + task["last_note"] if task.get("last_note") else ""
-            say("  attention: {} ({}){}".format(task["id"], task["status"], note))
+            warning = " - WARNING: " + task["warning"] if task.get("warning") else ""
+            say("  attention: {} ({}){}{}".format(
+                task["id"], task["status"], note, warning,
+            ))
     say_next_actions(relay_dir)
 
 

@@ -177,7 +177,7 @@ Environment variables (all read/written in `framework/relay`): `RELAY_DIR` (runt
 - Run the suite with `RELAY_*` unset if inside a leased worker (see Run and verify).
 - v1 invariants still apply: stdlib only; no Windows (`fcntl`, process groups); init target must be `git rev-parse --show-toplevel`; no submodules/Gitlinks; keep temp-index snapshots (not `git diff HEAD`); scopes case-fold; workers share one tree (no isolation); `accept` records review, `return` never reverts; don't hand-edit task JSON; archive preflight+rollback and signal masking stay; task numbers never reuse across archive.
 - `worker_timeout_minutes` default is 60: long-thinking workers on hard tasks can hit it; prefer smaller tasks over raising it globally.
-- External provider failures (e.g. HTTP 429 quota) surface as `failed` with `worker_exit_1` even when the worker already submitted a valid result; the fix is `task return` with resubmit instructions (no-change attempt), not code changes.
+- An external provider failure (for example, HTTP 429 quota) after a fully valid submission preserves the submitted status and records a `worker_exit_N_after_submission` warning. Before accepting, reviewers must inspect the prominent review-brief warning and linked attempt log; failures before submission still surface as `failed` with `worker_exit_N` and require a return/retry.
 
 ## Guide self-test routes
 
