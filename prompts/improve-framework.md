@@ -58,9 +58,11 @@ Check these behaviors with temporary Git repositories and stub workers:
     stderr when Baton state is missing or broken.
 18. Claude Code settings merges are idempotent and do not clobber existing
     settings or hook arrays.
-19. An ordinary start brief asks the user to choose orchestrator memory/session
-    handling and hard/medium/easy model/reasoning preferences. A post-compaction
-    hook suppresses only the one-time difficulty question.
+19. A start brief asks the exact persistent plain-text hard/medium/easy onboarding
+    question only while any conventional route is missing, invalid, or not
+    executable. Valid project-local routes produce only a safe settings reminder,
+    including after compaction; no startup question asks about harness memory or
+    fresh sessions.
 20. A close brief counts recorded worker launches across active and archived
     tasks, including retries, and reports a natural total with conventional and
     other-level breakdowns without exposing commands.

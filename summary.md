@@ -49,7 +49,10 @@ echo seed > "$tmp/seed.txt" && git -C "$tmp" add -A && git -C "$tmp" commit -qm 
 rm -rf "$tmp"
 ```
 
-Expected: init ends with `next: have your agent read .baton/orchestrator.md and run .baton/baton orchestrator brief --phase start`; the start brief prints the orchestrator role, a `Harness memory:` section, a `Difficulty levels:` section (fresh installs have no level tiers), and `Next actions:`; validate prints `ok: 0 active task(s)`.
+Expected: init directs the coding agent to the orchestrator manual; the start
+brief prints the orchestrator role, a `Worker routing:` section whose fresh
+install requires onboarding, and current task state; validate prints
+`ok: 0 active task(s)` even though no worker route is predefined.
 Do not smoke-test a real worker unless the configured worker CLI and its credentials work locally.
 
 ## Stack
@@ -67,7 +70,8 @@ Do not smoke-test a real worker unless the configured worker CLI and its credent
 | CI | `.github/workflows/ci.yml`: push+PR, Ubuntu/macOS × Python 3.11/3.13, `checkout@v7`, `setup-python@v6`, 10-minute timeout. |
 | License | MIT (`LICENSE`). |
 
-Baton itself makes no HTTP requests. The configured worker command (default: Hermes with `--ignore-rules`) is the only connection to an agent CLI.
+Baton itself makes no HTTP requests. Explicit project-local tier commands are
+the only connections to agent CLIs.
 
 ## Repository map
 
@@ -76,7 +80,7 @@ Baton itself makes no HTTP requests. The configured worker command (default: Her
 | `framework/baton` | Entire production CLI: paths, config, capsule compiler, tasks, briefs/tokens, scopes, Git snapshots, runner, handoff, hooks, validation, archive, memory, parser. |
 | `framework/orchestrator.md` | Orchestrator manual: phase briefs, task creation, waves, token-gated review, handoff, failure handling, memory. |
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
-| `framework/config.example.toml` | Default worker command (memory-clean Hermes), tiers, limits, gates; copied to runtime `config.toml` on init. |
+| `framework/config.example.toml` | Unconfigured worker-routing template plus limits and gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
 | `tests/test_baton.py` | Canonical 125-test end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
@@ -102,7 +106,7 @@ Baton itself makes no HTTP requests. The configured worker command (default: Her
 | --- | --- |
 | Runtime discovery, safety | `find_baton_dir`, `runtime_paths_are_safe`, `require_baton_dir`; `BATON_DIRNAME = ".baton"`. |
 | Locks and atomic state | `file_lock`, `task_lock`, `atomic_write`, `atomic_json`, `lock_path`. |
-| Config | `load_config`, `cfg_get`, the `configured_*` readers (including `configured_tier` and the default-off phase-sequence gate), `validate_worker_template`, `command_template`, `worker_argv`; difficulty-level onboarding via `conventional_level_names` + `difficulty_levels_lines`. |
+| Config | `load_config`, `cfg_get`, the `configured_*` readers (including `configured_tier` and the default-off phase-sequence gate), `validate_worker_template`, `validate_worker_executable`, `command_template`, `worker_argv`; route onboarding via `conventional_level_names` + `worker_routing_lines`. |
 | Paths and review evidence | `report_path`, `result_path`, `diff_path`, `sha256_regular_file`, `build_review_evidence_manifest`, streaming `attempt_diff_summary`, `sanitize_log_text` + bounded `bounded_log_tail`, `brief_token_path` (finish-brief-token.json), `review_token_path` (review-brief-token.json), and phase receipts via `phase_receipts_path` + `read_phase_receipts` (attempt-N.briefs.json). |
 | Capsule | `CAPSULE_SECTIONS`, `task_spec_sections`, `memory_index_entries`, `context_capsule_components` + `compile_context_capsule` (deterministic, budgeted, placeholder- and memory-reference-validating), `stored_context_capsule_components` (launch-snapshot parsing), `report_section_problems` (report gate parser). |
 | Task lifecycle commands | `cmd_task_create`, `cmd_task_list/show`, `cmd_task_capsule` (read-only preview, `--raw`), `cmd_task_accept` (review-token + evidence gate), `cmd_task_return/decide/cancel` (invalidate review token), `cmd_task_finish` (finish-token + report-shape gates), `cmd_task_brief` (worker phases, receipts, report token), `cmd_task_unlock`. |
@@ -131,7 +135,7 @@ Runtime layout after `.baton/baton init <git-root>` (all Git-ignored):
 End-to-end flow with the v2 edge mechanisms marked:
 
 ```text
-orchestrator brief --phase start      <- beginning edge: role + handoff + both startup questions + next actions
+orchestrator brief --phase start      <- beginning edge: role + route validity/onboarding + handoff + task state
    | task create -> edit spec (Objective/Acceptance criteria/... are the capsule source)
    v
 run: pick_wave -> prepare_worker compiles capsule
@@ -153,7 +157,7 @@ orchestrator brief --phase close --goal TEXT [--note TEXT]... [--avoid TEXT]... 
 Statuses: `queued → running → needs_review → done`, or `needs_decision`/`blocked`/`failed → queued` (after decide/repair/return). Workers can submit only the four `WORKER_FINAL` statuses; only `task accept` records `done`.
 Scope enforcement, temp-index Git snapshots, leases, and archive semantics are inherited from v1 unchanged: every changed path outside the wave's scopes blocks the wave; declared `--changed` paths must equal the observed scoped diff case-insensitively.
 
-Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` prints or merges two matcher-free hooks into the project's `.claude/settings.json` — SessionStart runs `hook-event session-start` (start brief as stdout → session context, including explicit state re-injection after automatic or manual compaction, but without repeating the one-time difficulty-preference question) and UserPromptSubmit runs `hook-event user-prompt-submit` (JSON `additionalContext` with the Next-actions capsule). Both cap output at 9000 chars and emit nothing (exit 0) on any error.
+Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` prints or merges two matcher-free hooks into the project's `.claude/settings.json` — SessionStart runs `hook-event session-start` (start brief as stdout → session context, including explicit state re-injection after automatic or manual compaction with the same route-validity behavior) and UserPromptSubmit runs `hook-event user-prompt-submit` (JSON `additionalContext` with the Next-actions capsule). Both cap output at 9000 chars and emit nothing (exit 0) on any error.
 
 ## Configuration
 
@@ -161,8 +165,8 @@ Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` pri
 
 | Key | Purpose |
 | --- | --- |
-| `commands.worker` | Worker argv template with exactly one `{prompt}` or `{prompt_file}` argument; the default Hermes route uses `--ignore-rules`. Custom commands are memory-isolated only with the equivalent harness option. |
-| `tiers.<name>.command` | Optional per-tier command override; non-default task tiers must be configured and limits-only tiers inherit the default command. |
+| `commands.worker` | Optional shared worker argv template with exactly one `{prompt}` or `{prompt_file}` argument; absent in a fresh install. |
+| `tiers.<name>.command` | Optional per-tier command override; every task tier must be explicitly configured, and limits-only tiers require an explicit shared command. |
 | `tiers.<name>.worker_timeout_minutes` | Optional per-tier worker timeout override; unset inherits the global timeout. |
 | `tiers.<name>.capsule_max_chars` | Optional per-tier capsule budget override; unset inherits the global budget. |
 | `tiers.<name>.display` | Optional bounded safe `model`, `harness`, `effort`, `engineering_role`, and `fallback` declarations; missing metadata displays `unlabeled worker` and metadata never changes routing. |
@@ -176,19 +180,14 @@ Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` pri
 
 Environment variables (all read/written in `framework/baton`): `BATON_DIR` (runtime override in, worker export out), `BATON_TASK_ID`, `BATON_ATTEMPT`, `BATON_LEASE`, `BATON_ROOT` (worker exports; their presence marks a process as a leased worker and blocks orchestrator commands). There is no `.env`; worker credentials belong to the external agent CLI.
 
-Every ordinary start asks whether to keep or change the current model/reasoning
-preferences, even when all conventional tiers exist. Only after the explicit
-answer may the orchestrator update matching command/display settings and the
-profiles or wrappers that make them real; it then validates, runs `tiers`, and
-restates the effective preferences. Every task creation requires an explicit
-validated tier; even `default` must be named rather than silently selected.
-Documented defaults are hard = GPT 5.6
-Sol/high/elite senior, medium = GPT 5.6 Sol/medium/elite senior, and easy = Claude
-Code Opus 4.8/xhigh/senior with GPT 5.6 Terra/high only when Claude usage is
-exhausted. Until all three matching tables exist, the start brief prints
-missing-only routing skeletons and `.baton/baton tiers` appends a missing-level
-hint. Configuration and tier selection remain explicit user and orchestrator
-actions.
+A fresh start asks the exact persistent plain-text model/reasoning question once
+because no conventional routes are predefined. The derive path discovers actual
+local capabilities, asks permission before lowering, and uses current reasoning
+for all three when permission is omitted. Only explicit choice or that path may
+write project-local routing, and executable commands or wrappers must match
+display metadata. Once all three routes are valid, later starts and compaction
+recovery only state safe settings and remind the user they can change them.
+Every task creation requires an explicit configured tier; `default` is rejected.
 
 ## Landmines
 
@@ -200,10 +199,10 @@ actions.
 - The `orchestrator-handoff` lock is a leaf: start holds it for handoff consumption; close validates flags, loads active/archive state, gathers candidates, and checks Git before locking, then holds it only for previous-handoff read, dedupe/render, and atomic write. Never acquire task/scheduler locks while holding it.
 - Handoff `done` entries dedupe by task id against the previous handoff (same-second boundary). Don't simplify to a pure timestamp comparison; whole-second `now()` makes `>` and `>=` both wrong alone.
 - Every close brief requires a fresh explicit nonblank `--goal`; never restore goal inheritance. Goal and up to five repeatable `--avoid` values use `flatten_bounded_text(..., 200)`. Up to three trusted `--note` values use 160 characters, omit blanks/duplicates and the empty section, and must not contain secrets; durable facts belong in memory or this guide. Done outcomes come only from the matched accepted-event note and use 120 characters. The writer drops outcome suffixes, then reduces done/decisions, then next/unresolved with accurate overflow markers to stay at most 4000 characters.
-- At request completion, pass every unique task id created for that request to repeatable `stats --task ID`; copy its single sentence into the final response. It counts retries and classifies default/custom/malformed tiers as `other levels`. If no task was created, state the explicit zero breakdown. Close still reports all runtime launches for continuity, but that fallback may span requests and must never be relabeled as request-scoped.
+- At request completion, pass every unique task id created for that request to repeatable `stats --task ID`; copy its single sentence into the final response. It counts retries and classifies legacy default/custom/malformed tier state as `other levels`. If no task was created, state the explicit zero breakdown. Close still reports all runtime launches for continuity, but that fallback may span requests and must never be relabeled as request-scoped.
 - `cap_hook_output` returning `""` (and adapters emitting nothing, exit 0) is deliberate fail-open, spec'd behavior — don't "fix" silence into errors, and keep every emission ≤ 9000 chars including edge lines.
 - `hooks claude-code --write` must merge idempotently (detected by exact command string) and never drop existing entries; refusal on invalid JSON is intentional (no partial writes).
-- `--ignore-rules` in the default Hermes worker command is deliberate memory hygiene (keeps model config). Do not swap in `--safe-mode` (drops user config, loses the model) or `hermes memory reset` (destructive).
+
 - `claude --bare` conflicts with the hook integration (it disables hooks); the start brief and README state this — keep the warning when editing either.
 - Worker-facing command examples must use `python3 .baton/baton ...` or `.baton/baton ...`; bare `baton` is not on PATH in installed projects.
 - Runtime discovery is `BATON_DIR` env first, else a walk up from the CURRENT directory — never the invoked binary's location. Invoking another project's `baton` from inside this repo targets this repo's runtime; `cd` into the intended project first (see the smoke).

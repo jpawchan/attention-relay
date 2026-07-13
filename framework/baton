@@ -321,7 +321,7 @@ def configured_tier_names(config):
         raise ValueError("tier name must be non-blank")
     if "default" in tiers:
         raise ValueError("tier name 'default' is reserved")
-    return ["default", *sorted(tiers)]
+    return sorted(tiers)
 
 
 def validated_display_metadata(value):
@@ -365,20 +365,38 @@ def worker_display_label(tier):
     return flatten_bounded_text(label, WORKER_LABEL_MAX_CHARS) or "unlabeled worker"
 
 
-def conventional_level_names(config):
-    configured = [
-        name for name in CONVENTIONAL_LEVELS
-        if cfg_get(config, "tiers." + name) is not None
-    ]
-    missing = [name for name in CONVENTIONAL_LEVELS if name not in configured]
+def validate_worker_executable(template, root):
+    """Validate a command template and verify its executable without running it."""
+    argv = validate_worker_template(template)
+    executable = argv[0]
+    if os.path.sep in executable:
+        candidate = executable if os.path.isabs(executable) else os.path.join(root, executable)
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            raise ValueError("worker executable not found: {}".format(executable))
+    elif not shutil.which(executable):
+        raise ValueError("worker executable not found: {}".format(executable))
+    return argv
+
+
+def conventional_level_names(config, root=None):
+    configured = []
+    missing = []
+    for name in CONVENTIONAL_LEVELS:
+        try:
+            tier = configured_tier(config, name)
+            if root is not None:
+                validate_worker_executable(tier["command"], root)
+        except ValueError:
+            missing.append(name)
+        else:
+            configured.append(name)
     return configured, missing
 
 
-def difficulty_levels_lines(config):
-    configured, missing = conventional_level_names(config)
+def worker_routing_lines(config, root):
+    configured, missing = conventional_level_names(config, root)
     lines = [
-        "Difficulty levels:",
-        '- Ask the user: "I’m the Baton orchestrator. Before I assign tasks, do you have model and reasoning-level preferences for hard, medium, and easy tasks? Reply as `hard = …, medium = …, easy = …`; for example, `hard = GPT 5.6 Sol with xhigh reasoning` and `medium = Claude Opus 4.8 with xhigh reasoning`. If all three are configured, say `use the current settings` to keep them unchanged. Say `use the defaults` to replace or fill them with Baton’s documented defaults."',
+        "Worker routing:",
         "- Current safe settings: " + "; ".join(
             "{}: {}".format(
                 name,
@@ -387,33 +405,26 @@ def difficulty_levels_lines(config):
             )
             for name in CONVENTIONAL_LEVELS
         ) + ".",
-        "- After the user answers explicitly, update only the relevant `[tiers.hard]`, `[tiers.medium]`, and `[tiers.easy]` command/display settings; preserve or create the harness wrappers or profiles that make the requested model and reasoning real; validate the configuration, run `.baton/baton tiers`, and restate the effective hard, medium, and easy preferences before assigning tasks.",
     ]
     if missing:
-        lines.append(
-            "- Missing levels: {}. Copy only their skeletons below (strip `# `); per-level worker_timeout_minutes/capsule_max_chars are optional:".format(
-                ", ".join(missing),
-            )
-        )
-    for name in missing:
-        command = {
-            "hard": "hermes chat -Q -t terminal,file --source tool --ignore-rules -m GPT-5.6-Sol -q {prompt}",
-            "medium": "hermes-medium-worker {prompt_file}",
-            "easy": "baton-easy-worker {prompt_file}",
-        }[name]
         lines.extend((
-            "# [tiers.{}]".format(name),
-            "# command = {}".format(json.dumps(command)),
+            '- Ask the user: "Which model and reasoning level should Baton use for hard, medium, and easy tasks? You can specify each one or ask me to derive the settings from the current orchestrator."',
+            "- Ask this as a persistent plain-text question that remains visible until answered. Never use a transient form; expiration or dismissal is not an answer and must not be treated as selecting any option.",
+            "- Routes needing onboarding: {}. Follow the onboarding protocol in orchestrator.md; do not invent or merely relabel a route.".format(
+                ", ".join(missing),
+            ),
         ))
-    lines.extend((
-        "- Hermes exposes no per-invocation reasoning override, so use a matching profile or wrapper; Baton never changes configuration or selects a level automatically, and task creation still requires an explicit validated --tier.",
-    ))
+    else:
+        lines.append(
+            "- All conventional routes are valid and project-local. Continue with these settings without asking again; tell the user they can change these settings at any time."
+        )
     return lines
 
 
 def unknown_tier_error(config, name):
+    known = configured_tier_names(config)
     return "unknown tier {!r}; known tiers: {}".format(
-        name, ", ".join(configured_tier_names(config)),
+        name, ", ".join(known) or "(none)",
     )
 
 
@@ -441,18 +452,13 @@ def configured_tier(config, name):
     tiers = config.get("tiers", {})
     if not isinstance(tiers, dict):
         raise ValueError("tiers must be a table")
-    if name == "default":
-        if name in tiers:
-            raise ValueError("tier name 'default' is reserved")
-        section = {}
-    else:
-        if name not in tiers:
-            raise ValueError(unknown_tier_error(config, name))
-        section = tiers[name]
-        if not isinstance(section, dict):
-            raise ValueError("[tiers.{}] must be a table".format(name))
+    if name not in tiers or name == "default":
+        raise ValueError(unknown_tier_error(config, name))
+    section = tiers[name]
+    if not isinstance(section, dict):
+        raise ValueError("[tiers.{}] must be a table".format(name))
 
-    command_source = "tier" if "command" in section else "default"
+    command_source = "tier" if "command" in section else "global"
     template = section.get("command", cfg_get(config, "commands.worker", ""))
     validate_worker_template(template)
     timeout = configured_worker_timeout_minutes(section.get(
@@ -514,19 +520,12 @@ def displayed_task(config, task, tier_cache=None):
 
 
 def worker_argv(config, task, prompt, prompt_file, root):
-    argv = validate_worker_template(command_template(config, task))
+    argv = validate_worker_executable(command_template(config, task), root)
     index, placeholder = next(
         (index, token) for index, token in enumerate(argv)
         if token in ("{prompt}", "{prompt_file}")
     )
     argv[index] = prompt if placeholder == "{prompt}" else prompt_file
-    executable = argv[0]
-    if os.path.sep in executable:
-        candidate = executable if os.path.isabs(executable) else os.path.join(root, executable)
-        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
-            raise ValueError("worker executable not found: {}".format(executable))
-    elif not shutil.which(executable):
-        raise ValueError("worker executable not found: {}".format(executable))
     return argv
 
 
@@ -2197,29 +2196,17 @@ def render_handoff(
     return content
 
 
-def orchestrator_start_brief(
-        baton_dir, tasks, consume_handoff=True, include_levels_ask=True):
+def orchestrator_start_brief(baton_dir, tasks, consume_handoff=True):
     say("Orchestrator role:")
     say("- Translate the user goal into small, observable tasks.")
     say("- Run only non-conflicting work and resolve worker decisions.")
     say("- Review reports and diffs before accepting any task.")
-    say("\nHarness memory:")
-    say('- Ask the user: "Before we plan, would you like me to (1) use your existing harness memory and project rules, or (2) start the Baton orchestrator in a fresh harness session? A fresh session is usually better for a new goal: old conversation history, stale assumptions, unrelated instructions, and accumulated tool output are less likely to compete with the current goal and Baton protocol. The tradeoff is that unpersisted context disappears, so first save relevant facts in project memory or a Baton handoff."')
-    say("- To start fresh while continuing Baton work, run a close brief first, open a new conversation or session (Hermes `/new`, for example), then provide `prompts/use-framework.md` or ask the agent to read `.baton/orchestrator.md` and run `.baton/baton orchestrator brief --phase start`.")
-    say("- Baton launches each worker in a fresh task process and context. The included Hermes worker command also uses --ignore-rules so harness memory and project rules are not injected.")
-    say("- A custom worker command has that memory isolation only if it keeps the equivalent isolation option for its harness.")
-    say('- Claude Code: disable auto-memory via settings "autoMemoryEnabled": false, env CLAUDE_CODE_DISABLE_AUTO_MEMORY=1, or the /memory toggle.')
-    say('- Skip loaded CLAUDE.md files with "claudeMdExcludes" globs; managed-policy CLAUDE.md cannot be excluded.')
-    say("- claude --bare = strongest clean start but ALSO disables hooks (conflicts with hook-based injection).")
-    say("- Hermes: add --ignore-rules to the command (keeps model config).")
-    say("- Do not use --safe-mode: it drops user config, including the configured model.")
-    say("- `hermes memory reset` is destructive.")
-    if include_levels_ask:
-        level_lines = difficulty_levels_lines(load_config(baton_dir))
-        if level_lines:
-            say("\n" + level_lines[0])
-            for line in level_lines[1:]:
-                say(line)
+    routing_lines = worker_routing_lines(
+        load_config(baton_dir), project_root(baton_dir),
+    )
+    say("\n" + routing_lines[0])
+    for line in routing_lines[1:]:
+        say(line)
     if consume_handoff:
         with file_lock(lock_path(baton_dir, "orchestrator-handoff")):
             handoff = read_handoff(baton_dir)
@@ -2592,7 +2579,10 @@ def orchestrator_close_brief(
         atomic_write(orchestrator_handoff_path(baton_dir), content)
     say(content.rstrip())
     say(worker_usage_sentence(tasks + archived_tasks))
-    say("Start a fresh session, then run: .baton/baton orchestrator brief --phase start")
+    say(
+        "Start a fresh coding-agent session and tell it to read "
+        ".baton/orchestrator.md."
+    )
 
 
 def cmd_orchestrator_brief(args):
@@ -2789,7 +2779,6 @@ def cmd_hook_event(args):
             if args.name == "session-start":
                 orchestrator_start_brief(
                     baton_dir, tasks, consume_handoff=False,
-                    include_levels_ask=hook_input.get("source") != "compact",
                 )
             else:
                 context = "Baton state:\n" + render_next_actions(baton_dir)
@@ -2988,7 +2977,7 @@ Other workers may be active. Run only the targeted checks in the task spec.
 
 def build_prompt(
         baton_dir, task, memory_entries, capsule_max_chars=4000, capsule=None,
-        difficulty="default", worker_label="unlabeled worker"):
+        difficulty="unconfigured", worker_label="unlabeled worker"):
     root = project_root(baton_dir)
     relative_baton = os.path.relpath(baton_dir, root)
     attempt = task.get("attempt", 1)
@@ -3526,7 +3515,9 @@ def cmd_tiers(args):
         blocks = []
         for name in names:
             tier = configured_tier(config, name)
-            executable = validate_worker_template(tier["command"])[0]
+            executable = validate_worker_executable(
+                tier["command"], project_root(baton_dir),
+            )[0]
             blocks.append("\n".join((
                 "Tier: " + name,
                 "Routing: difficulty={} | worker={}".format(
@@ -3541,8 +3532,10 @@ def cmd_tiers(args):
             )))
     except ValueError as error:
         die(str(error))
-    say("\n\n".join(blocks))
-    _configured, missing = conventional_level_names(config)
+    say("\n\n".join(blocks) if blocks else "No worker tiers configured.")
+    _configured, missing = conventional_level_names(
+        config, project_root(baton_dir),
+    )
     if missing:
         say("Conventional levels missing: " + ", ".join(missing))
 
@@ -3891,10 +3884,6 @@ def cmd_validate(args):
                 validator(config)
             except ValueError as error:
                 problems.append("config: {}".format(error))
-        try:
-            configured_tier(config, "default")
-        except ValueError as error:
-            problems.append("config: default tier: {}".format(error))
         tiers = config.get("tiers", {})
         if not isinstance(tiers, dict):
             problems.append("config: tiers must be a table")
@@ -3925,7 +3914,8 @@ def cmd_validate(args):
                         problems.append(prefix + str(error))
                 if len(problems) == before:
                     try:
-                        configured_tier(config, name)
+                        tier = configured_tier(config, name)
+                        validate_worker_executable(tier["command"], root)
                     except ValueError as error:
                         problems.append(prefix + str(error))
     try:
@@ -4213,7 +4203,7 @@ def cmd_init(args):
         atomic_write(gitignore, updated)
         say("added .baton/ to .gitignore")
     say("initialized {}".format(baton_dir))
-    say("next: have your agent read .baton/orchestrator.md and run .baton/baton orchestrator brief --phase start")
+    say("next: have your coding agent read .baton/orchestrator.md")
 
 
 def build_parser():

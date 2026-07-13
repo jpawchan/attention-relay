@@ -32,15 +32,13 @@ framework/baton init /path/to/project
 Requirements: Git, Python 3.11+, macOS or Linux, and a worktree without tracked
 submodules.
 
-Then tell the main coding agent to read `.baton/orchestrator.md` and
-run the start brief. Startup asks the user whether to keep existing harness
-memory/rules or move the orchestrator to a fresh session, and whether to keep or
-change the current hard/medium/easy model and reasoning settings. Apply neither
-choice automatically. Configure explicit `hard` (GPT 5.6 Sol/high),
-`medium` (GPT 5.6 Sol/medium), and `easy` (Claude Code Opus 4.8/xhigh, with GPT
-5.6 Terra/high only after Claude usage is exhausted) routes before assigning
-those difficulties; Baton does not install, select, or infer them. A copy-ready
-instruction is in `prompts/use-framework.md`.
+Then tell the main coding agent to read `.baton/orchestrator.md`; it runs the
+start brief internally and silently. A fresh project asks once for explicit
+project-local hard, medium, and easy model/reasoning routes. Valid later sessions
+recover those routes without asking again and state that settings can change at
+any time. Missing or invalid routing uses the manual's persistent plain-text
+question, capability discovery, consent-before-lowering, and no-consent fallback.
+A copy-ready instruction is in `prompts/use-framework.md`.
 
 Hermes Agent, Claude Code, Codex, OpenCode, and other noninteractive CLI agents
 can be workers when their locally verified command accepts one prompt or prompt
@@ -59,9 +57,12 @@ To generate the same framework instead of copying it, use
 - Changes to Git-visible files outside a wave’s scopes block approval; workers
   never modify Git-ignored files.
 - Memory contains durable project facts, not task history.
-- The default worker command is harness-memory-clean via `--ignore-rules`.
-- Every ordinary orchestrator startup offers both user choices; compaction
-  reinjection suppresses only the one-time difficulty question.
+- Fresh config contains no worker command or tier; every task tier is explicit,
+  configured, and project-local. There is no `default` route.
+- Executable commands or wrappers must implement displayed model/reasoning
+  settings; metadata alone is never routing.
+- Startup and compaction use the same route-validity rule and never ask a
+  harness-memory or fresh-session question.
 - Request completion uses `stats --task ID` for every task created for that
   request; the final response copies its hard/medium/easy worker breakdown.
 - Close briefs retain a separately labeled runtime-wide count for continuity,

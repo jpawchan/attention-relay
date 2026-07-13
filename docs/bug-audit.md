@@ -89,8 +89,8 @@ submit that exact path.
 
 Exact reproduction input:
 
-1. Initialize a fresh project and create a valid `default`-tier task scoped to
-   `src/**`.
+1. Initialize a fresh project, explicitly configure a test tier, and create a
+   valid task in that tier scoped to `src/**`.
 2. Lease attempt 1 and obtain a report-phase finish token.
 3. Run `task finish ... --status failed --brief TOKEN --changed 'src/[id].txt'`.
 4. The bounded generated-input comparison also called

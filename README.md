@@ -49,7 +49,7 @@ See [Long-context research synthesis](docs/research-synthesis.md) and [Context p
 
 ### Generate Baton from a prompt
 
-Give [`prompts/create-framework.md`](prompts/create-framework.md) to a coding agent, then give [`prompts/improve-framework.md`](prompts/improve-framework.md) to a fresh agent to test and repair the result. The generated framework requires Python 3.11+, Git, and macOS or Linux.
+The generated framework requires Python 3.11+, Git, and macOS or Linux.
 
 ### Run the ready version
 
@@ -61,7 +61,7 @@ Use any agent with file and command access as the orchestrator, and any agent th
 
 ### Framework token usage
 
-Baton currently adds about 4,888 tokens before the first task. The estimate covers its activation prompt, orchestrator manual, and configured start brief.
+Baton currently adds about 4,658 tokens before the first task. The estimate covers its activation prompt, orchestrator manual, and configured start brief.
 
 ## Install
 

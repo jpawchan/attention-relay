@@ -51,7 +51,9 @@ Initialization adds `.baton/` to the project’s `.gitignore` once. It does
 not replace existing files unless `--force` is used. `--force` refreshes the
 CLI and manuals but preserves `config.toml`, `memory.md`, tasks, and work.
 Initialization and normal commands reject symlinks anywhere in managed runtime
-files or directories.
+files or directories. Successful initialization tells the user only to have the
+coding agent read `.baton/orchestrator.md`; it does not expose or ask the user to
+run the internal start command.
 
 The runtime is local and disposable, but deleting it also deletes task state,
 reports, and memory.
@@ -219,55 +221,54 @@ task creation, run, review/accept, and session close. Close is invoked as
 `.baton/baton orchestrator brief --phase close --goal TEXT [--note TEXT]...
 [--avoid TEXT]...`.
 
-- `start` prints a short role summary and a copy-ready `Harness memory` question
-  in a notice of at most 12 lines. It asks the user to choose either the existing
-  harness memory/project rules or a fresh orchestrator session. It recommends a
-  fresh session for a new goal because old conversation history, stale
-  assumptions, unrelated instructions, and accumulated tool output are then less
-  likely to compete with the goal and Baton protocol. It also states the cost:
-  unpersisted context disappears, so relevant facts first belong in project
-  memory or a Baton handoff. Fresh-start instructions say to close continuing
-  Baton work first, open a new harness conversation/session (optionally naming
-  Hermes `/new`), and provide `prompts/use-framework.md` or ask the new agent to
-  read `.baton/orchestrator.md` and run the start brief.
+- After reading `orchestrator.md`, the coding agent runs `start` internally and
+  silently. The user is never asked to install, start, validate, inspect state,
+  or run a Baton command. Start remains the single parser for current task state,
+  unresolved decisions/reviews, and the latest handoff.
 
-  The notice says every worker launch uses a fresh task process/context. It makes
-  the narrower memory-isolation boundary explicit: the included Hermes worker
-  command uses `--ignore-rules`, while custom commands have equivalent isolation
-  only when configured with the harness's corresponding option. It retains Claude
-  Code's `"autoMemoryEnabled": false`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`,
-  `/memory`, and `"claudeMdExcludes"` controls, including the managed-policy
-  exclusion limit and the warning that `claude --bare` disables hooks. It offers
-  Hermes `--ignore-rules`, warns that `--safe-mode` drops user config and
-  `hermes memory reset` is destructive, and never applies a harness change.
+- `start` prints a short role summary and exactly one `Worker routing:` section.
+  It validates the project-local Git-ignored configuration and verifies each
+  conventional route's executable without running it. Its current safe summary
+  uses only validated display metadata or `unlabeled worker`; it never prints
+  commands, paths, flags, provider internals, or credentials. When all of `hard`,
+  `medium`, and `easy` are valid, it does not ask a question: it says to continue
+  with the current settings and remind the user they can change them at any time.
 
-  Every ordinary start also prints exactly one `Difficulty levels:` section of at
-  most 12 lines, even when `[tiers.hard]`, `[tiers.medium]`, and `[tiers.easy]`
-  all exist. Its copy-ready question identifies the agent as the Baton
-  orchestrator and asks for model and reasoning-level preferences for all three
-  levels. It gives a compact reply shape with examples such as `hard = GPT 5.6
-  Sol with xhigh reasoning` and `medium = Claude Opus 4.8 with xhigh reasoning`,
-  and the choices `use the current settings` and `use the defaults`. The
-  documented defaults remain GPT 5.6 Sol/high for hard, GPT 5.6 Sol/medium for
-  medium, and Claude Code Opus 4.8/xhigh for easy with GPT 5.6 Terra/high only
-  when Claude usage is exhausted. A safe current
-  summary uses only validated display metadata or `unlabeled worker`; it never
-  prints commands, paths, flags, provider internals, or credentials.
+  If any conventional route is missing, incomplete, invalid, or not executable,
+  the manual's initial question is exactly: `Which model and reasoning level
+  should Baton use for hard, medium, and easy tasks? You can specify each one or
+  ask me to derive the settings from the current orchestrator.` Immediately
+  around it the manual says exactly: `Ask this as a persistent plain-text question
+  that remains visible until answered. Never use a transient form; expiration or
+  dismissal is not an answer and must not be treated as selecting any option.`
 
-  After an explicit answer, the protocol requires updating only relevant
-  conventional-tier command/display configuration, preserving or creating the
-  harness wrappers/profiles needed to make the model and reasoning settings real,
-  validating, running `.baton/baton tiers`, and restating all three effective
-  preferences before task assignment. Display-only relabeling is insufficient.
-  Missing tiers additionally receive commented, copy-ready TOML skeletons only
-  for those tiers; stripping each leading `# ` produces valid TOML. Hard uses the
-  included memory-isolated Hermes pattern, while medium and easy name local
-  wrapper/profile skeletons. Per-level limits remain optional, Hermes reasoning
-  follows its configured profile/wrapper, and task creation still needs an
-  explicit validated tier. Baton never prompts interactively, auto-selects a
-  preference, registers a level, chooses a fallback, or writes configuration
-  before the user's answer. Start also prints the current handoff when present,
-  task counts, unresolved
+  The initial question is asked only once. The orchestrator derives settings when
+  the user is unsure, asks Baton to choose, or continues without settings. It
+  discovers the current harness, model, and reasoning from reliable
+  harness-provided context, then uses read-only local config or CLI capability
+  checks as needed. It never infers from labels, naming conventions, display
+  metadata, or unsupported assumptions. If it cannot verify an executable route,
+  it explains what is unknown and requests explicit settings instead of inventing
+  one.
+
+  Derived routes use the orchestrator's current model: `hard` uses current
+  reasoning, `medium` uses the next lower available level, and `easy` uses the
+  lowest. With only two levels, medium and easy share the lower level. If current
+  reasoning is already minimum, all three use it. The orchestrator tells the user
+  the selected routes and that they can change them at any time.
+
+  Whenever lowering is possible, the orchestrator asks persistent plain-text
+  permission before lowering. Omission is not approval. If the user continues
+  without permission, all three routes use current reasoning; the orchestrator
+  says Baton avoided an unapproved downgrade and reminds the user settings can
+  change. Expiration or dismissal of a transient UI is never consent.
+
+  Configuration may be written only after an explicit choice or the defined
+  derive/fallback path. Executable commands, profiles, or wrappers must implement
+  the stated model, reasoning, and fallback; display metadata alone is
+  insufficient. Baton itself remains noninteractive and never invents, selects,
+  or writes routes. Start also prints the current handoff when present, task
+  counts, unresolved
   decision/review ids, and one recommended next command. Directly beneath the
   ids-only decision line it prints at most two available worker questions,
   flattened to one line, stripped of ANSI and C0/C1 controls, bounded to 160
@@ -366,9 +367,11 @@ task creation, run, review/accept, and session close. Close is invoked as
   goal, warning, notes, and avoid are never naively truncated or dropped. Close
   atomically writes `.baton/orchestrator-handoff.md`, prints it, and
   then prints one deterministic runtime-wide worker-usage sentence and reminds
-  the orchestrator to start a fresh session. The sentence counts every recorded
-  `launched` history event in active and archived tasks, so retries count as
-  separate worker processes. It states the total, hard/medium/easy counts with
+  the user to start a fresh coding-agent session and tell it to read
+  `.baton/orchestrator.md`. It does not expose or ask the user to run the internal
+  start command. The sentence counts every recorded `launched` history event in
+  active and archived tasks, so retries count as separate worker processes. It
+  states the total, hard/medium/easy counts with
   correct singular/plural grammar, and an other-level count when any default,
   custom, missing, or malformed tier value was used. Non-object history entries,
   entries whose event is not exactly `launched`, and non-list histories are
@@ -438,15 +441,16 @@ task, it states the explicit zero sentence instead of inventing an id. The
 runtime-wide close sentence is never substituted for this request boundary.
 
 `.baton/baton tiers` is orchestrator-only and read-only. It prints one deterministic
-block for `default` followed by each configured tier in sorted name order. Each
+block for each explicitly configured tier in sorted name order. Each
 block shows the difficulty and bounded safe worker label, then only the command
 executable (`argv[0]`, never its flags or remaining arguments), whether the
-command comes from `default` or the tier, the effective worker timeout in minutes,
+command comes from the global command or the tier, the effective worker timeout in minutes,
 and the effective capsule budget in characters. If any conventional `hard`,
-`medium`, and `easy` table is absent,
+`medium`, or `easy` route is missing or invalid,
 it appends exactly one line `Conventional levels missing: <comma-separated
 names>` in hard, medium, easy order. The line is omitted when all three are
-configured; every tier block is otherwise byte-unchanged.
+valid; every tier block is otherwise byte-unchanged. With no configured tiers it
+prints `No worker tiers configured.` before the missing-level line.
 
 ## Optional Claude Code integration
 
@@ -466,10 +470,10 @@ shape. Commands invoke the project-local adapter through
 The matcher-free `SessionStart` entry fires at startup and after automatic or
 manual compaction; post-compaction stdin carries `"source": "compact"`. Claude
 adds SessionStart stdout back to session context. `.baton/baton hook-event
-session-start` normally emits the same plain stdout as the start-phase
-orchestrator brief. For a compact source, it omits only the one-time `Difficulty
-levels:` preference section and prefixes the otherwise unchanged brief with the
-single line
+session-start` emits the same state and route-validity result as the start-phase
+orchestrator brief. Valid routes therefore remain silent apart from their safe
+reminder, while missing or invalid routes require onboarding. For a compact
+source it prefixes the brief with the single line
 `Baton: context was compacted; state re-injected below.` so the new
 context is explicitly re-grounded. PreCompact stdout does not reach Claude's
 summarizer or the resulting context, so this integration intentionally has no
@@ -623,23 +627,21 @@ validation. Preview creates or changes no file or task state.
 
 ```toml
 [commands]
-worker = "hermes chat -Q -t terminal,file --source tool --ignore-rules -q {prompt}"
+# worker = "agent-cli run {prompt_file}"
 
 [limits]
 max_parallel = 3
 capsule_max_chars = 4000
 worker_timeout_minutes = 60
 
-[tiers.premium]
-command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
-capsule_max_chars = 6000
-worker_timeout_minutes = 90
-
-[tiers.premium.display]
-model = "GPT 5.6 Sol"
-harness = "Hermes"
-effort = "high"
-engineering_role = "elite senior"
+# [tiers.category]
+# command = "agent-cli run {prompt_file}"
+# capsule_max_chars = 6000
+# worker_timeout_minutes = 90
+# [tiers.category.display]
+# model = "<selected model>"
+# harness = "<local CLI>"
+# effort = "<selected reasoning level>"
 
 [gates]
 phase_sequence_requires_briefs = false
@@ -648,10 +650,11 @@ report_requires_sections = true
 accept_requires_brief = true
 ```
 
-The default worker command is harness-memory-clean: `--ignore-rules` suppresses
-automatic rules, saved memory, and preloaded skills while preserving the user's
-configured model and reasoning. This guarantee does not extend to a custom
-worker command unless its harness's equivalent isolation option is configured.
+The installed file has no active worker command, tier, model, provider,
+reasoning, or fallback. Commented examples explain only generic syntax and do
+not prescribe named models or Baton routes. Worker commands are project-local;
+any desired harness-memory isolation must be implemented by that command or its
+wrapper rather than assumed by Baton.
 
 `max_parallel` and `capsule_max_chars` are positive integers. The capsule limit
 defaults to 4000 characters. The timeout is a finite non-negative number in
@@ -664,11 +667,11 @@ All gate values must be booleans. `phase_sequence_requires_briefs` defaults to
 `accept_requires_brief = false` lets `task accept` work without a review token.
 Each disabled token gate ignores its corresponding `--brief` argument.
 
-The `default` tier is always available when explicitly passed to task creation and
-uses `[commands].worker` plus the global limits. Each non-default task tier must have a matching `[tiers.<name>]`
-table; unknown and blank tier names are errors at creation, validation, preview,
-and launch rather than falling back to the default command. A literal
-`[tiers.default]` table is reserved and invalid.
+Every task tier must have a matching `[tiers.<name>]` table. Unknown and blank
+tier names are errors at creation, validation, preview, and launch rather than
+falling back to another command. `default` is not a task route, and
+`task create --tier default` fails. A literal `[tiers.default]` table is reserved
+and invalid.
 
 Each tier table may set `command`, `worker_timeout_minutes`, `capsule_max_chars`,
 and a `[tiers.<name>.display]` table. Display supports only `model`, `harness`,
@@ -677,8 +680,8 @@ text of at most 80 characters, contains no C0/C1 controls or command flags, and 
 credential-redacted before rendering. Unknown fields and malformed display
 tables are errors. The assembled label is single-line and at most 240 characters;
 missing metadata deterministically renders `unlabeled worker`. Unset routing keys inherit their global values, so a limits-only
-tier inherits `[commands].worker`. Tier commands obey the same one-placeholder
-rule as the default command. Tier limits obey the same type and range rules as
+tier inherits `[commands].worker` only when that command is explicitly configured.
+Tier commands obey the same one-placeholder rule. Tier limits obey the same type and range rules as
 their global counterparts. `validate` checks every configured tier, including
 unused tiers. `.baton/baton tiers` displays all effective settings without exposing
 command flags. Display metadata never changes routing: worker argv, timeout, and

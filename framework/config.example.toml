@@ -1,76 +1,31 @@
-# Baton worker configuration
+# Baton project-local worker configuration
+#
+# A fresh install intentionally has no worker routes. The orchestrator will ask
+# once for hard, medium, and easy settings, then write only this Git-ignored
+# project's .baton/config.toml after an explicit choice or the documented derive
+# path.
 
 [commands]
-# The placeholder must be one complete argument. Baton does not use a shell.
-# --ignore-rules skips auto-injection of AGENTS.md, SOUL.md, .cursorrules,
-# saved memory, and preloaded skills while keeping the user's configured
-# model/reasoning.
-# --safe-mode is NOT used because it also drops user config, losing the
-# configured model.
-worker = "hermes chat -Q -t terminal,file --source tool --ignore-rules -q {prompt}"
+# Optional shared command inherited by an explicitly configured tier. The
+# placeholder must be one complete argument. Baton parses argv without a shell.
+# worker = "agent-cli run {prompt_file}"
 
-# To inherit hermes memory/rules instead:
-# worker = "hermes chat -Q -t terminal,file --source tool -q {prompt}"
-
-# Other noninteractive agent CLIs work when they accept a prompt argument.
-# Verify their flags locally before use. A custom command is memory-isolated only
-# when its harness has an equivalent isolation option configured here.
-# worker = "codex exec {prompt}"
-# Memory-clean Claude Code worker:
-# worker = "claude -p --bare {prompt}"
-
-# Example conventional defaults for coding tasks. Ask the user whether to keep or
-# change current model/reasoning preferences before enabling or editing them.
-# Metadata is display-only and
-# must truthfully describe the command or wrapper in the same tier. Baton never
-# parses commands to infer these values. Uncomment and adapt executable/model
-# identifiers to those installed locally before assigning the tier.
-# [tiers.hard]
-# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m GPT-5.6-Sol -q {prompt}"
-# worker_timeout_minutes = 90
-# capsule_max_chars = 6000
-# [tiers.hard.display]
-# model = "GPT 5.6 Sol"
-# harness = "Hermes"
-# effort = "high"
-# engineering_role = "elite senior"
+# Every usable task category needs an explicit table. A tier can provide its own
+# command or inherit commands.worker. Commands and wrappers must actually select
+# the model and reasoning described by display metadata; metadata alone never
+# changes routing.
 #
-# [tiers.medium]
-# command = "hermes-medium-worker {prompt_file}" # wrapper/profile configured for medium effort
-# [tiers.medium.display]
-# model = "GPT 5.6 Sol"
-# harness = "Hermes"
-# effort = "medium"
-# engineering_role = "elite senior"
-#
-# [tiers.easy]
-# command = "baton-easy-worker {prompt_file}" # Claude first; Terra only on exhausted Claude usage
-# worker_timeout_minutes = 30
-# capsule_max_chars = 3000
-# [tiers.easy.display]
-# model = "Claude Code Opus 4.8"
-# harness = "Claude Code"
-# effort = "xhigh"
-# engineering_role = "senior"
-# fallback = "GPT 5.6 Terra/high when Claude usage is exhausted"
-#
-# The easy wrapper must implement that exact exhaustion-only fallback; metadata
-# cannot change routing. These names are not automatically registered tiers.
-
-# Optional commands for selected task tiers:
-# [tiers.cheap]
-# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
+# [tiers.category]
+# command = "agent-cli run {prompt_file}"
 # worker_timeout_minutes = 30
 # capsule_max_chars = 3000
 #
-# [tiers.premium]
-# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provider/model -q {prompt}"
-# worker_timeout_minutes = 90
-# capsule_max_chars = 6000
-#
-# A tier may override only limits and inherit [commands].worker:
-# [tiers.long_context]
-# capsule_max_chars = 8000
+# [tiers.category.display]
+# model = "<selected model>"
+# harness = "<local CLI>"
+# effort = "<selected reasoning level>"
+# engineering_role = "<optional role>"
+# fallback = "<optional executable fallback behavior>"
 
 [limits]
 max_parallel = 3

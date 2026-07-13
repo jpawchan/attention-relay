@@ -248,8 +248,8 @@ differentials, not universal tokenizer counts.
 
 A fresh committed temporary repository passed source `init`, then installed
 `orchestrator brief --phase start`, `status`, and `validate`. The installed
-executable mode was `0700`; `.gitignore` contained `.baton/` once; the brief
-contained Orchestrator role, Harness memory, Difficulty levels, task counts,
+executable mode was `0700`; `.gitignore` contained `.baton/` once. This historical
+audit exercised the startup sections present in that revision, task counts,
 decision/review state, and a real recommended command; status printed
 `tasks: none`; validation printed `ok: 0 active task(s)`.
 

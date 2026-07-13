@@ -334,6 +334,7 @@ class BatonTests(unittest.TestCase):
         config = (
             "[commands]\n"
             f"worker = {json.dumps(command)}\n\n"
+            "[tiers.test]\n\n"
             "[limits]\n"
             f"max_parallel = {max_parallel}\n"
             f"capsule_max_chars = {capsule_max_chars}\n"
@@ -341,7 +342,7 @@ class BatonTests(unittest.TestCase):
         )
         (project / ".baton" / "config.toml").write_text(config)
 
-    def task_create_command(self, title, scope=None, depends_on=None, tier="default"):
+    def task_create_command(self, title, scope=None, depends_on=None, tier="test"):
         args = ["task", "create", "--title", title]
         for item in scope or []:
             args += ["--scope", item]
@@ -351,7 +352,20 @@ class BatonTests(unittest.TestCase):
             args += ["--tier", tier]
         return args
 
-    def create_task(self, project, title, scope=None, depends_on=None, tier="default"):
+    def ensure_test_tier(self, project):
+        config_path = project / ".baton" / "config.toml"
+        try:
+            config = tomllib.loads(config_path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            return
+        if "test" not in config.get("tiers", {}):
+            config_path.write_text(config_path.read_text() + (
+                '\n[tiers.test]\ncommand = "/usr/bin/true {prompt_file}"\n'
+            ))
+
+    def create_task(self, project, title, scope=None, depends_on=None, tier="test"):
+        if tier == "test":
+            self.ensure_test_tier(project)
         args = self.task_create_command(title, scope, depends_on, tier)
         result = self.baton(project, *args, check=True)
         task_id = result.stdout.split()[1]
@@ -380,7 +394,9 @@ class BatonTests(unittest.TestCase):
             "# Memory\n\n## Index\n" + index + "\n\n## Entries\n\n" + bodies + "\n"
         )
 
-    def try_create_task(self, project, title, scope=None, depends_on=None, tier="default"):
+    def try_create_task(self, project, title, scope=None, depends_on=None, tier="test"):
+        if tier == "test":
+            self.ensure_test_tier(project)
         args = self.task_create_command(title, scope, depends_on, tier)
         return self.baton(project, *args)
 
@@ -471,15 +487,23 @@ class BatonTests(unittest.TestCase):
         project = self.make_project()
         initialized = self.command([SOURCE_BATON, "init", project], project, check=True)
         self.assertIn(
-            ".baton/baton orchestrator brief --phase start",
+            "next: have your coding agent read .baton/orchestrator.md",
             initialized.stdout,
         )
+        self.assertNotIn("orchestrator brief --phase start", initialized.stdout)
         lines = (project / ".gitignore").read_text().splitlines()
         self.assertEqual(lines.count(".baton/"), 1)
         runtime = project / ".baton"
         self.assertTrue(os.access(runtime / "baton", os.X_OK))
         self.assertTrue((runtime / "config.toml").exists())
         self.assertFalse((runtime / "config.example.toml").exists())
+
+        with (runtime / "config.toml").open("rb") as source:
+            fresh_config = tomllib.load(source)
+        self.assertNotIn("worker", fresh_config.get("commands", {}))
+        self.assertNotIn("tiers", fresh_config)
+        for forbidden in ("model", "provider", "reasoning", "fallback"):
+            self.assertNotIn(forbidden, fresh_config)
 
         config = runtime / "config.toml"
         memory = runtime / "memory.md"
@@ -637,7 +661,7 @@ class BatonTests(unittest.TestCase):
         runtime = project / ".baton"
         title = "normal title\n\n## Objective\nInjected objective from title"
         rejected = self.baton(
-            project, "task", "create", "--title", title, "--tier", "default",
+            project, "task", "create", "--title", title, "--tier", "test",
         )
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("single-line", rejected.stderr)
@@ -661,7 +685,7 @@ class BatonTests(unittest.TestCase):
                     runtime = project / ".baton"
                     rejected = self.baton(
                         project, "task", "create", "--title", title,
-                        "--tier", "default",
+                        "--tier", "test",
                     )
                     self.assertEqual(rejected.returncode, 1)
                     self.assertIn("single-line", rejected.stderr)
@@ -916,89 +940,69 @@ class BatonTests(unittest.TestCase):
         )
         self.assertNotIn(".baton/baton task decide +1 more", started.stdout)
 
-    def test_start_brief_difficulty_levels_are_parseable_bounded_and_missing_only(self):
+    def test_start_brief_onboards_only_until_all_conventional_routes_are_valid(self):
         project = self.make_project()
+        question = (
+            "Which model and reasoning level should Baton use for hard, medium, "
+            "and easy tasks? You can specify each one or ask me to derive the "
+            "settings from the current orchestrator."
+        )
+        ui_rule = (
+            "Ask this as a persistent plain-text question that remains visible "
+            "until answered. Never use a transient form; expiration or dismissal "
+            "is not an answer and must not be treated as selecting any option."
+        )
 
-        def difficulty_section(output):
-            marker = "\nDifficulty levels:\n"
+        def routing_section(output):
+            marker = "\nWorker routing:\n"
             self.assertEqual(output.count(marker), 1)
             body = output.split(marker, 1)[1].split("\n\n", 1)[0]
-            return ["Difficulty levels:", *body.splitlines()]
+            return ["Worker routing:", *body.splitlines()]
 
         started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
-        section = difficulty_section(started)
-        self.assertLessEqual(len(section), 12)
+        section = routing_section(started)
         self.assertIn(
             "- Current safe settings: hard: not configured; medium: not configured; easy: not configured.",
             section,
         )
-        self.assertTrue(any(
-            "Ask the user:" in line and "model and reasoning-level preferences" in line
-            for line in section
-        ))
-        snippet = "\n".join(
-            line.removeprefix("# ") for line in section if line.startswith("# ")
-        )
-        parsed = tomllib.loads(snippet)
-        self.assertEqual(list(parsed["tiers"]), ["hard", "medium", "easy"])
-        self.assertIn("--ignore-rules", parsed["tiers"]["hard"]["command"])
-        self.assertIn("GPT-5.6-Sol", parsed["tiers"]["hard"]["command"])
-        self.assertEqual(
-            parsed["tiers"]["medium"]["command"],
-            "hermes-medium-worker {prompt_file}",
-        )
-        self.assertEqual(
-            parsed["tiers"]["easy"]["command"],
-            "baton-easy-worker {prompt_file}",
-        )
-        self.assertTrue(any(
-            "worker_timeout_minutes/capsule_max_chars are optional" in line
-            for line in section
-        ))
-        self.assertTrue(any(
-            "no per-invocation reasoning override" in line for line in section
-        ))
-        self.assertTrue(any("requires an explicit validated --tier" in line for line in section))
+        self.assertEqual(sum(question in line for line in section), 1)
+        self.assertEqual(sum(ui_rule in line for line in section), 1)
+        self.assertNotIn("Harness memory:", started)
+        self.assertNotIn("GPT", "\n".join(section))
+        self.assertNotIn("Claude", "\n".join(section))
+        self.assertNotIn("command =", "\n".join(section))
 
         config = project / ".baton" / "config.toml"
-        config.write_text(config.read_text() + (
-            "\n[tiers.hard]\ncapsule_max_chars = 5000\n"
-            "\n[tiers.custom]\ncapsule_max_chars = 4500\n"
-        ))
+        config.write_text(
+            '[tiers.hard]\ncommand = "/usr/bin/true {prompt_file}"\n'
+            '[tiers.medium]\ncommand = "/missing/worker {prompt_file}"\n'
+            '[tiers.easy]\ncommand = "/usr/bin/true {prompt_file}"\n'
+        )
         partial = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
-        partial_section = difficulty_section(partial)
-        self.assertLessEqual(len(partial_section), 12)
+        partial_section = routing_section(partial)
         self.assertIn(
-            "- Current safe settings: hard: unlabeled worker; medium: not configured; easy: not configured.",
+            "- Current safe settings: hard: unlabeled worker; medium: not configured; easy: unlabeled worker.",
             partial_section,
         )
-        self.assertTrue(any("Missing levels: medium, easy." in line for line in partial_section))
-        partial_snippet = "\n".join(
-            line.removeprefix("# ")
-            for line in partial_section if line.startswith("# ")
-        )
-        self.assertEqual(
-            list(tomllib.loads(partial_snippet)["tiers"]), ["medium", "easy"],
-        )
-        self.assertNotIn("[tiers.hard]", partial_snippet)
-        self.assertNotIn("tiers.custom", "\n".join(partial_section))
+        self.assertEqual(sum(question in line for line in partial_section), 1)
 
-        config.write_text(config.read_text() + (
-            "\n[tiers.medium]\nworker_timeout_minutes = 45\n"
-            "\n[tiers.easy]\nworker_timeout_minutes = 20\n"
-        ))
+        config.write_text(config.read_text().replace("/missing/worker", "/usr/bin/true"))
         complete = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
-        complete_section = difficulty_section(complete)
-        self.assertLessEqual(len(complete_section), 12)
-        self.assertIn("- Current safe settings: hard: unlabeled worker; medium: unlabeled worker; easy: unlabeled worker.", complete_section)
-        self.assertNotIn("Missing levels:", "\n".join(complete_section))
-        self.assertFalse(any(line.startswith("# ") for line in complete_section))
+        complete_section = routing_section(complete)
+        self.assertIn(
+            "- Current safe settings: hard: unlabeled worker; medium: unlabeled worker; easy: unlabeled worker.",
+            complete_section,
+        )
+        self.assertNotIn(question, "\n".join(complete_section))
+        self.assertTrue(any(
+            "change these settings at any time" in line for line in complete_section
+        ))
 
     def test_worker_role_and_live_runner_guards(self):
         project = self.make_project()
@@ -1925,89 +1929,39 @@ class BatonTests(unittest.TestCase):
         self.assertIn("template placeholder", failed.stderr)
         self.assertFalse((work / "review-brief-token.json").exists())
 
-    def test_start_brief_asks_copy_ready_harness_memory_choice(self):
+    def test_start_brief_never_asks_about_harness_memory_or_fresh_sessions(self):
         project = self.make_project()
         started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
-        harness = started.split("Harness memory:\n", 1)[1].split(
-            "\n\nDifficulty levels:", 1,
-        )[0]
-        self.assertIn("Ask the user:", harness)
-        for text in (
-            "use your existing harness memory and project rules",
-            "start the Baton orchestrator in a fresh harness session",
-            "old conversation history, stale assumptions, unrelated instructions",
-            "accumulated tool output",
-            "current goal and Baton protocol",
-            "unpersisted context disappears",
-            "project memory or a Baton handoff",
-            "run a close brief first",
-            "new conversation or session",
-            "Hermes `/new`",
-            "prompts/use-framework.md",
-            "read `.baton/orchestrator.md`",
-            ".baton/baton orchestrator brief --phase start",
-            "fresh task process and context",
-            "equivalent isolation option",
-        ):
-            self.assertIn(text, harness)
+        self.assertNotIn("Harness memory:", started)
+        self.assertNotIn("fresh harness session", started)
+        self.assertNotIn("use your existing harness memory", started)
 
-    def test_start_brief_asks_for_difficulty_preferences_until_compaction(self):
+    def test_compaction_reinjection_uses_the_same_route_validity_rule(self):
         project = self.make_project()
         runtime = project / ".baton"
-        config = """[commands]
-worker = "/usr/bin/true {prompt_file}"
-
-[tiers.hard]
-[tiers.hard.display]
-model = "GPT 5.6 Sol"
-effort = "xhigh"
-
-[tiers.medium]
-[tiers.medium.display]
-model = "Claude Opus 4.8"
-effort = "xhigh"
-
-[tiers.easy]
-[tiers.easy.display]
-model = "Local Small"
-effort = "low"
-"""
-        (runtime / "config.toml").write_text(config)
-        started = self.baton(
-            project, "orchestrator", "brief", "--phase", "start", check=True,
-        ).stdout
-        section = started.split("\nDifficulty levels:\n", 1)[1].split("\n\n", 1)[0]
-        for text in (
-            "I’m the Baton orchestrator",
-            "model and reasoning-level preferences for hard, medium, and easy tasks",
-            "hard = GPT 5.6 Sol with xhigh reasoning",
-            "medium = Claude Opus 4.8 with xhigh reasoning",
-            "use the current settings",
-            "keep them unchanged",
-            "use the defaults",
-            "replace or fill them with Baton’s documented defaults",
-            "Current safe settings:",
-            "hard: model=GPT 5.6 Sol; effort=xhigh",
-            "validate the configuration",
-            "run `.baton/baton tiers`",
-            "restate the effective hard, medium, and easy preferences",
-            "preserve or create the harness wrappers or profiles",
-        ):
-            self.assertIn(text, section)
-        self.assertNotIn("/usr/bin/true", section)
-        self.assertNotIn("{prompt_file}", section)
-
         compact = subprocess.run(
             [runtime / "baton", "hook-event", "session-start"],
             cwd=project, input='{"source":"compact"}', text=True,
             capture_output=True,
         )
         self.assertEqual(compact.returncode, 0)
-        self.assertNotIn("Difficulty levels:", compact.stdout)
-        self.assertIn("Harness memory:", compact.stdout)
-        self.assertIn("Ask the user:", compact.stdout)
+        self.assertIn("Which model and reasoning level should Baton use", compact.stdout)
+        self.assertNotIn("Harness memory:", compact.stdout)
+
+        (runtime / "config.toml").write_text("".join(
+            f'[tiers.{name}]\ncommand = "/usr/bin/true {{prompt_file}}"\n'
+            for name in ("hard", "medium", "easy")
+        ))
+        compact = subprocess.run(
+            [runtime / "baton", "hook-event", "session-start"],
+            cwd=project, input='{"source":"compact"}', text=True,
+            capture_output=True,
+        )
+        self.assertEqual(compact.returncode, 0)
+        self.assertNotIn("Which model and reasoning level should Baton use", compact.stdout)
+        self.assertIn("change these settings at any time", compact.stdout)
 
     def test_close_brief_counts_worker_launches_across_retries_and_archives(self):
         project = self.make_project()
@@ -2110,24 +2064,9 @@ effort = "low"
         started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
-        harness = started.stdout.split("Harness memory:\n", 1)[1].split(
-            "\n\nDifficulty levels:", 1,
-        )[0]
-        self.assertLessEqual(len(harness.splitlines()) + 1, 12)
-        for control in (
-            '"autoMemoryEnabled": false',
-            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-            "the /memory toggle",
-            '"claudeMdExcludes"',
-            "managed-policy CLAUDE.md cannot be excluded",
-            "claude --bare",
-            "ALSO disables hooks (conflicts with hook-based injection)",
-            "--ignore-rules",
-            "--safe-mode: it drops user config",
-            "hermes memory reset` is destructive",
-            "included Hermes worker command also uses --ignore-rules",
-        ):
-            self.assertIn(control, harness)
+        self.assertIn("Worker routing:", started.stdout)
+        self.assertIn("Which model and reasoning level should Baton use", started.stdout)
+        self.assertNotIn("Harness memory:", started.stdout)
         plan = self.baton(
             project, "orchestrator", "brief", "--phase", "plan", check=True,
         )
@@ -2185,7 +2124,12 @@ effort = "low"
             avoid_block, "".join(f"- {note}\n" for note in expected_avoids),
         )
         self.assertNotIn("(fill in)", avoid_block)
-        self.assertIn("Start a fresh session", closed.stdout)
+        self.assertIn(
+            "Start a fresh coding-agent session and tell it to read "
+            ".baton/orchestrator.md.",
+            closed.stdout,
+        )
+        self.assertNotIn("orchestrator brief --phase start", closed.stdout)
         started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
@@ -2300,9 +2244,12 @@ effort = "low"
         )
         globals_["now"] = lambda: "2026-01-01T00:00:01Z"
         globals_["say"] = lambda *_args: None
+        globals_["load_config"] = lambda _baton_dir: {}
+        globals_["project_root"] = lambda _baton_dir: "/project"
+        globals_["worker_routing_lines"] = lambda _config, _root: ["Worker routing:"]
 
         module["orchestrator_start_brief"](
-            "/baton", [], consume_handoff=True, include_levels_ask=False,
+            "/baton", [], consume_handoff=True,
         )
         self.assertEqual(events, [
             ("enter", "orchestrator-handoff.lock"), "read", "write",
@@ -2491,7 +2438,7 @@ effort = "low"
         started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
-        self.assertIn("Difficulty levels:", started.stdout)
+        self.assertIn("Worker routing:", started.stdout)
         after_start = snapshot()
         changed = {
             path for path in before if before[path] != after_start.get(path)
@@ -2660,17 +2607,14 @@ effort = "low"
                 )
 
         notice = "Baton: context was compacted; state re-injected below."
-        difficulty_start = brief.index("\nDifficulty levels:\n")
-        difficulty_end = brief.index("\n\n", difficulty_start + 1)
-        compact_brief = brief[:difficulty_start] + brief[difficulty_end + 1:]
         compact = subprocess.run(
             command, cwd=project, input='{"source":"compact"}', text=True,
             capture_output=True,
         )
         self.assertEqual(compact.returncode, 0)
         self.assertEqual(compact.stderr, "")
-        self.assertEqual(compact.stdout, notice + "\n" + compact_brief)
-        self.assertNotIn("Difficulty levels:", compact.stdout)
+        self.assertEqual(compact.stdout, notice + "\n" + brief)
+        self.assertIn("Worker routing:", compact.stdout)
 
         (project / ".baton" / "orchestrator-handoff.md").write_text(
             "goal: " + "x" * 10000 + "\nlast handoff line\n"
@@ -2854,6 +2798,7 @@ effort = "low"
         config = project / ".baton" / "config.toml"
         config.write_text(
             '[commands]\nworker = "true {prompt} embedded{prompt}"\n'
+            '[tiers.test]\n'
             '[limits]\nmax_parallel = 1\n'
         )
         self.assertNotEqual(self.baton(project, "validate").returncode, 0)
@@ -3064,6 +3009,7 @@ effort = "low"
         config = (
             "[commands]\n"
             f"worker = {json.dumps(command)}\n\n"
+            "[tiers.test]\n\n"
             "[limits]\n"
             "max_parallel = 1\n"
             "worker_timeout_minutes = 1\n"
@@ -3082,8 +3028,16 @@ effort = "low"
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("--tier", missing.stderr)
 
-        task_id = self.create_task(project, "explicit", tier="default")
-        self.assertEqual(self.state(project, task_id)["tier"], "default")
+        rejected_default = self.try_create_task(project, "removed route", tier="default")
+        self.assertNotEqual(rejected_default.returncode, 0)
+        self.assertIn("unknown tier 'default'", rejected_default.stderr)
+
+        config = project / ".baton" / "config.toml"
+        config.write_text(config.read_text() + (
+            '\n[tiers.explicit]\ncommand = "/usr/bin/true {prompt_file}"\n'
+        ))
+        task_id = self.create_task(project, "explicit", tier="explicit")
+        self.assertEqual(self.state(project, task_id)["tier"], "explicit")
 
         state_path = project / ".baton" / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
@@ -3197,11 +3151,11 @@ effort = "low"
             'fallback = "GPT 5.6 Terra/high when Claude usage is exhausted"\n'
         ))
 
-        default_created = self.baton(
+        fallback_created = self.baton(
             project, "task", "create", "--title", "fallback label",
-            "--tier", "default", check=True,
+            "--tier", "test", check=True,
         )
-        self.assertIn("difficulty=default | worker=unlabeled worker", default_created.stdout)
+        self.assertIn("difficulty=test | worker=unlabeled worker", fallback_created.stdout)
         safe_created = self.baton(
             project, "task", "create", "--title", "safe label",
             "--tier", "safe", check=True,
@@ -3279,7 +3233,7 @@ effort = "low"
         unknown = self.try_create_task(project, "unknown tier", tier="mystery")
         self.assertNotEqual(unknown.returncode, 0)
         self.assertIn("unknown tier 'mystery'", unknown.stderr)
-        self.assertIn("known tiers: default, premium", unknown.stderr)
+        self.assertIn("known tiers: premium, test", unknown.stderr)
         blank = self.try_create_task(project, "blank tier", tier="")
         self.assertNotEqual(blank.returncode, 0)
         self.assertIn("tier name must be non-blank", blank.stderr)
@@ -3562,12 +3516,12 @@ effort = "low"
         tiers = self.baton(project, "tiers", check=True)
         executable = sys.executable
         tier_blocks = (
-            "Tier: default\nRouting: difficulty=default | worker=unlabeled worker\n"
-            f"Executable: {executable}\nCommand source: default\n"
-            "Worker timeout: 2.5 minutes\nCapsule budget: 4000 characters\n\n"
             "Tier: alpha\nRouting: difficulty=alpha | worker=unlabeled worker\n"
-            f"Executable: {executable}\nCommand source: default\n"
+            f"Executable: {executable}\nCommand source: global\n"
             "Worker timeout: 2.5 minutes\nCapsule budget: 5000 characters\n\n"
+            "Tier: test\nRouting: difficulty=test | worker=unlabeled worker\n"
+            f"Executable: {executable}\nCommand source: global\n"
+            "Worker timeout: 2.5 minutes\nCapsule budget: 4000 characters\n\n"
             "Tier: zeta\nRouting: difficulty=zeta | worker=unlabeled worker\n"
             f"Executable: {executable}\nCommand source: tier\n"
             "Worker timeout: 0 minutes\nCapsule budget: 4000 characters\n"
@@ -4049,7 +4003,7 @@ module["cmd_archive"](SimpleNamespace())
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
         created = self.baton(
             project, "task", "create", "--title", "unfinished spec",
-            "--tier", "default", check=True,
+            "--tier", "test", check=True,
         )
         task_id = created.stdout.split()[1]
         run = self.baton(project, "run", task_id)
@@ -4185,7 +4139,7 @@ module["cmd_archive"](SimpleNamespace())
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
         created = self.baton(
             project, "task", "create", "--title", "unfinished preview",
-            "--tier", "default", check=True,
+            "--tier", "test", check=True,
         )
         unfinished = created.stdout.split()[1]
         preview = self.baton(project, "task", "capsule", unfinished)
@@ -4492,11 +4446,45 @@ module["cmd_archive"](SimpleNamespace())
         orchestrator = (ROOT / "framework" / "orchestrator.md").read_text()
         use_prompt = (ROOT / "prompts" / "use-framework.md").read_text()
         example_text = (ROOT / "framework" / "config.example.toml").read_text()
-        for text in (spec, prompt, orchestrator, example_text):
-            normalized = " ".join(text.split())
-            self.assertIn("GPT 5.6 Sol", normalized)
-            self.assertIn("Claude Code Opus 4.8", normalized)
-            self.assertIn("GPT 5.6 Terra/high", normalized)
+        question = (
+            "Which model and reasoning level should Baton use for hard, medium, "
+            "and easy tasks? You can specify each one or ask me to derive the "
+            "settings from the current orchestrator."
+        )
+        ui_rule = (
+            "Ask this as a persistent plain-text question that remains visible "
+            "until answered. Never use a transient form; expiration or dismissal "
+            "is not an answer and must not be treated as selecting any option."
+        )
+        self.assertEqual(orchestrator.count(question), 1)
+        self.assertEqual(orchestrator.count(ui_rule), 1)
+        self.assertLess(abs(orchestrator.index(question) - orchestrator.index(ui_rule)), 600)
+        normalized_orchestrator = " ".join(orchestrator.split())
+        for phrase in (
+            "unsure", "continues the task without settings", "do not repeat the initial question",
+            "reliable harness-provided context", "read-only local", "never infer",
+            "next lower available reasoning", "with only two levels",
+            "already the minimum", "permission before lowering", "Omission is not approval",
+            "avoided an unapproved downgrade", "display metadata alone is insufficient",
+        ):
+            self.assertIn(phrase.lower(), normalized_orchestrator.lower())
+        self.assertIn("internally and silently", orchestrator)
+        self.assertIn("Never ask the user to run", orchestrator)
+        for path in (
+            ROOT / "framework" / "orchestrator.md",
+            ROOT / "framework" / "config.example.toml",
+            ROOT / "prompts" / "use-framework.md",
+            ROOT / "prompts" / "improve-framework.md",
+            ROOT / "skill" / "SKILL.md",
+            ROOT / "SPEC.md",
+            ROOT / "summary.md",
+        ):
+            text = path.read_text()
+            for stale in (
+                "Harness memory", "use the defaults", "documented defaults",
+                "GPT 5.6", "Claude Code Opus 4.8", "Claude Opus 4.8",
+            ):
+                self.assertNotIn(stale, text, f"{stale!r} remains in {path}")
         for text in (orchestrator, use_prompt):
             normalized = " ".join(text.split())
             self.assertIn("0 workers for this request", normalized)
@@ -4508,16 +4496,11 @@ module["cmd_archive"](SimpleNamespace())
         self.assertIn("runtime-wide", orchestrator)
         self.assertIn("whole Baton runtime", use_prompt)
         self.assertIn("Never omit `--tier`", orchestrator)
-        self.assertIn('engineering_role = "elite senior"', example_text)
-        self.assertIn('engineering_role = "senior"', example_text)
 
         with (ROOT / "framework" / "config.example.toml").open("rb") as source:
             config = tomllib.load(source)
-        command = shlex.split(config["commands"]["worker"])
-        self.assertEqual(command.count("--ignore-rules"), 1)
-        self.assertIn("--ignore-rules", command)
-        query = command.index("-q")
-        self.assertEqual(command[query + 1], "{prompt}")
+        self.assertNotIn("worker", config.get("commands", {}))
+        self.assertNotIn("tiers", config)
 
 
 if __name__ == "__main__":

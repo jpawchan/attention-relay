@@ -10,37 +10,54 @@ reviewing the report and diff; never bypass role, scope, lease, or brief gates.
 
 ## Start
 
-From the project root, run the start brief FIRST:
+After reading this manual, run `.baton/baton orchestrator brief --phase start`
+internally and silently before responding to the user. Never ask the user to run,
+install, start, validate, or inspect Baton or its state. The start brief is the
+single parser for current task state, unresolved decisions and reviews, and the
+latest handoff; do not reconstruct those from individual files or substitute a
+different startup command. Follow its state without exposing CLI mechanics.
 
-```bash
-.baton/baton orchestrator brief --phase start
-.baton/baton validate
-.baton/baton status
-.baton/baton memory index --for orchestrator
-```
+The start brief's `Worker routing` section checks this project's Git-ignored
+`.baton/config.toml`. If all three conventional routes are valid and executable,
+do not ask an onboarding question. State the current safe hard, medium, and easy
+settings, remind the user they can change the settings at any time, and continue.
+Do not expose commands, paths, flags, credentials, provider internals, or unsafe
+configuration values in that summary.
 
-In your first response, ask the copy-ready questions in the brief's `Harness
-memory` and `Difficulty levels` sections. Wait for the user's explicit choices
-before planning or changing harness or tier configuration.
+If any conventional route is missing, incomplete, invalid, or not executable,
+ask exactly:
 
-### Difficulty levels
+Which model and reasoning level should Baton use for hard, medium, and easy tasks? You can specify each one or ask me to derive the settings from the current orchestrator.
 
-Ask whether the user wants to keep or change the current `hard`, `medium`, and
-`easy` model/reasoning preferences even when all three are configured. If the
-user says to use the current settings, leave them unchanged. If the user says to
-use the defaults, use the documented example routes: `hard` = GPT 5.6 Sol/high,
-`medium` = GPT 5.6 Sol/medium, and `easy` = Claude Code Opus 4.8/xhigh with GPT
-5.6 Terra/high only when Claude usage is exhausted. Do not edit configuration
-before that explicit answer.
+Ask this as a persistent plain-text question that remains visible until answered. Never use a transient form; expiration or dismissal is not an answer and must not be treated as selecting any option.
 
-For requested changes, update the relevant command and safe display metadata in
-`[tiers.hard]`, `[tiers.medium]`, and `[tiers.easy]`. Preserve or create the
-harness profiles or wrappers needed to make the requested model, reasoning, and
-fallback behavior real; changing display labels alone is not configuration.
-Then run `.baton/baton validate` and `.baton/baton tiers`, and restate the
-effective preferences in clear language before assigning tasks. The start brief
-prints copy-ready skeletons only for missing conventional tiers. Baton never
-infers metadata from commands or configures a route automatically.
+Ask the initial question only once. Derive settings when the user says they are
+unsure, asks Baton to choose, or continues the task without settings; do not
+repeat the initial question. First discover the current harness, model, and
+reasoning from reliable harness-provided context, then use read-only local
+configuration or CLI capability checks as needed. Never infer capabilities from
+labels, display metadata, naming conventions, or unsupported assumptions. If
+discovery cannot verify an executable route that implements the setting, explain
+what is unknown and request explicit settings rather than inventing one.
+
+Derived routing uses the orchestrator's current model. Set `hard` to the current
+reasoning level, `medium` to the next lower available reasoning level, and `easy`
+to the lowest available level. With only two levels, `medium` and `easy` share
+the lower level. If current reasoning is already the minimum, all three use it.
+Tell the user the selected routes and that they can change them at any time.
+
+When lowering is possible, ask persistent plain-text permission before lowering.
+Never use a transient permission form, and never treat expiration or dismissal
+as consent. Omission is not approval: if the user continues without permission,
+configure all three routes at the current reasoning level, say Baton avoided an
+unapproved downgrade, and remind them the settings can change at any time.
+
+Only after an explicit choice or this defined derive/fallback path may you write
+the project-local configuration. Commands, profiles, or wrappers must actually
+implement the stated model, reasoning, and fallback behavior; display metadata
+alone is insufficient. Validate the resulting configuration and inspect its safe
+tier summary internally, then tell the user the selected routes without exposing
+the underlying command or provider details.
 
 Choose and announce one concrete difficulty for every coding task before creating
 it. Always pass `task create --tier hard|medium|easy` (choosing one configured
@@ -54,9 +71,9 @@ task id rather than a `+N more` marker.
 
 Load only memory entries relevant to the current goal.
 
-Treat `orchestrator.md` and `worker.md` as read-only instructions. Task specs
-and `memory.md` are the mutable agent-managed artifacts; `config.toml` is
-user-managed.
+Treat `orchestrator.md` and `worker.md` as read-only instructions. Task specs and
+`memory.md` are mutable agent-managed artifacts. Change `config.toml` only under
+the onboarding and reconfiguration rules above.
 
 ## Optional Claude Code hooks
 
@@ -70,8 +87,9 @@ it into the project's existing settings without replacing other hooks:
 
 The matcher-free `SessionStart` hook injects the start-phase orchestrator brief
 as context at startup and after automatic or manual compaction. Post-compaction
-injection is prefixed with an explicit notice that Baton state was re-injected
-and suppresses only the one-time user-facing difficulty-preference question.
+injection is prefixed with an explicit notice that Baton state was re-injected.
+Both paths use the same route-validity check: valid conventional routes produce
+only a safe reminder, while missing or invalid routes require onboarding.
 The `UserPromptSubmit` hook injects a bounded, state-derived `Next actions`
 capsule before Claude handles each prompt. That capsule uses one global budget
 of five content lines for reviews, decisions, and overflow markers; decision
@@ -98,10 +116,10 @@ Before creating or editing task specs, run the plan brief:
 ```
 
 `--title` and an explicit `--tier` are required. An omitted scope means the whole
-project and cannot run beside another task. `default` is always available only
-when explicitly named; every other value must have a matching `[tiers.<name>]`
-config table. Tell the user the task id, title, chosen difficulty, and worker label
-shown by creation. List the effective, redacted settings before assigning tiers:
+project and cannot run beside another task. Every value must have a matching,
+valid `[tiers.<name>]` config table; `default` is not a task route. Tell the user
+the task id, title, chosen difficulty, and worker label shown by creation. List
+the effective, redacted settings before assigning tiers:
 
 ```bash
 .baton/baton tiers
@@ -216,10 +234,11 @@ Before ending an orchestrator session, run:
 ```
 
 Baton writes a bounded `.baton/orchestrator-handoff.md` from current
-state. Start a fresh session and run the start brief; it prints the handoff and
-marks it consumed without deleting it. Every close requires a nonblank explicit
-goal. Add at most five repeatable `--avoid` notes when useful. Baton flattens
-whitespace, removes controls and ANSI, and bounds the goal and each avoid to 200
+state. Start a fresh coding-agent session and tell it to read
+`.baton/orchestrator.md`; it runs the start brief internally, prints the handoff,
+and marks it consumed without deleting it. Every close requires a nonblank
+explicit goal. Add at most five repeatable `--avoid` notes when useful. Baton
+flattens whitespace, removes controls and ANSI, and bounds the goal and each avoid to 200
 characters; it rejects close-only flags on other phases and asks callers with
 more than five notes to consolidate. With no avoid notes, the visible `(fill in)`
 placeholder remains. Add at most three repeatable `--note` values for trusted
@@ -315,13 +334,14 @@ sizes, phase-receipt command-use coverage, and post-submission warnings. With on
 or more repeatable `--task ID` values, it deduplicates the ids, resolves active
 and archived tasks, and prints only the request-scoped worker sentence.
 
-`.baton/baton tiers` is orchestrator-only and read-only. It lists `default` first and
-then configured tiers by name with each difficulty and bounded safe worker label,
+`.baton/baton tiers` is orchestrator-only and read-only. It lists only explicitly
+configured tiers by name with each difficulty and bounded safe worker label,
 effective command source, executable only (never command flags), timeout, and
 capsule budget. Missing display metadata deterministically shows `unlabeled
 worker`. Display fields are declarations only: they never change the command
-routed from that same validated tier. When any conventional difficulty level is
-unconfigured, the command appends one `Conventional levels missing:` hint.
+routed from that same validated tier. With no tiers it says none are configured.
+When any conventional route is missing or invalid, the command appends one
+`Conventional levels missing:` hint.
 
 ## Before consequential action
 

@@ -47,10 +47,12 @@ class ContextFootprintTests(unittest.TestCase):
             )
         brief = artifacts["generated_start_brief"].decode("utf-8")
         manual = artifacts["installed_orchestrator_manual"].decode("utf-8")
-        self.assertIn("Difficulty levels:", brief)
-        self.assertIn("use the current settings", brief)
-        self.assertIn("GPT 5.6 Sol", manual)
-        self.assertIn("Claude Code Opus 4.8", manual)
+        self.assertIn("Worker routing:", brief)
+        self.assertIn("change these settings at any time", brief)
+        self.assertNotIn("Which model and reasoning level should Baton use", brief)
+        self.assertIn("Which model and reasoning level should Baton use", manual)
+        self.assertNotIn("GPT 5.6", manual)
+        self.assertNotIn("Claude Opus", manual)
 
     def test_default_result_uses_only_reproducible_offline_estimates(self):
         result = MEASURE.measure(ROOT)

@@ -37,33 +37,14 @@ PROVIDER_PATHS = {
     "claude_opus_4_8": "claude_opus_4_8_via_claude_code",
 }
 
-CONFIG = """[commands]
-worker = "/usr/bin/true {prompt_file}"
-
-[tiers.hard]
+CONFIG = """[tiers.hard]
 command = "/usr/bin/true {prompt_file}"
-[tiers.hard.display]
-model = "GPT 5.6 Sol"
-harness = "Hermes"
-effort = "high"
-engineering_role = "elite senior"
 
 [tiers.medium]
 command = "/usr/bin/true {prompt_file}"
-[tiers.medium.display]
-model = "GPT 5.6 Sol"
-harness = "Hermes"
-effort = "medium"
-engineering_role = "elite senior"
 
 [tiers.easy]
 command = "/usr/bin/true {prompt_file}"
-[tiers.easy.display]
-model = "Claude Code Opus 4.8"
-harness = "Claude Code"
-effort = "xhigh"
-engineering_role = "senior"
-fallback = "GPT 5.6 Terra/high when Claude usage is exhausted"
 
 [limits]
 max_parallel = 3

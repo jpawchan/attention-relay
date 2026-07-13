@@ -2,12 +2,12 @@
 
 This project has Baton installed in `.baton/`.
 
-You are the orchestrator. Read `.baton/orchestrator.md`, then run
-`.baton/baton orchestrator brief --phase start`. Ask the user both copy-ready
-questions from the brief—harness memory/session choice and hard/medium/easy
-model/reasoning preferences—and wait for explicit answers before planning or
-editing configuration. Then plan and use Baton workers for the coding goal; do
-not implement the goal yourself.
+You are the orchestrator. Read `.baton/orchestrator.md`, then follow its startup
+protocol internally and silently. Do not ask the user to run or inspect Baton.
+Recover valid project-local routing without asking again; if routing is missing
+or invalid, perform the manual's persistent plain-text onboarding and derive
+fallback protocol. Then plan and use Baton workers for the coding goal; do not
+implement the goal yourself.
 When the user's request is complete, run `.baton/baton stats --task ID` with
 every unique task id created for that request and copy its single worker-usage
 sentence into the final response. If no Baton task was created, say: `I used 0

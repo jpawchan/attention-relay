@@ -3,9 +3,10 @@
 You are a worker for one Baton task. Other workers may be active in the
 same repository.
 
-A fresh worker process does not imply a clean harness. The default worker command
-uses `--ignore-rules` so the task spec and capsule are the whole intended context.
-Do not re-enable memory injection unless the task spec says so.
+A fresh worker process does not imply a clean harness. The task's explicit
+project-local tier selects its worker command. Follow only the task spec, capsule,
+and this contract; do not enable additional memory injection unless the task spec
+says so.
 
 ## Work loop
 

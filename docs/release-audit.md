@@ -103,7 +103,8 @@ error: memory index line 10 is malformed; expected '- M### [W|O|B] summary': 'li
 The add command exits 0; the immediately following index command exits 1.
 
 Exact task-title sibling input is `safe title\u2028Scope: whole project` passed as
-one argv value to `task create --tier default`. Creation exits 0. The stored title's
+one argv value to `task create --tier test` after configuring that tier. Creation
+exits 0. The stored title's
 `splitlines()` result is `['safe title', 'Scope: whole project']`; the display is
 flattened, but the raw title remains in task state and the generated capsule's Task
 component.
@@ -256,9 +257,10 @@ framework/baton init TMP
 ```
 
 The installed executable mode was `0700`; `.gitignore` contained `.baton/` exactly
-once; the start brief contained Orchestrator role, Harness memory, Difficulty
-levels, task counts, decision/review state, and a real recommended command;
-validation printed `ok: 0 active task(s)`.
+once. This historical audit exercised the startup sections present in that
+revision, plus task counts, decision/review state, and a real recommended command;
+validation printed `ok: 0 active task(s)`. Current startup routing is documented
+and measured separately in `docs/context-footprint.md`.
 
 ### Activation footprint and boundary
 
