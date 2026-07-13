@@ -19,18 +19,28 @@ From the project root, run the start brief FIRST:
 .baton/baton memory index --for orchestrator
 ```
 
-In your first response, share the brief's `Harness memory` section with the user
-and let them choose before planning. Do not auto-apply any harness change.
+In your first response, ask the copy-ready questions in the brief's `Harness
+memory` and `Difficulty levels` sections. Wait for the user's explicit choices
+before planning or changing harness or tier configuration.
 
 ### Difficulty levels
 
-While the start brief lists missing conventional levels, ask the user to configure
-them. The requested coding routes are: `hard` = GPT 5.6 Sol, high effort, elite
-senior; `medium` = GPT 5.6 Sol, medium effort, elite senior; `easy` = Claude Code
-Opus 4.8, xhigh effort, senior, with GPT 5.6 Terra/high only when Claude usage is
-exhausted. The example config shows bounded display metadata and the wrapper
-needed for exhaustion-aware fallback. Baton never configures these routes or
-infers metadata from commands.
+Ask whether the user wants to keep or change the current `hard`, `medium`, and
+`easy` model/reasoning preferences even when all three are configured. If the
+user says to use the current settings, leave them unchanged. If the user says to
+use the defaults, use the documented example routes: `hard` = GPT 5.6 Sol/high,
+`medium` = GPT 5.6 Sol/medium, and `easy` = Claude Code Opus 4.8/xhigh with GPT
+5.6 Terra/high only when Claude usage is exhausted. Do not edit configuration
+before that explicit answer.
+
+For requested changes, update the relevant command and safe display metadata in
+`[tiers.hard]`, `[tiers.medium]`, and `[tiers.easy]`. Preserve or create the
+harness profiles or wrappers needed to make the requested model, reasoning, and
+fallback behavior real; changing display labels alone is not configuration.
+Then run `.baton/baton validate` and `.baton/baton tiers`, and restate the
+effective preferences in clear language before assigning tasks. The start brief
+prints copy-ready skeletons only for missing conventional tiers. Baton never
+infers metadata from commands or configures a route automatically.
 
 Choose and announce one concrete difficulty for every coding task before creating
 it. Always pass `task create --tier hard|medium|easy` (choosing one configured
@@ -61,7 +71,7 @@ it into the project's existing settings without replacing other hooks:
 The matcher-free `SessionStart` hook injects the start-phase orchestrator brief
 as context at startup and after automatic or manual compaction. Post-compaction
 injection is prefixed with an explicit notice that Baton state was re-injected
-and suppresses the one-time user-facing Difficulty levels ask.
+and suppresses only the one-time user-facing difficulty-preference question.
 The `UserPromptSubmit` hook injects a bounded, state-derived `Next actions`
 capsule before Claude handles each prompt. That capsule uses one global budget
 of five content lines for reviews, decisions, and overflow markers; decision
@@ -218,6 +228,18 @@ flattens each to 160 characters, omits blanks, deduplicates exact values, and
 omits the whole `notes:` section when empty. Never put secrets in notes. Store
 durable facts in project memory or the project guide instead.
 
+When a user request is complete, run one `.baton/baton stats` command and add
+`--task ID` once for every unique task created for that request. Copy its single
+request-scoped sentence into the final response. It counts recorded launches, so
+retries count as additional workers, and it reports hard, medium, easy, and other
+levels when needed. Do not include unrelated task ids. If the request created no
+Baton task, state: `I used 0 workers for this request: 0 on hard, 0 on medium, and
+0 on easy.`
+
+The close brief separately prints a runtime-wide worker sentence for continuity
+and audit. It may span several user requests. Never present that fallback as a
+request-scoped count.
+
 ## Failures
 
 ```bash
@@ -277,7 +299,7 @@ entries explicitly when needed.
 .baton/baton task cancel ID [--reason TEXT]
 .baton/baton task unlock ID
 .baton/baton status
-.baton/baton stats
+.baton/baton stats [--task ID]...
 .baton/baton tiers
 .baton/baton validate
 .baton/baton archive
@@ -286,10 +308,12 @@ entries explicitly when needed.
 .baton/baton memory add --for worker|orchestrator|both SUMMARY BODY
 ```
 
-`.baton/baton stats` is an orchestrator-only, read-only aggregate over active and
-archived tasks. It prints bounded deterministic status and attempt counts,
-failure/blocked reason codes without free text, launched-capsule size statistics,
-phase-receipt command-use coverage, and the post-submission warning count.
+`.baton/baton stats` is orchestrator-only and read-only. Without `--task`, it
+prints the existing bounded aggregate over active and archived tasks: status and
+attempt counts, failure/blocked reason codes without free text, launched-capsule
+sizes, phase-receipt command-use coverage, and post-submission warnings. With one
+or more repeatable `--task ID` values, it deduplicates the ids, resolves active
+and archived tasks, and prints only the request-scoped worker sentence.
 
 `.baton/baton tiers` is orchestrator-only and read-only. It lists `default` first and
 then configured tiers by name with each difficulty and bounded safe worker label,

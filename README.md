@@ -67,9 +67,9 @@ The interactive orchestrator needs file and command access. Worker routing accep
 
 ### Measured framework token usage
 
-The revision recorded in [Activation context footprint](docs/context-footprint.md) loads a 15,126-byte Baton-authored activation payload: `prompts/use-framework.md`, the freshly installed orchestrator manual, and a generated start brief after `hard`, `medium`, and `easy` are configured. It excludes the host harness's base prompt and tool schemas, unrelated saved memory, source code, task specs, worker prompts, and later capsules.
+The revision recorded in [Activation context footprint](docs/context-footprint.md) reproducibly measures the Baton-authored activation payload: `prompts/use-framework.md`, the freshly installed orchestrator manual, and a generated start brief after `hard`, `medium`, and `easy` are configured. It excludes the host harness's base prompt and tool schemas, unrelated saved memory, source code, task specs, worker prompts, and later capsules.
 
-A live provider differential measured that exact payload between fixed inert-data markers with identical bracketing baselines: **3,426 logical input tokens** for GPT 5.6 Sol through Hermes/OpenAI Codex and **5,323 logical input tokens** for Claude Opus 4.8 through Claude Code. Those values are exact only for the recorded harness/API differential and tested model revision and message construction; they are not standalone tokenizer counts or universal counts for similarly named endpoints. For unmeasured paths, the documented offline fallback is a **3,782-token estimate**, with a conservative **2,521–7,563** range.
+The startup communication changed after the previously recorded live provider differential, so Baton no longer applies those stale exact token counts to the current payload. The measurement command reports exact characters, UTF-8 bytes, lines, and SHA-256 plus a clearly labeled standard-library offline estimate and range. New provider counts require genuine bracketing baseline/payload/baseline evidence for these exact bytes.
 
 Activation is overhead. If a goal will probably use fewer direct-execution tokens than the applicable footprint, run it directly; use Baton when decomposition, fresh-worker focus, parallelism, review, or risk control is expected to justify that cost.
 
@@ -110,9 +110,11 @@ framework/baton init /path/to/project
    .baton/baton tiers
    ```
 
-2. Choose the start brief's memory-clean option before planning. Configure and verify all three requested worker levels in `.baton/config.toml`: `hard` uses GPT 5.6 Sol at high effort, `medium` uses GPT 5.6 Sol at medium effort, and `easy` uses Claude Code Opus 4.8 at xhigh effort, with GPT 5.6 Terra/high only when Claude usage is exhausted. The example configuration shows the required display metadata and wrapper shape; Baton does not register these models, select effort, or implement the exhaustion-only fallback.
+2. Answer both copy-ready start questions before planning: whether the orchestrator should use existing harness memory/project rules or move to a fresh session, and whether to keep or change the current model/reasoning preferences for `hard`, `medium`, and `easy`. A fresh session is usually preferable for a new goal, but preserve session-only facts in project memory or a close handoff first. Baton launches each worker in a fresh task process/context; only commands configured with the harness's isolation option also suppress persistent harness memory and project rules. The included Hermes command does so with `--ignore-rules`.
 
-3. Describe the goal. The orchestrator assigns one explicit configured difficulty to every task, previews generated context, runs non-conflicting workers, and reviews evidence before acceptance. Its core commands are:
+3. After an explicit preference answer, configure and verify all three worker levels in `.baton/config.toml`. The documented defaults are GPT 5.6 Sol/high for `hard`, GPT 5.6 Sol/medium for `medium`, and Claude Code Opus 4.8/xhigh for `easy`, with GPT 5.6 Terra/high only when Claude usage is exhausted. Preserve or create the wrappers/profiles that make those choices real, then run `validate` and `tiers` and restate the effective settings. Baton does not register models, select effort, implement fallback, or infer truthful display metadata from commands.
+
+4. Describe the goal. The orchestrator assigns one explicit configured difficulty to every task, previews generated context, runs non-conflicting workers, and reviews evidence before acceptance. Its core commands are:
 
    ```bash
    .baton/baton task create --title "Add email validation" --scope "src/auth/**" --tier hard
@@ -122,11 +124,27 @@ framework/baton init /path/to/project
    .baton/baton orchestrator brief --phase review T001-add-email-validation
    ```
 
-4. Before ending an orchestrator session, run a close brief with a concrete next-session goal:
+5. When the request is complete, count only the workers used for that request by
+   passing every task id the orchestrator created for it:
+
+   ```bash
+   .baton/baton stats --task T001-add-email-validation --task T002-add-tests
+   ```
+
+   Copy the command's single sentence into the final response. It counts retries
+   as additional workers and reports the hard, medium, easy, and—when needed—
+   other-level breakdown. If the request created no Baton task, say: `I used 0
+   workers for this request: 0 on hard, 0 on medium, and 0 on easy.`
+
+6. Before ending an orchestrator session, run a close brief with a concrete next-session goal:
 
    ```bash
    .baton/baton orchestrator brief --phase close --goal "Continue with the next concrete objective"
    ```
+
+   The close brief also reports all recorded worker launches in this Baton
+   runtime for continuity and audit. That fallback may span several user
+   requests; do not present it as the request-scoped count.
 
 Optional Claude Code hooks can inject the start brief at session start and after compaction, and inject bounded current next actions before each user prompt:
 
@@ -156,7 +174,7 @@ The hook merge is idempotent and preserves existing hook arrays. Do not use Clau
 | `docs/bug-audit.md` | Correctness audit, reproductions, and fix dispositions. |
 | `docs/performance.md` | Profiling method, benchmark results, and rejected optimizations. |
 | `docs/github-description.txt` | Short GitHub repository description. |
-| `tools/` | Standard-library measurement and benchmark scripts plus recorded provider evidence. |
+| `tools/` | Standard-library measurement and benchmark scripts plus explicitly retired historical provider evidence. |
 | `tests/test_baton.py` | End-to-end Baton test suite. |
 | `tests/test_context_footprint.py` | Activation-footprint reproducibility tests. |
 | `SPEC.md` | Normative behavior and safety contract. |

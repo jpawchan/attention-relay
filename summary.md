@@ -13,7 +13,7 @@ Baton coordinates external worker CLIs. It is not an agent model, package manage
 - The release-candidate implementation and documentation use Baton as the canonical name and target `https://github.com/jpawchan/baton`; the GitHub rename is intentionally deferred until local verification is complete.
 - The current CLI includes generated dual-edge capsules, phase receipts and one-use gates, bounded cross-session handoffs, strict difficulty tiers, read-only statistics, and optional compaction-aware Claude Code hooks.
 - The seven malformed-input and report-integrity defects documented in `docs/bug-audit.md` are fixed with regression coverage. The performance changes and their measured limits are recorded in `docs/performance.md`.
-- The end-to-end suite contains 121 tests; run it rather than relying on this count after later edits. A framework-owned `baton orchestrate` process remains deliberately out of scope.
+- The end-to-end suite contains 125 tests; run it rather than relying on this count after later edits. A framework-owned `baton orchestrate` process remains deliberately out of scope.
 - The repository's live, Git-ignored `.baton/` directory is dogfooding state and audit history, not project source; do not edit or delete it casually.
 
 ## Run and verify
@@ -28,7 +28,7 @@ python3 tests/test_baton.py
 python3 tests/test_context_footprint.py
 ```
 
-Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; the primary suite runs 121 tests and the focused context-footprint suite runs four tests, with both unittest summaries ending in `OK`. The expected `[T001-lease-guard] stale finalizer ignored` probe diagnostic may follow the primary suite (temp Git repos and stub workers, no network or live agent calls).
+Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; the primary suite runs 125 tests and the focused context-footprint suite runs four tests, with both unittest summaries ending in `OK`. The expected `[T001-lease-guard] stale finalizer ignored` probe diagnostic may follow the primary suite (temp Git repos and stub workers, no network or live agent calls).
 
 If you run the suite from inside a Baton-leased worker process, unset the inherited worker env first or fixtures will reject orchestrator commands:
 
@@ -78,7 +78,7 @@ Baton itself makes no HTTP requests. The configured worker command (default: Her
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
 | `framework/config.example.toml` | Default worker command (memory-clean Hermes), tiers, limits, gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
-| `tests/test_baton.py` | Canonical 121-test end-to-end suite and all stub worker fixtures. |
+| `tests/test_baton.py` | Canonical 125-test end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
 | `prompts/create-framework.md` | Standalone generation prompt with the embedded exact SPEC copy (BEGIN SPEC / END SPEC markers). |
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
@@ -90,7 +90,7 @@ Baton itself makes no HTTP requests. The configured worker command (default: Her
 | `docs/bug-audit.md` | Correctness audit with reproductions and fix dispositions. |
 | `docs/performance.md` | Profiling method, benchmark evidence, and rejected optimizations. |
 | `docs/github-description.txt` | Short public repository description. |
-| `tools/` | Context-measurement and performance-benchmark scripts plus recorded provider evidence. |
+| `tools/` | Context-measurement and performance-benchmark scripts plus retired historical provider evidence. |
 | `tests/test_context_footprint.py` | Activation-footprint reproducibility checks. |
 | `README.md` | Public explanation, evidence, requirements, install, usage, and repository map. |
 | `summary.md` | This guide. |
@@ -131,7 +131,7 @@ Runtime layout after `.baton/baton init <git-root>` (all Git-ignored):
 End-to-end flow with the v2 edge mechanisms marked:
 
 ```text
-orchestrator brief --phase start      <- beginning edge: role + handoff + Harness memory + optional difficulty ask + next actions
+orchestrator brief --phase start      <- beginning edge: role + handoff + both startup questions + next actions
    | task create -> edit spec (Objective/Acceptance criteria/... are the capsule source)
    v
 run: pick_wave -> prepare_worker compiles capsule
@@ -146,13 +146,14 @@ orchestrator brief --phase review ID -> diff stat/history + token/evidence manif
    |    task accept --brief TOKEN verifies evidence               <- gate (default on)
    v
 status/show/run output ends with "Next actions:"       <- recency edge, any harness
-orchestrator brief --phase close --goal TEXT [--note TEXT]... [--avoid TEXT]... -> handoff written <- next session edge
+stats --task ID [--task ID]... -> request-scoped worker count <- final response edge
+orchestrator brief --phase close --goal TEXT [--note TEXT]... [--avoid TEXT]... -> handoff + runtime count <- next session edge
 ```
 
 Statuses: `queued → running → needs_review → done`, or `needs_decision`/`blocked`/`failed → queued` (after decide/repair/return). Workers can submit only the four `WORKER_FINAL` statuses; only `task accept` records `done`.
 Scope enforcement, temp-index Git snapshots, leases, and archive semantics are inherited from v1 unchanged: every changed path outside the wave's scopes blocks the wave; declared `--changed` paths must equal the observed scoped diff case-insensitively.
 
-Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` prints or merges two matcher-free hooks into the project's `.claude/settings.json` — SessionStart runs `hook-event session-start` (start brief as stdout → session context, including explicit state re-injection after automatic or manual compaction, but without repeating the Difficulty levels ask after compaction) and UserPromptSubmit runs `hook-event user-prompt-submit` (JSON `additionalContext` with the Next-actions capsule). Both cap output at 9000 chars and emit nothing (exit 0) on any error.
+Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` prints or merges two matcher-free hooks into the project's `.claude/settings.json` — SessionStart runs `hook-event session-start` (start brief as stdout → session context, including explicit state re-injection after automatic or manual compaction, but without repeating the one-time difficulty-preference question) and UserPromptSubmit runs `hook-event user-prompt-submit` (JSON `additionalContext` with the Next-actions capsule). Both cap output at 9000 chars and emit nothing (exit 0) on any error.
 
 ## Configuration
 
@@ -160,7 +161,7 @@ Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` pri
 
 | Key | Purpose |
 | --- | --- |
-| `commands.worker` | Worker argv template with exactly one `{prompt}` or `{prompt_file}` argument; default is Hermes with `--ignore-rules` (memory-clean). |
+| `commands.worker` | Worker argv template with exactly one `{prompt}` or `{prompt_file}` argument; the default Hermes route uses `--ignore-rules`. Custom commands are memory-isolated only with the equivalent harness option. |
 | `tiers.<name>.command` | Optional per-tier command override; non-default task tiers must be configured and limits-only tiers inherit the default command. |
 | `tiers.<name>.worker_timeout_minutes` | Optional per-tier worker timeout override; unset inherits the global timeout. |
 | `tiers.<name>.capsule_max_chars` | Optional per-tier capsule budget override; unset inherits the global budget. |
@@ -175,8 +176,13 @@ Claude Code integration (opt-in): `.baton/baton hooks claude-code [--write]` pri
 
 Environment variables (all read/written in `framework/baton`): `BATON_DIR` (runtime override in, worker export out), `BATON_TASK_ID`, `BATON_ATTEMPT`, `BATON_LEASE`, `BATON_ROOT` (worker exports; their presence marks a process as a leased worker and blocks orchestrator commands). There is no `.env`; worker credentials belong to the external agent CLI.
 
-Every task creation requires an explicit validated tier; even `default` must be
-named rather than silently selected. Requested coding routes are hard = GPT 5.6
+Every ordinary start asks whether to keep or change the current model/reasoning
+preferences, even when all conventional tiers exist. Only after the explicit
+answer may the orchestrator update matching command/display settings and the
+profiles or wrappers that make them real; it then validates, runs `tiers`, and
+restates the effective preferences. Every task creation requires an explicit
+validated tier; even `default` must be named rather than silently selected.
+Documented defaults are hard = GPT 5.6
 Sol/high/elite senior, medium = GPT 5.6 Sol/medium/elite senior, and easy = Claude
 Code Opus 4.8/xhigh/senior with GPT 5.6 Terra/high only when Claude usage is
 exhausted. Until all three matching tables exist, the start brief prints
@@ -194,6 +200,7 @@ actions.
 - The `orchestrator-handoff` lock is a leaf: start holds it for handoff consumption; close validates flags, loads active/archive state, gathers candidates, and checks Git before locking, then holds it only for previous-handoff read, dedupe/render, and atomic write. Never acquire task/scheduler locks while holding it.
 - Handoff `done` entries dedupe by task id against the previous handoff (same-second boundary). Don't simplify to a pure timestamp comparison; whole-second `now()` makes `>` and `>=` both wrong alone.
 - Every close brief requires a fresh explicit nonblank `--goal`; never restore goal inheritance. Goal and up to five repeatable `--avoid` values use `flatten_bounded_text(..., 200)`. Up to three trusted `--note` values use 160 characters, omit blanks/duplicates and the empty section, and must not contain secrets; durable facts belong in memory or this guide. Done outcomes come only from the matched accepted-event note and use 120 characters. The writer drops outcome suffixes, then reduces done/decisions, then next/unresolved with accurate overflow markers to stay at most 4000 characters.
+- At request completion, pass every unique task id created for that request to repeatable `stats --task ID`; copy its single sentence into the final response. It counts retries and classifies default/custom/malformed tiers as `other levels`. If no task was created, state the explicit zero breakdown. Close still reports all runtime launches for continuity, but that fallback may span requests and must never be relabeled as request-scoped.
 - `cap_hook_output` returning `""` (and adapters emitting nothing, exit 0) is deliberate fail-open, spec'd behavior — don't "fix" silence into errors, and keep every emission ≤ 9000 chars including edge lines.
 - `hooks claude-code --write` must merge idempotently (detected by exact command string) and never drop existing entries; refusal on invalid JSON is intentional (no partial writes).
 - `--ignore-rules` in the default Hermes worker command is deliberate memory hygiene (keeps model config). Do not swap in `--safe-mode` (drops user config, loses the model) or `hermes memory reset` (destructive).

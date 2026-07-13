@@ -24,3 +24,6 @@ jobs:
           python3 -m py_compile framework/baton tests/test_baton.py tools/measure_context.py tests/test_context_footprint.py
           python3 tests/test_baton.py
           python3 tests/test_context_footprint.py
+          python3 tools/measure_context.py --json > context-1.json
+          python3 tools/measure_context.py --json > context-2.json
+          cmp context-1.json context-2.json

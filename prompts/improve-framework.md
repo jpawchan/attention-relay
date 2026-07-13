@@ -58,6 +58,17 @@ Check these behaviors with temporary Git repositories and stub workers:
     stderr when Baton state is missing or broken.
 18. Claude Code settings merges are idempotent and do not clobber existing
     settings or hook arrays.
+19. An ordinary start brief asks the user to choose orchestrator memory/session
+    handling and hard/medium/easy model/reasoning preferences. A post-compaction
+    hook suppresses only the one-time difficulty question.
+20. A close brief counts recorded worker launches across active and archived
+    tasks, including retries, and reports a natural total with conventional and
+    other-level breakdowns without exposing commands.
+21. `stats --task ID` accepts repeatable request task ids, deduplicates them,
+    resolves active and archived tasks, rejects unknown ids before output, counts
+    retries, and prints only the copy-ready request-scoped worker breakdown.
+    Ordinary `stats` output remains unchanged, and manuals never present the
+    runtime-wide close count as a per-request count.
 
 Read the local specification and tests when present. Compare every promise in
 the manuals with actual CLI behavior. Keep the shared-working-tree limitation

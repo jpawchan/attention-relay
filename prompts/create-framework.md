@@ -219,31 +219,55 @@ task creation, run, review/accept, and session close. Close is invoked as
 `.baton/baton orchestrator brief --phase close --goal TEXT [--note TEXT]...
 [--avoid TEXT]...`.
 
-- `start` prints a short role summary and a `Harness memory` notice of at most 12
-  lines. The notice offers Claude Code's `"autoMemoryEnabled": false`,
-  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `/memory`, and `"claudeMdExcludes"`
-  controls, including the managed-policy exclusion limit and the warning that
-  `claude --bare` disables hooks. It offers Hermes `--ignore-rules`, warns that
-  `--safe-mode` drops user config and `hermes memory reset` is destructive, and
-  says framework workers are already clean by default. The orchestrator shares
-  these choices in its first response and never auto-applies one. Start also
-  checks the conventional tier tables `[tiers.hard]`, `[tiers.medium]`,
-  and `[tiers.easy]`. While any are absent, it prints exactly one `Difficulty
-  levels:` section of at most 12 lines naming configured and missing conventional
-  levels. The section directs the orchestrator to ask the user to configure the
-  requested routes: hard is GPT 5.6 Sol/high/elite senior, medium is GPT 5.6
-  Sol/medium/elite senior, and easy is Claude Code Opus 4.8/xhigh/senior with GPT
-  5.6 Terra/high only when Claude usage is exhausted.
-  It includes commented, copy-ready TOML tables for only the missing levels;
-  stripping each leading `# ` produces valid TOML. Hard uses the memory-clean
-  Hermes pattern, while medium and easy name local wrapper/profile skeletons
-  required to implement their effort and exhaustion semantics. It notes that per-level `worker_timeout_minutes` and
-  `capsule_max_chars` are optional, that Hermes has no per-invocation reasoning
-  override so reasoning follows the harness's own configuration, and that every
-  task needs an explicitly selected validated tier. The section is absent only when all
-  three tables exist. Baton never prompts interactively, registers a level,
-  chooses a fallback, schedules from these names, or writes configuration. Start
-  also prints the current handoff when present, task counts, unresolved
+- `start` prints a short role summary and a copy-ready `Harness memory` question
+  in a notice of at most 12 lines. It asks the user to choose either the existing
+  harness memory/project rules or a fresh orchestrator session. It recommends a
+  fresh session for a new goal because old conversation history, stale
+  assumptions, unrelated instructions, and accumulated tool output are then less
+  likely to compete with the goal and Baton protocol. It also states the cost:
+  unpersisted context disappears, so relevant facts first belong in project
+  memory or a Baton handoff. Fresh-start instructions say to close continuing
+  Baton work first, open a new harness conversation/session (optionally naming
+  Hermes `/new`), and provide `prompts/use-framework.md` or ask the new agent to
+  read `.baton/orchestrator.md` and run the start brief.
+
+  The notice says every worker launch uses a fresh task process/context. It makes
+  the narrower memory-isolation boundary explicit: the included Hermes worker
+  command uses `--ignore-rules`, while custom commands have equivalent isolation
+  only when configured with the harness's corresponding option. It retains Claude
+  Code's `"autoMemoryEnabled": false`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`,
+  `/memory`, and `"claudeMdExcludes"` controls, including the managed-policy
+  exclusion limit and the warning that `claude --bare` disables hooks. It offers
+  Hermes `--ignore-rules`, warns that `--safe-mode` drops user config and
+  `hermes memory reset` is destructive, and never applies a harness change.
+
+  Every ordinary start also prints exactly one `Difficulty levels:` section of at
+  most 12 lines, even when `[tiers.hard]`, `[tiers.medium]`, and `[tiers.easy]`
+  all exist. Its copy-ready question identifies the agent as the Baton
+  orchestrator and asks for model and reasoning-level preferences for all three
+  levels. It gives a compact reply shape with examples such as `hard = GPT 5.6
+  Sol with xhigh reasoning` and `medium = Claude Opus 4.8 with xhigh reasoning`,
+  and the choices `use the current settings` and `use the defaults`. The
+  documented defaults remain GPT 5.6 Sol/high for hard, GPT 5.6 Sol/medium for
+  medium, and Claude Code Opus 4.8/xhigh for easy with GPT 5.6 Terra/high only
+  when Claude usage is exhausted. A safe current
+  summary uses only validated display metadata or `unlabeled worker`; it never
+  prints commands, paths, flags, provider internals, or credentials.
+
+  After an explicit answer, the protocol requires updating only relevant
+  conventional-tier command/display configuration, preserving or creating the
+  harness wrappers/profiles needed to make the model and reasoning settings real,
+  validating, running `.baton/baton tiers`, and restating all three effective
+  preferences before task assignment. Display-only relabeling is insufficient.
+  Missing tiers additionally receive commented, copy-ready TOML skeletons only
+  for those tiers; stripping each leading `# ` produces valid TOML. Hard uses the
+  included memory-isolated Hermes pattern, while medium and easy name local
+  wrapper/profile skeletons. Per-level limits remain optional, Hermes reasoning
+  follows its configured profile/wrapper, and task creation still needs an
+  explicit validated tier. Baton never prompts interactively, auto-selects a
+  preference, registers a level, chooses a fallback, or writes configuration
+  before the user's answer. Start also prints the current handoff when present,
+  task counts, unresolved
   decision/review ids, and one recommended next command. Directly beneath the
   ids-only decision line it prints at most two available worker questions,
   flattened to one line, stripped of ANSI and C0/C1 controls, bounded to 160
@@ -341,8 +365,17 @@ task creation, run, review/accept, and session close. Close is invoked as
   applies the same per-pass reduction to next and then unresolved. Metadata,
   goal, warning, notes, and avoid are never naively truncated or dropped. Close
   atomically writes `.baton/orchestrator-handoff.md`, prints it, and
-  reminds the orchestrator to start a fresh session. The 8000-character handoff
-  reader and hook-output cap are unchanged.
+  then prints one deterministic runtime-wide worker-usage sentence and reminds
+  the orchestrator to start a fresh session. The sentence counts every recorded
+  `launched` history event in active and archived tasks, so retries count as
+  separate worker processes. It states the total, hard/medium/easy counts with
+  correct singular/plural grammar, and an other-level count when any default,
+  custom, missing, or malformed tier value was used. Non-object history entries,
+  entries whose event is not exactly `launched`, and non-list histories are
+  ignored. The sentence says `for this Baton runtime so far` because state does
+  not prove that all launches belong to one user request. It is continuity and
+  audit evidence only and must never be presented as a request-scoped count. The
+  8000-character handoff reader and hook-output cap are unchanged.
 
 With the default accept gate enabled, `task accept --brief TOKEN` requires the
 stored token for that task's current attempt. Under the task lock and before any
@@ -369,10 +402,11 @@ explicitly labeled `worker question:`; a missing or non-text question leaves an
 id-only decision line. The block otherwise derives report paths or create/run
 commands from current task state and contains no generic advice.
 
-`.baton/baton stats` is an orchestrator-only, read-only aggregate over active and
-archived task state and work. With no task state it prints exactly `no task data`.
-Otherwise it prints deterministic bounded sections for status counts, a
-histogram of tasks' current attempt numbers, failed/blocked reason-code counts,
+`.baton/baton stats` is orchestrator-only and read-only. Without `--task`, it is
+an aggregate over active and archived task state and work. With no task state it
+prints exactly `no task data`. Otherwise it prints deterministic bounded
+sections for status counts, a histogram of tasks' current attempt numbers,
+failed/blocked reason-code counts,
 launched-capsule character sizes (minimum, lower-middle median for an even count,
 and maximum), per-phase receipt coverage, and a post-submission warning count.
 Status and count entries are sorted; variable count sections show at most 12
@@ -387,6 +421,21 @@ Receipt coverage counts attempts represented by a launch or a valid receipt and
 is labeled `command-use evidence, not proof of attention`. Stats reads archived
 receipts from the work directories moved by `archive`; it acquires no
 write-capable lock and creates or changes no runtime file.
+
+One or more repeatable `.baton/baton stats --task ID` values switch the command
+to request-scoped worker accounting. Before printing anything, Baton validates
+each id, deduplicates repeated ids in first-seen order, resolves tasks across
+active and archived state, and rejects an unknown id. It then prints exactly one
+copy-ready sentence: `I used N worker(s) for this request: H on hard, M on
+medium, and E on easy.`, adding `and O on other levels` only when needed. Every
+recorded `launched` event counts, so retries are separate workers. Default,
+custom, missing, non-text, and otherwise non-conventional tiers count as other;
+commands, paths, flags, provider internals, history free text, and credentials
+are never printed. No-filter aggregate output is byte-unchanged. The
+orchestrator passes every unique task id created for the completed user request
+and copies the sentence into its final response. When a request created no Baton
+task, it states the explicit zero sentence instead of inventing an id. The
+runtime-wide close sentence is never substituted for this request boundary.
 
 `.baton/baton tiers` is orchestrator-only and read-only. It prints one deterministic
 block for `default` followed by each configured tier in sorted name order. Each
@@ -418,8 +467,9 @@ The matcher-free `SessionStart` entry fires at startup and after automatic or
 manual compaction; post-compaction stdin carries `"source": "compact"`. Claude
 adds SessionStart stdout back to session context. `.baton/baton hook-event
 session-start` normally emits the same plain stdout as the start-phase
-orchestrator brief. For a compact source, it omits the `Difficulty levels:`
-section and prefixes the otherwise unchanged brief with the single line
+orchestrator brief. For a compact source, it omits only the one-time `Difficulty
+levels:` preference section and prefixes the otherwise unchanged brief with the
+single line
 `Baton: context was compacted; state re-injected below.` so the new
 context is explicitly re-grounded. PreCompact stdout does not reach Claude's
 summarizer or the resulting context, so this integration intentionally has no
@@ -600,7 +650,8 @@ accept_requires_brief = true
 
 The default worker command is harness-memory-clean: `--ignore-rules` suppresses
 automatic rules, saved memory, and preloaded skills while preserving the user's
-configured model and reasoning.
+configured model and reasoning. This guarantee does not extend to a custom
+worker command unless its harness's equivalent isolation option is configured.
 
 `max_parallel` and `capsule_max_chars` are positive integers. The capsule limit
 defaults to 4000 characters. The timeout is a finite non-negative number in

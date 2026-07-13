@@ -47,26 +47,18 @@ class ContextFootprintTests(unittest.TestCase):
             )
         brief = artifacts["generated_start_brief"].decode("utf-8")
         manual = artifacts["installed_orchestrator_manual"].decode("utf-8")
-        self.assertNotIn("Difficulty levels:", brief)
+        self.assertIn("Difficulty levels:", brief)
+        self.assertIn("use the current settings", brief)
         self.assertIn("GPT 5.6 Sol", manual)
-        self.assertIn("Claude Code\nOpus 4.8", manual)
+        self.assertIn("Claude Code Opus 4.8", manual)
 
-    def test_recorded_provider_differential_is_ingested_and_labeled(self):
+    def test_default_result_uses_only_reproducible_offline_estimates(self):
         result = MEASURE.measure(ROOT)
         rendered = MEASURE.render_text(result)
         for model in ("GPT 5.6 Sol", "Claude Opus 4.8"):
             self.assertIn(model, rendered)
-        self.assertEqual(rendered.count("PROVIDER-REPORTED DIFFERENTIAL"), 2)
-        self.assertEqual(
-            result["token_counts"]["gpt_5_6_sol"]["provider_reported_differential_tokens"],
-            3426,
-        )
-        self.assertEqual(
-            result["token_counts"]["claude_opus_4_8"]["provider_reported_differential_tokens"],
-            5323,
-        )
-        self.assertIn("uncached input + cache-read input + cache-write input", rendered)
-        self.assertIn("offline_fallback_estimate=3782", rendered)
+        self.assertEqual(rendered.count("ESTIMATE — authoritative"), 2)
+        self.assertNotIn("PROVIDER-REPORTED DIFFERENTIAL", rendered)
         self.assertIn("characters=", rendered)
         self.assertIn("bytes=", rendered)
         self.assertIn("lines=", rendered)
@@ -78,11 +70,10 @@ class ContextFootprintTests(unittest.TestCase):
         self.assertIn("conservative_range_tokens=", rendered)
 
         evidence = json.loads(MEASURE.PROVIDER_EVIDENCE.read_text(encoding="utf-8"))
-        evidence["payload_bytes"] += 1
         with tempfile.TemporaryDirectory(prefix="baton-context-evidence-") as temporary:
             path = Path(temporary) / "evidence.json"
             path.write_text(json.dumps(evidence), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "does not match"):
+            with self.assertRaisesRegex(ValueError, "retired"):
                 MEASURE.measure(ROOT, provider_evidence=path)
 
 if __name__ == "__main__":

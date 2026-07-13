@@ -376,17 +376,25 @@ def conventional_level_names(config):
 
 def difficulty_levels_lines(config):
     configured, missing = conventional_level_names(config)
-    if not missing:
-        return []
-    configured_text = ", ".join(configured) or "none"
     lines = [
         "Difficulty levels:",
-        "- Configured conventional levels: {}; missing: {}.".format(
-            configured_text, ", ".join(missing),
-        ),
-        "- Ask the USER to configure the requested routes: hard=GPT 5.6 Sol/high/elite senior; medium=GPT 5.6 Sol/medium/elite senior; easy=Claude Code Opus 4.8/xhigh/senior with GPT 5.6 Terra/high only when Claude usage is exhausted.",
-        "- Copy-ready routing skeleton for only the missing levels (strip `# `; use local wrappers/profiles that match framework/config.example.toml); per-level worker_timeout_minutes/capsule_max_chars are optional:",
+        '- Ask the user: "I’m the Baton orchestrator. Before I assign tasks, do you have model and reasoning-level preferences for hard, medium, and easy tasks? Reply as `hard = …, medium = …, easy = …`; for example, `hard = GPT 5.6 Sol with xhigh reasoning` and `medium = Claude Opus 4.8 with xhigh reasoning`. If all three are configured, say `use the current settings` to keep them unchanged. Say `use the defaults` to replace or fill them with Baton’s documented defaults."',
+        "- Current safe settings: " + "; ".join(
+            "{}: {}".format(
+                name,
+                worker_display_label(configured_tier(config, name))
+                if name in configured else "not configured",
+            )
+            for name in CONVENTIONAL_LEVELS
+        ) + ".",
+        "- After the user answers explicitly, update only the relevant `[tiers.hard]`, `[tiers.medium]`, and `[tiers.easy]` command/display settings; preserve or create the harness wrappers or profiles that make the requested model and reasoning real; validate the configuration, run `.baton/baton tiers`, and restate the effective hard, medium, and easy preferences before assigning tasks.",
     ]
+    if missing:
+        lines.append(
+            "- Missing levels: {}. Copy only their skeletons below (strip `# `); per-level worker_timeout_minutes/capsule_max_chars are optional:".format(
+                ", ".join(missing),
+            )
+        )
     for name in missing:
         command = {
             "hard": "hermes chat -Q -t terminal,file --source tool --ignore-rules -m GPT-5.6-Sol -q {prompt}",
@@ -398,8 +406,7 @@ def difficulty_levels_lines(config):
             "# command = {}".format(json.dumps(command)),
         ))
     lines.extend((
-        "- Hermes exposes no per-invocation reasoning override; reasoning follows the harness's own config.",
-        "- Baton never configures or selects a level automatically; task creation requires an explicit validated --tier.",
+        "- Hermes exposes no per-invocation reasoning override, so use a matching profile or wrapper; Baton never changes configuration or selects a level automatically, and task creation still requires an explicit validated --tier.",
     ))
     return lines
 
@@ -2197,14 +2204,16 @@ def orchestrator_start_brief(
     say("- Run only non-conflicting work and resolve worker decisions.")
     say("- Review reports and diffs before accepting any task.")
     say("\nHarness memory:")
-    say("- Choose inherited memory/rules or a clean start; no change is applied automatically.")
+    say('- Ask the user: "Before we plan, would you like me to (1) use your existing harness memory and project rules, or (2) start the Baton orchestrator in a fresh harness session? A fresh session is usually better for a new goal: old conversation history, stale assumptions, unrelated instructions, and accumulated tool output are less likely to compete with the current goal and Baton protocol. The tradeoff is that unpersisted context disappears, so first save relevant facts in project memory or a Baton handoff."')
+    say("- To start fresh while continuing Baton work, run a close brief first, open a new conversation or session (Hermes `/new`, for example), then provide `prompts/use-framework.md` or ask the agent to read `.baton/orchestrator.md` and run `.baton/baton orchestrator brief --phase start`.")
+    say("- Baton launches each worker in a fresh task process and context. The included Hermes worker command also uses --ignore-rules so harness memory and project rules are not injected.")
+    say("- A custom worker command has that memory isolation only if it keeps the equivalent isolation option for its harness.")
     say('- Claude Code: disable auto-memory via settings "autoMemoryEnabled": false, env CLAUDE_CODE_DISABLE_AUTO_MEMORY=1, or the /memory toggle.')
     say('- Skip loaded CLAUDE.md files with "claudeMdExcludes" globs; managed-policy CLAUDE.md cannot be excluded.')
     say("- claude --bare = strongest clean start but ALSO disables hooks (conflicts with hook-based injection).")
     say("- Hermes: add --ignore-rules to the command (keeps model config).")
     say("- Do not use --safe-mode: it drops user config, including the configured model.")
     say("- `hermes memory reset` is destructive.")
-    say("- Workers launched by this framework are already clean by default via the config worker command.")
     if include_levels_ask:
         level_lines = difficulty_levels_lines(load_config(baton_dir))
         if level_lines:
@@ -2495,12 +2504,63 @@ def working_tree_state(root):
         return None
 
 
+def worker_usage_sentence(tasks, for_request=False):
+    """Summarize recorded worker launches for a request or the whole runtime."""
+    counts = {name: 0 for name in CONVENTIONAL_LEVELS}
+    other = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        history = task.get("history", [])
+        if not isinstance(history, list):
+            continue
+        launches = sum(
+            1 for entry in history
+            if isinstance(entry, dict) and entry.get("event") == "launched"
+        )
+        tier = task.get("tier")
+        if isinstance(tier, str) and tier in counts:
+            counts[tier] += launches
+        else:
+            other += launches
+
+    total = sum(counts.values()) + other
+    if for_request:
+        phrases = ["{} on {}".format(counts[level], level)
+                   for level in CONVENTIONAL_LEVELS]
+        if other:
+            phrases.append("{} on other levels".format(other))
+        breakdown = ", ".join(phrases[:-1]) + ", and " + phrases[-1]
+        return "I used {} worker{} for this request: {}.".format(
+            total, "s" if total != 1 else "", breakdown,
+        )
+
+    def level_phrase(count, level):
+        if count == 1:
+            article = "an" if level[0] in "aeiou" else "a"
+            return "1 for {} {} task".format(article, level)
+        return "{} for {} tasks".format(count, level)
+
+    phrases = [level_phrase(counts[level], level) for level in CONVENTIONAL_LEVELS]
+    if other:
+        phrases.append("{} for other level{}".format(other, "s" if other != 1 else ""))
+    breakdown = ", ".join(phrases[:-1]) + ", and " + phrases[-1]
+    return "I used {} worker{} for this Baton runtime so far: {}.".format(
+        total, "s" if total != 1 else "", breakdown,
+    )
+
+
 def orchestrator_close_brief(
         baton_dir, tasks, archived_tasks, goal, avoid_notes, notes, working_tree):
     done_candidates = []
     decisions = []
     for task in tasks + archived_tasks:
-        for entry in task.get("history", []):
+        history = task.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
             if entry.get("event") == "accepted":
                 done_candidates.append((
                     entry.get("at", ""), task["id"], task.get("title", ""),
@@ -2531,13 +2591,14 @@ def orchestrator_close_brief(
         )
         atomic_write(orchestrator_handoff_path(baton_dir), content)
     say(content.rstrip())
+    say(worker_usage_sentence(tasks + archived_tasks))
     say("Start a fresh session, then run: .baton/baton orchestrator brief --phase start")
 
 
 def cmd_orchestrator_brief(args):
     require_orchestrator()
     baton_dir = require_baton_dir()
-    tasks = load_all_tasks(baton_dir)
+    tasks = load_all_tasks(baton_dir, validate_history=args.phase != "close")
     if args.include_log_tail and args.phase != "review":
         die("--include-log-tail is valid only for the review phase")
     if args.goal is not None and args.phase != "close":
@@ -2576,7 +2637,7 @@ def cmd_orchestrator_brief(args):
     elif args.phase == "run":
         orchestrator_run_brief(baton_dir, tasks)
     else:
-        archived_tasks = load_archived_tasks(baton_dir)
+        archived_tasks = load_archived_tasks(baton_dir, validate_history=False)
         tree_state = working_tree_state(project_root(baton_dir))
         orchestrator_close_brief(
             baton_dir, tasks, archived_tasks, goal, avoid_notes, notes, tree_state,
@@ -3486,12 +3547,40 @@ def cmd_tiers(args):
         say("Conventional levels missing: " + ", ".join(missing))
 
 
+def request_tasks_by_id(task_ids, active, archived):
+    """Resolve a deduplicated request boundary before emitting any statistics."""
+    by_id = {
+        task.get("id"): task for task in active + archived
+        if isinstance(task, dict) and isinstance(task.get("id"), str)
+    }
+    selected = []
+    seen = set()
+    for task_id in task_ids:
+        try:
+            validate_task_id(task_id)
+        except ValueError as error:
+            die(str(error))
+        if task_id in seen:
+            continue
+        if task_id not in by_id:
+            die("unknown task " + task_id)
+        seen.add(task_id)
+        selected.append(by_id[task_id])
+    return selected
+
+
 def cmd_stats(args):
     """Print bounded aggregate runtime evidence without write-capable locks."""
     require_orchestrator()
     baton_dir = require_baton_dir()
     active = load_all_tasks(baton_dir)
     archived = load_archived_tasks(baton_dir)
+    if args.task_ids:
+        say(worker_usage_sentence(
+            request_tasks_by_id(args.task_ids, active, archived),
+            for_request=True,
+        ))
+        return
     located_tasks = [(task, False) for task in active] + [
         (task, True) for task in archived
     ]
@@ -4206,7 +4295,11 @@ def build_parser():
     command = commands.add_parser("status", help="show tasks needing attention")
     command.set_defaults(function=cmd_status)
 
-    command = commands.add_parser("stats", help="show read-only aggregate task statistics")
+    command = commands.add_parser("stats", help="show read-only task statistics")
+    command.add_argument(
+        "--task", dest="task_ids", action="append", default=[], metavar="ID",
+        help="report worker use for one request task (repeatable)",
+    )
     command.set_defaults(function=cmd_stats)
 
     command = commands.add_parser("tiers", help="show effective worker tier settings")

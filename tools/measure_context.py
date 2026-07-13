@@ -105,6 +105,8 @@ def estimated_tokens(byte_count: int) -> dict[str, object]:
 def load_provider_evidence(path: Path, payload: bytes) -> dict[str, object]:
     """Validate recorded provider usage evidence without making a network request."""
     evidence = json.loads(path.read_text(encoding="utf-8"))
+    if evidence.get("status") == "retired":
+        raise ValueError("provider evidence is retired and does not apply to this revision")
     payload_hash = hashlib.sha256(payload).hexdigest()
     if evidence.get("payload_bytes") != len(payload) or evidence.get("payload_sha256") != payload_hash:
         raise ValueError("provider evidence does not match the generated activation payload")
@@ -185,7 +187,7 @@ def generate_artifacts(repo_root: Path, project: Path) -> dict[str, bytes]:
 def measure(
         repo_root: Path,
         keep_artifacts: Path | None = None,
-        provider_evidence: Path | None = PROVIDER_EVIDENCE,
+        provider_evidence: Path | None = None,
 ) -> dict[str, object]:
     repo_root = repo_root.resolve()
     with tempfile.TemporaryDirectory(prefix="baton-context-") as temporary:
@@ -275,8 +277,8 @@ def main() -> int:
     parser.add_argument("--keep-artifacts", type=Path)
     evidence = parser.add_mutually_exclusive_group()
     evidence.add_argument(
-        "--provider-evidence", type=Path, default=PROVIDER_EVIDENCE,
-        help="recorded provider differential JSON (default: bundled evidence)",
+        "--provider-evidence", type=Path,
+        help="applicable live provider differential JSON (default: offline estimate)",
     )
     evidence.add_argument(
         "--offline-estimate-only", action="store_true",

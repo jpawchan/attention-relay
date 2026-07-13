@@ -916,7 +916,7 @@ class BatonTests(unittest.TestCase):
         )
         self.assertNotIn(".baton/baton task decide +1 more", started.stdout)
 
-    def test_start_brief_difficulty_levels_are_missing_only_parseable_and_bounded(self):
+    def test_start_brief_difficulty_levels_are_parseable_bounded_and_missing_only(self):
         project = self.make_project()
 
         def difficulty_section(output):
@@ -931,11 +931,11 @@ class BatonTests(unittest.TestCase):
         section = difficulty_section(started)
         self.assertLessEqual(len(section), 12)
         self.assertIn(
-            "- Configured conventional levels: none; missing: hard, medium, easy.",
+            "- Current safe settings: hard: not configured; medium: not configured; easy: not configured.",
             section,
         )
         self.assertTrue(any(
-            "Ask the USER" in line and "GPT 5.6 Sol/high/elite senior" in line
+            "Ask the user:" in line and "model and reasoning-level preferences" in line
             for line in section
         ))
         snippet = "\n".join(
@@ -973,9 +973,10 @@ class BatonTests(unittest.TestCase):
         partial_section = difficulty_section(partial)
         self.assertLessEqual(len(partial_section), 12)
         self.assertIn(
-            "- Configured conventional levels: hard; missing: medium, easy.",
+            "- Current safe settings: hard: unlabeled worker; medium: not configured; easy: not configured.",
             partial_section,
         )
+        self.assertTrue(any("Missing levels: medium, easy." in line for line in partial_section))
         partial_snippet = "\n".join(
             line.removeprefix("# ")
             for line in partial_section if line.startswith("# ")
@@ -993,7 +994,11 @@ class BatonTests(unittest.TestCase):
         complete = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
-        self.assertNotIn("Difficulty levels:", complete)
+        complete_section = difficulty_section(complete)
+        self.assertLessEqual(len(complete_section), 12)
+        self.assertIn("- Current safe settings: hard: unlabeled worker; medium: unlabeled worker; easy: unlabeled worker.", complete_section)
+        self.assertNotIn("Missing levels:", "\n".join(complete_section))
+        self.assertFalse(any(line.startswith("# ") for line in complete_section))
 
     def test_worker_role_and_live_runner_guards(self):
         project = self.make_project()
@@ -1920,6 +1925,184 @@ class BatonTests(unittest.TestCase):
         self.assertIn("template placeholder", failed.stderr)
         self.assertFalse((work / "review-brief-token.json").exists())
 
+    def test_start_brief_asks_copy_ready_harness_memory_choice(self):
+        project = self.make_project()
+        started = self.baton(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        ).stdout
+        harness = started.split("Harness memory:\n", 1)[1].split(
+            "\n\nDifficulty levels:", 1,
+        )[0]
+        self.assertIn("Ask the user:", harness)
+        for text in (
+            "use your existing harness memory and project rules",
+            "start the Baton orchestrator in a fresh harness session",
+            "old conversation history, stale assumptions, unrelated instructions",
+            "accumulated tool output",
+            "current goal and Baton protocol",
+            "unpersisted context disappears",
+            "project memory or a Baton handoff",
+            "run a close brief first",
+            "new conversation or session",
+            "Hermes `/new`",
+            "prompts/use-framework.md",
+            "read `.baton/orchestrator.md`",
+            ".baton/baton orchestrator brief --phase start",
+            "fresh task process and context",
+            "equivalent isolation option",
+        ):
+            self.assertIn(text, harness)
+
+    def test_start_brief_asks_for_difficulty_preferences_until_compaction(self):
+        project = self.make_project()
+        runtime = project / ".baton"
+        config = """[commands]
+worker = "/usr/bin/true {prompt_file}"
+
+[tiers.hard]
+[tiers.hard.display]
+model = "GPT 5.6 Sol"
+effort = "xhigh"
+
+[tiers.medium]
+[tiers.medium.display]
+model = "Claude Opus 4.8"
+effort = "xhigh"
+
+[tiers.easy]
+[tiers.easy.display]
+model = "Local Small"
+effort = "low"
+"""
+        (runtime / "config.toml").write_text(config)
+        started = self.baton(
+            project, "orchestrator", "brief", "--phase", "start", check=True,
+        ).stdout
+        section = started.split("\nDifficulty levels:\n", 1)[1].split("\n\n", 1)[0]
+        for text in (
+            "I’m the Baton orchestrator",
+            "model and reasoning-level preferences for hard, medium, and easy tasks",
+            "hard = GPT 5.6 Sol with xhigh reasoning",
+            "medium = Claude Opus 4.8 with xhigh reasoning",
+            "use the current settings",
+            "keep them unchanged",
+            "use the defaults",
+            "replace or fill them with Baton’s documented defaults",
+            "Current safe settings:",
+            "hard: model=GPT 5.6 Sol; effort=xhigh",
+            "validate the configuration",
+            "run `.baton/baton tiers`",
+            "restate the effective hard, medium, and easy preferences",
+            "preserve or create the harness wrappers or profiles",
+        ):
+            self.assertIn(text, section)
+        self.assertNotIn("/usr/bin/true", section)
+        self.assertNotIn("{prompt_file}", section)
+
+        compact = subprocess.run(
+            [runtime / "baton", "hook-event", "session-start"],
+            cwd=project, input='{"source":"compact"}', text=True,
+            capture_output=True,
+        )
+        self.assertEqual(compact.returncode, 0)
+        self.assertNotIn("Difficulty levels:", compact.stdout)
+        self.assertIn("Harness memory:", compact.stdout)
+        self.assertIn("Ask the user:", compact.stdout)
+
+    def test_close_brief_counts_worker_launches_across_retries_and_archives(self):
+        project = self.make_project()
+        runtime = project / ".baton"
+        active = [
+            {
+                "id": "T900-hard", "title": "hard", "status": "done", "tier": "hard",
+                "history": [
+                    {"event": "launched", "attempt": 1},
+                    {"event": "worker_exited", "attempt": 1},
+                    {"event": "launched", "attempt": 2},
+                    None,
+                    {"event": 7},
+                ],
+            },
+            {
+                "id": "T901-easy", "title": "easy", "status": "queued", "tier": "easy",
+                "history": [{"event": "launched"}] * 3,
+            },
+            {
+                "id": "T902-custom", "title": "custom", "status": "done",
+                "tier": "private-route", "history": [{"event": "launched"}],
+            },
+            {
+                "id": "T905-malformed", "title": "malformed", "status": "done",
+                "tier": "hard", "history": "launched",
+            },
+            {
+                "id": "T906-unhashable", "title": "unhashable", "status": "done",
+                "tier": [], "history": [{"event": "launched"}],
+            },
+        ]
+        archived = [
+            {
+                "id": "T903-medium", "title": "medium", "status": "done",
+                "tier": "medium", "history": [{"event": "launched"}],
+            },
+            {
+                "id": "T904-default", "title": "default", "status": "done",
+                "tier": "default", "history": [{"event": "launched"}],
+            },
+        ]
+        expected = (
+            "I used 9 workers for this Baton runtime so far: 2 for hard tasks, "
+            "1 for a medium task, 3 for easy tasks, and 3 for other levels."
+        )
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_worker_count_probe")
+        self.assertEqual(
+            module["worker_usage_sentence"]([]),
+            "I used 0 workers for this Baton runtime so far: 0 for hard tasks, "
+            "0 for medium tasks, and 0 for easy tasks.",
+        )
+        self.assertEqual(
+            module["worker_usage_sentence"]([{
+                "tier": "hard", "history": [{"event": "launched"}],
+            }]),
+            "I used 1 worker for this Baton runtime so far: 1 for a hard task, "
+            "0 for medium tasks, and 0 for easy tasks.",
+        )
+        self.assertEqual(
+            module["worker_usage_sentence"]([{
+                "tier": [], "history": [{"event": "launched"}],
+            }]),
+            "I used 1 worker for this Baton runtime so far: 0 for hard tasks, "
+            "0 for medium tasks, 0 for easy tasks, and 1 for other level.",
+        )
+        self.assertEqual(module["worker_usage_sentence"](active + archived), expected)
+        self.assertEqual(
+            module["worker_usage_sentence"]([], for_request=True),
+            "I used 0 workers for this request: 0 on hard, 0 on medium, and 0 on easy.",
+        )
+        self.assertEqual(
+            module["worker_usage_sentence"]([{
+                "tier": [], "history": [{"event": "launched"}],
+            }], for_request=True),
+            "I used 1 worker for this request: 0 on hard, 0 on medium, "
+            "0 on easy, and 1 on other levels.",
+        )
+        emitted = []
+        module["orchestrator_close_brief"].__globals__["say"] = emitted.append
+        module["orchestrator_close_brief"](
+            runtime, active, archived, "next goal", [], [], False,
+        )
+        self.assertIn(expected, emitted)
+
+        for task in active:
+            (runtime / "tasks" / (task["id"] + ".json")).write_text(json.dumps(task))
+        for task in archived:
+            (runtime / "archive" / (task["id"] + ".json")).write_text(json.dumps(task))
+        closed = self.baton(
+            project, "orchestrator", "brief", "--phase", "close",
+            "--goal", "next goal", check=True,
+        )
+        self.assertIn(expected, closed.stdout)
+
     def test_orchestrator_phase_handoff_and_next_action_capsules(self):
         project = self.make_project()
         self.configure(project, self.write_worker(GOOD_WORKER))
@@ -1942,7 +2125,7 @@ class BatonTests(unittest.TestCase):
             "--ignore-rules",
             "--safe-mode: it drops user config",
             "hermes memory reset` is destructive",
-            "already clean by default via the config worker command",
+            "included Hermes worker command also uses --ignore-rules",
         ):
             self.assertIn(control, harness)
         plan = self.baton(
@@ -3660,6 +3843,76 @@ class BatonTests(unittest.TestCase):
         )
         self.assertNotIn("private failure text", stats.stdout)
 
+    def test_stats_request_worker_count_filters_active_and_archived_tasks(self):
+        project = self.make_project()
+        runtime = project / ".baton"
+        hard, medium, easy, other = [
+            self.create_task(project, title, [f"{title}/**"])
+            for title in ("hard", "medium", "easy", "other")
+        ]
+
+        medium_path = runtime / "tasks" / f"{medium}.json"
+        medium_state = json.loads(medium_path.read_text())
+        medium_state["status"] = "done"
+        medium_state["tier"] = "medium"
+        medium_state["history"] = [{"event": "launched", "attempt": 1}]
+        medium_path.write_text(json.dumps(medium_state))
+        self.baton(project, "archive", check=True)
+
+        for task_id, tier, launches in (
+                (hard, "hard", 2),
+                (easy, "easy", 3),
+                (other, [], 1)):
+            path = runtime / "tasks" / f"{task_id}.json"
+            state = json.loads(path.read_text())
+            state["tier"] = tier
+            state["history"] = [
+                {"event": "launched", "attempt": attempt}
+                for attempt in range(1, launches + 1)
+            ]
+            path.write_text(json.dumps(state))
+
+        request_stats = self.baton(
+            project, "stats",
+            "--task", hard,
+            "--task", medium,
+            "--task", hard,
+            "--task", easy,
+            "--task", other,
+            check=True,
+        )
+        self.assertEqual(
+            request_stats.stdout,
+            "I used 7 workers for this request: 2 on hard, 1 on medium, "
+            "3 on easy, and 1 on other levels.\n",
+        )
+        self.assertNotIn("Status counts:", request_stats.stdout)
+
+        aggregate = self.baton(project, "stats", check=True)
+        self.assertIn("Status counts:\n", aggregate.stdout)
+        self.assertNotIn("for this request", aggregate.stdout)
+
+        unknown = self.baton(
+            project, "stats", "--task", hard, "--task", "T999-unknown",
+        )
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertEqual(unknown.stdout, "")
+        self.assertIn("unknown task T999-unknown", unknown.stderr)
+        self.assertNotIn("I used", unknown.stderr)
+
+        malformed = self.baton(project, "stats", "--task", "not-a-task-id")
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertEqual(malformed.stdout, "")
+        self.assertIn("task id must look like T001-short-slug", malformed.stderr)
+
+        denied = self.baton(
+            project, "stats", "--task", hard,
+            env={"BATON_TASK_ID": "T999-worker", "BATON_ATTEMPT": "1",
+                 "BATON_LEASE": "worker"},
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
+
     def test_archive_preflights_all_destinations_before_moving(self):
         project = self.make_project()
         task_ids = [
@@ -4237,12 +4490,23 @@ module["cmd_archive"](SimpleNamespace())
         self.assertEqual(embedded, spec.rstrip())
 
         orchestrator = (ROOT / "framework" / "orchestrator.md").read_text()
+        use_prompt = (ROOT / "prompts" / "use-framework.md").read_text()
         example_text = (ROOT / "framework" / "config.example.toml").read_text()
         for text in (spec, prompt, orchestrator, example_text):
             normalized = " ".join(text.split())
             self.assertIn("GPT 5.6 Sol", normalized)
             self.assertIn("Claude Code Opus 4.8", normalized)
             self.assertIn("GPT 5.6 Terra/high", normalized)
+        for text in (orchestrator, use_prompt):
+            normalized = " ".join(text.split())
+            self.assertIn("0 workers for this request", normalized)
+        self.assertIn("stats --task ID", " ".join(use_prompt.split()))
+        self.assertIn(
+            "`--task ID` once for every unique task",
+            " ".join(orchestrator.split()),
+        )
+        self.assertIn("runtime-wide", orchestrator)
+        self.assertIn("whole Baton runtime", use_prompt)
         self.assertIn("Never omit `--tier`", orchestrator)
         self.assertIn('engineering_role = "elite senior"', example_text)
         self.assertIn('engineering_role = "senior"', example_text)

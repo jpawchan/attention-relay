@@ -1,5 +1,7 @@
 {
-  "boundary": "The exact 15126-byte activation-context.txt payload inserted between fixed inert-data markers; provider-reported logical input is uncached input + cache read + cache creation/write.",
+  "status": "retired",
+  "retired_reason": "Startup payload changed; retain only as historical live evidence and do not apply it to the current revision.",
+  "boundary": "Historical 15126-byte activation-context.txt payload inserted between fixed inert-data markers; provider-reported logical input is uncached input + cache read + cache creation/write.",
   "payload_bytes": 15126,
   "payload_sha256": "f3ca7044b52318effe0e371048e12b4fff4927be928a9d1b11827fefe80d0616",
   "logical_input_accounting": "uncached input + cache-read input + cache-write input (cache creation)",
