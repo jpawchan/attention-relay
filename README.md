@@ -1,163 +1,167 @@
-# attention relay
+# Baton
 
-## What is Attention Relay?
+## What is Baton?
 
-Attention Relay is a small delegation framework. It can improve code quality and
-reduce token use.
+Baton is a standard-library Python framework for delegating scoped coding tasks to separate agent processes under one reviewing orchestrator.
 
-You work with one orchestrator agent. It breaks your goal into tasks, sends each
-task to a separate worker, and reviews the result before accepting it.
+Fresh task contexts can keep relevant constraints easier to use and avoid carrying completed-task history into every later worker request; scoped parallelism, explicit dependencies, and central review provide additional control. These are potential quality and token-efficiency gains, not guarantees, and delegation has a fixed activation cost.
 
-Workers can use Hermes Agent, Claude Code, Codex, OpenCode, or another
-non-interactive CLI agent.
+The orchestrator turns a goal into small tasks, launches non-overlapping tasks in parallel waves, and reviews each worker's report and Git diff. Baton generates a task-specific Critical Context Capsule at both edges of every worker prompt, asks workers to re-read current briefs before consequential phases, and carries only a bounded state handoff between orchestrator sessions. Scope checks, lease-bound finish tokens, evidence-bound review tokens, and exact changed-path checks make mistakes visible before acceptance; they do not sandbox an agent that shares the user's operating-system permissions.
 
-## Why put critical context at the edges?
+The orchestrator can be any coding agent that can read files and run commands. Workers can use Hermes Agent, Claude Code, Codex, OpenCode, or another noninteractive CLI agent and may accept a prompt or prompt-file argument; optional context hooks are specific to Claude Code.
 
-Models can use context near the beginning and end more reliably than context in
-the middle. As a session grows, instructions in the middle can fade or be
-missed. The effect varies by model and task; read more in
-[Attention Decay](https://jpawchan.substack.com/p/attention-decay).
+## Why can this improve quality and reduce token use?
 
-Attention Relay puts the same Critical Context Capsule at both ends of every
-worker prompt. The capsule carries the task's objective, acceptance criteria,
-restrictions, verification commands, and summaries of worker-visible memory ids
-referenced in the task's Context section. This placement does not guarantee
-quality, but it can make critical context easier to recover.
+### Quality
 
-See [Context placement rationale](docs/context-placement.md) for the research,
-tradeoffs, and limits behind this design.
+Long agent sessions grow quickly with tool output, reasoning, corrections, and finished-subtask detail. Research shows that models can use information unevenly by position and can degrade when related facts are far apart; in practice, a growing transcript can contribute to missed constraints, stale assumptions, contradictory edits, and unsupported details. The effect depends on the model, prompt, and task, so Baton assumes no universal token threshold or sudden context cliff.
 
-Workers re-read the capsule before editing, verification, and reporting. The
-CLI stores bounded attempt-local command receipts for those phase briefs; an
-optional default-off gate can enforce edit → verify → report order. The
-report brief issues a fresh token bound to the current attempt and lease before
-`task finish`; the review brief binds its token to the current attempt and a
-SHA-256 manifest of the capsule and artifacts it displayed. `task accept`
-recomputes that manifest and refuses changed review evidence without consuming
-the token, so the reviewer can inspect the change and issue a fresh brief.
+Baton gives each fresh worker one scoped task and a generated capsule containing its objective, acceptance criteria, restrictions, verification, latest retry feedback, and summaries of explicitly referenced worker memory. The same capsule appears at both prompt edges, related constraints remain adjacent, and workers re-read phase briefs before editing, verification, and reporting. The orchestrator then reviews bounded evidence—the report, declared and observed paths, and Git diff—rather than trusting completion text alone. Fresh context, narrow scope, evidence review, and edge placement reduce avoidable context pressure; they cannot repair an incorrect task specification or guarantee a correct implementation.
 
-At session close, the orchestrator writes a bounded handoff from current state.
-The next start brief prints and consumes that handoff. Output from `status`,
-`task show`, and each completed real `run` also ends with a short, state-derived
-`Next actions` capsule.
+No cited study or Baton benchmark directly compares GPT 5.6 Max with GPT 5.6 Sol at xhigh. Nominal context capacity does not mean that every part of a long context is used uniformly: routing a scoped task to a fresh GPT 5.6 Sol at xhigh worker may reduce irrelevant live context, while GPT 5.6 Max may make direct execution preferable for some goals. Baton does not claim that either route universally wins.
 
-Orchestrators can run `.attention-relay/relay stats` for a read-only aggregate
-over active and archived status, attempts, reason codes, capsule sizes, phase
-receipt coverage, and post-submission warnings. Receipt coverage is command-use
-evidence, not proof of attention.
+### Token consumption
 
-Task tiers are explicit rather than fallback labels. `default` uses the global
-worker command and limits; each other tier must be configured and may override
-the command, worker timeout, and capsule budget independently. Run
-`.attention-relay/relay tiers` to inspect effective settings without printing
-worker command flags. Until all three optional conventional tiers (`hard`,
-`medium`, and `easy`) are configured, the start brief asks the orchestrator to
-ask you which models they should use and prints missing-only TOML to copy. Relay
-does not register, select, or write these tiers automatically.
+In a single growing conversation, completed-task detail becomes dead context: it may remain in the model's logical input and context window, and depending on provider caching and pricing, may also be billed again on later requests. Baton starts each worker with a fresh task context, while the orchestrator receives the worker's report and relevant diff instead of the worker's full transcript.
 
-## How is this different from Agent Relay?
+This can reduce repeated irrelevant input on multi-task goals, but every worker also incurs harness and Baton context. Small goals can cost fewer tokens when executed directly.
 
-- **Edge placement:** a deterministic task capsule appears at both ends of each
-  worker prompt.
-- **Freshness gates:** finish can require a brief token for the current lease and
-  attempt; accept can additionally bind its token to the exact displayed review
-  evidence.
-- **Bounded evidence:** phase receipts and read-only stats expose command-use
-  coverage without storing prompts, logs, or tokens in receipt records.
-- **Handoff:** close and start briefs carry current state between orchestrator
-  sessions.
-- **Claude Code hooks:** optional hooks inject the start brief and bounded next
-  actions.
-- **Memory-clean defaults:** workers skip saved harness memory and startup offers
-  memory-clean choices without applying them.
+### Why not just summarize?
 
-Attention Relay uses [agent-relay](https://github.com/jpawchan/agent-relay) as
-its base.
+Whole-history summarization is useful, but it is lossy: a broad paraphrase can omit a negation, qualifier, failed approach, or exact acceptance condition, and repeated summaries can compound that loss. It also begins with the entire transcript rather than deciding what the next task actually needs.
+
+Baton selectively generates each capsule from named task-spec sections and referenced-memory summaries, keeps related items together, and repeats the resulting capsule verbatim at both worker-prompt edges. Its orchestrator handoff is separately bounded and generated from current task state; it is not a compressed copy of the whole conversation. The distinction is selective task context plus bounded state transfer, not a claim that summarization is inherently ineffective.
+
+### Research
+
+Primary studies show systematic primacy/recency or U-shaped position effects in several long-context settings, while newer multi-piece evaluation finds that distance between related facts can be a sharper problem than middle position alone. Separate experiments find that re-reading or restating the input can improve comprehension and reasoning, which supports giving a model a second pass over compact, related instructions. Together with practitioner guidance on boundary placement and extracting relevant material, this makes Baton's capsule layout a reasonable engineering choice. None of these sources evaluates Baton, and their results across retrieval, summarization, in-context learning, and reasoning tasks do not establish a universal threshold, a guaranteed compliance gain, or a Baton effect size. Fresh-worker quality and token savings are therefore testable design inferences whose value must exceed Baton's measured activation overhead.
+
+The detailed claim-to-source analysis and limitations are in [Long-context research synthesis](docs/research-synthesis.md) and [Context placement rationale](docs/context-placement.md).
+
+### Research sources
+
+- Liu et al., [“Lost in the Middle: How Language Models Use Long Contexts”](https://arxiv.org/abs/2307.03172) — peer-reviewed TACL paper and primary study.
+- Hsieh et al., [“Found in the Middle: Calibrating Positional Attention Bias Improves Long Context Utilization”](https://aclanthology.org/2024.findings-acl.890/) ([arXiv](https://arxiv.org/abs/2406.16008)) — peer-reviewed Findings of ACL 2024 paper and primary study.
+- Tian et al., [“Distance between Relevant Information Pieces Causes Bias in Long-Context LLMs”](https://arxiv.org/abs/2410.14641) — peer-reviewed Findings of ACL 2025 paper and primary study.
+- Xu et al., [“Re-Reading Improves Reasoning in Large Language Models”](https://arxiv.org/abs/2309.06275) — peer-reviewed EMNLP 2024 paper and primary study.
+- Mekala, Razeghi, and Singh, [“EchoPrompt: Instructing the Model to Rephrase Queries for Improved In-context Learning”](https://aclanthology.org/2024.naacl-short.35/) ([arXiv](https://arxiv.org/abs/2309.10687)) — peer-reviewed NAACL 2024 short paper and primary study.
+- Guo and Vosoughi, [“Serial Position Effects of Large Language Models”](https://aclanthology.org/2025.findings-acl.52/) — peer-reviewed Findings of ACL 2025 paper and primary study.
+- Han et al., [“Read Before You Think: Mitigating LLM Comprehension Failures with Step-by-Step Reading”](https://arxiv.org/abs/2504.09402) — primary preprint; the linked page does not identify peer review.
+- Anthropic, [“Prompt engineering for Claude's long context window”](https://www.anthropic.com/news/prompting-long-context) — practitioner guidance, not peer-reviewed research.
+- A. Laurent, [“LLM Position Bias: Primacy and Recency Effects in Prompts”](https://intuitionlabs.ai/articles/llm-position-bias-primacy-recency-effects) — secondary synthesis, not primary research.
+- David William Silva, [“Lost in the Middle: The Context Crisis of LLMs”](https://davidwsilva.substack.com/p/lost-in-the-middle-the-context-crisis) — secondary article, not primary research.
 
 ## Requirements
 
-### Generate Relay from a prompt
+### Generate Baton from a prompt
 
-To generate Relay, give its prompt to a coding agent. The generated framework
-requires Python 3.11+, Git, and macOS or Linux.
+A coding agent that can create files and run local verification can generate Baton from `prompts/create-framework.md`; use a fresh agent with `prompts/improve-framework.md` to audit and repair the result. The generated framework requires Python 3.11 or newer, Git, and macOS or Linux.
 
 ### Run the ready-to-use framework
 
-Requirements: Git, Python 3.11+, macOS or Linux, and a command-line coding
-agent.
+The ready version requires Python 3.11 or newer, Git on `PATH`, macOS or Linux, and a Git worktree without tracked submodules. Baton has no third-party Python dependencies.
+
+### Supported agent harnesses
+
+The interactive orchestrator needs file and command access. Worker routing accepts a configurable noninteractive prompt command: the included configuration documents Hermes Agent, Claude Code, and Codex examples, while OpenCode and other CLI agents can be used when their locally verified noninteractive invocation accepts one prompt or prompt-file argument. Baton does not install agents, credentials, models, wrappers, or routing profiles.
+
+### Measured framework token usage
+
+The revision recorded in [Activation context footprint](docs/context-footprint.md) loads a 15,126-byte Baton-authored activation payload: `prompts/use-framework.md`, the freshly installed orchestrator manual, and a generated start brief after `hard`, `medium`, and `easy` are configured. It excludes the host harness's base prompt and tool schemas, unrelated saved memory, source code, task specs, worker prompts, and later capsules.
+
+A live provider differential measured that exact payload between fixed inert-data markers with identical bracketing baselines: **3,426 logical input tokens** for GPT 5.6 Sol through Hermes/OpenAI Codex and **5,323 logical input tokens** for Claude Opus 4.8 through Claude Code. Those values are exact only for the recorded harness/API differential and tested model revision and message construction; they are not standalone tokenizer counts or universal counts for similarly named endpoints. For unmeasured paths, the documented offline fallback is a **3,782-token estimate**, with a conservative **2,521–7,563** range.
+
+Activation is overhead. If a goal will probably use fewer direct-execution tokens than the applicable footprint, run it directly; use Baton when decomposition, fresh-worker focus, parallelism, review, or risk control is expected to justify that cost.
 
 ## Install
 
 ### Build from the prompt
 
-Give `prompts/create-framework.md` to a coding agent. Then give
-`prompts/improve-framework.md` to a fresh agent to test and fix the result. This
-costs tokens once, but future models can rebuild Relay from the same
-specification and may produce a better implementation.
+Get the generation and review prompts:
+
+```bash
+git clone https://github.com/jpawchan/baton
+cd baton
+```
+
+Open `prompts/create-framework.md` from the checkout, start a coding agent in
+the target project's Git root, and give it that prompt. Then give
+`prompts/improve-framework.md` to a fresh agent in the same target. The first
+prompt contains the normative specification; the second requires implementation
+and safety checks rather than assuming the first result is correct.
 
 ### Install the ready-to-use version
 
-Clone the repository:
-
 ```bash
-git clone https://github.com/jpawchan/attention-relay
+git clone https://github.com/jpawchan/baton
+cd baton
+framework/baton init /path/to/project
 ```
 
-Install Relay into your project:
+`init` installs the local, Git-ignored `.baton/` runtime in the target project's Git root.
 
-```bash
-attention-relay/framework/relay init /path/to/project
-```
+## How to use
 
-This creates a local `.attention-relay/` directory in the project.
-
-## How to use it
-
-1. Install Relay in your project.
-2. Ask your main agent to read `.attention-relay/orchestrator.md`.
-3. The agent runs the start brief and offers its memory-clean choices before
-   planning. If the optional `hard`, `medium`, or `easy` tiers are missing, it
-   also asks which model (and optionally provider) each should use:
+1. Install Baton, then tell the main coding agent to read `.baton/orchestrator.md` and run:
 
    ```bash
-   .attention-relay/relay orchestrator brief --phase start
+   .baton/baton orchestrator brief --phase start
+   .baton/baton validate
+   .baton/baton tiers
    ```
 
-4. Describe your goal.
+2. Choose the start brief's memory-clean option before planning. Configure and verify all three requested worker levels in `.baton/config.toml`: `hard` uses GPT 5.6 Sol at high effort, `medium` uses GPT 5.6 Sol at medium effort, and `easy` uses Claude Code Opus 4.8 at xhigh effort, with GPT 5.6 Terra/high only when Claude usage is exhausted. The example configuration shows the required display metadata and wrapper shape; Baton does not register these models, select effort, or implement the exhaustion-only fallback.
 
-## Optional Claude Code hooks
+3. Describe the goal. The orchestrator assigns one explicit configured difficulty to every task, previews generated context, runs non-conflicting workers, and reviews evidence before acceptance. Its core commands are:
 
-Print the Claude Code settings fragment, or merge it into the project's current
-settings:
+   ```bash
+   .baton/baton task create --title "Add email validation" --scope "src/auth/**" --tier hard
+   .baton/baton task capsule T001-add-email-validation
+   .baton/baton run --dry-run
+   .baton/baton run
+   .baton/baton orchestrator brief --phase review T001-add-email-validation
+   ```
+
+4. Before ending an orchestrator session, run a close brief with a concrete next-session goal:
+
+   ```bash
+   .baton/baton orchestrator brief --phase close --goal "Continue with the next concrete objective"
+   ```
+
+Optional Claude Code hooks can inject the start brief at session start and after compaction, and inject bounded current next actions before each user prompt:
 
 ```bash
-.attention-relay/relay hooks claude-code
-.attention-relay/relay hooks claude-code --write
+.baton/baton hooks claude-code
+.baton/baton hooks claude-code --write
 ```
 
-The matcher-free `SessionStart` hook injects the start-phase orchestrator brief
-at startup and re-injects it after automatic or manual compaction, with an
-explicit context-compacted notice. Post-compaction re-injection omits the
-user-facing Difficulty levels ask. The `UserPromptSubmit` hook injects a bounded,
-state-derived `Next actions` capsule before Claude handles each prompt. Repeated
-setup is idempotent and does not replace existing hook arrays.
-
-The adapters cap output and fail open with no output if Relay state is missing
-or broken. Do not launch Claude with `--bare` when using this integration,
-because `--bare` disables hooks.
+The hook merge is idempotent and preserves existing hook arrays. Do not use Claude Code's `--bare` mode with this integration because that mode disables hooks.
 
 ## What is in this repository?
 
 | Path | Contents |
 | --- | --- |
-| `framework/` | Ready-to-use Relay CLI, config example, orchestrator and worker manuals, and memory template. |
-| `prompts/create-framework.md` | Prompt for building Relay from the specification. |
-| `prompts/improve-framework.md` | Prompt for testing and fixing an implementation. |
-| `prompts/use-framework.md` | Prompt for using an installed Relay framework. |
-| `skill/` | Agent-skill metadata and usage guidance. |
-| `tests/test_relay.py` | End-to-end test suite. |
-| `SPEC.md` | Exact behavior and safety rules. |
-| `summary.md` | Code-verified project guide. |
+| `framework/baton` | Ready-to-use Baton CLI. |
+| `framework/orchestrator.md` | Installed orchestrator workflow and review guidance. |
+| `framework/worker.md` | Installed worker contract and report format. |
+| `framework/config.example.toml` | Installed worker, tier, limit, and gate configuration template. |
+| `framework/memory.md` | Installed indexed-memory template. |
+| `prompts/create-framework.md` | Standalone framework-generation prompt containing the normative specification. |
+| `prompts/improve-framework.md` | Prompt for independently testing and repairing a generated implementation. |
+| `prompts/use-framework.md` | Short prompt for activating an installed orchestrator. |
+| `skill/SKILL.md` | Portable skill metadata and operating guidance. |
+| `docs/context-placement.md` | Capsule-placement rationale, tradeoffs, and limits. |
+| `docs/research-synthesis.md` | Long-context evidence synthesis and source notes. |
+| `docs/context-footprint.md` | Reproducible activation-context measurement and break-even guidance. |
+| `docs/bug-audit.md` | Correctness audit, reproductions, and fix dispositions. |
+| `docs/performance.md` | Profiling method, benchmark results, and rejected optimizations. |
+| `docs/github-description.txt` | Short GitHub repository description. |
+| `tools/` | Standard-library measurement and benchmark scripts plus recorded provider evidence. |
+| `tests/test_baton.py` | End-to-end Baton test suite. |
+| `tests/test_context_footprint.py` | Activation-footprint reproducibility tests. |
+| `SPEC.md` | Normative behavior and safety contract. |
+| `summary.md` | Code-verified maintainer guide. |
+| `.github/workflows/ci.yml` | Python 3.11/3.13 test matrix for macOS and Ubuntu. |
 | `LICENSE` | MIT license text. |
 
 ## License

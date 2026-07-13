@@ -1,6 +1,6 @@
-# Attention Relay specification
+# Baton specification
 
-This file defines Attention Relay. The reference code in `framework/` and the
+This file defines Baton. The reference code in `framework/` and the
 standalone creation prompt must implement the same behavior.
 
 ## Requirements
@@ -11,16 +11,16 @@ standalone creation prompt must implement the same behavior.
 - Python standard library only
 - A Git worktree without tracked submodules
 
-Attention Relay is one executable Python file plus Markdown and TOML templates. It
+Baton is one executable Python file plus Markdown and TOML templates. It
 has no daemon, database, server, UI, plugin system, or package dependency.
 
 ## Runtime
 
-`relay init <project>` requires the Git worktree root and creates:
+`framework/baton init <project>` requires the Git worktree root and creates:
 
 ```text
-.attention-relay/
-  relay
+.baton/
+  baton
   orchestrator.md
   worker.md
   memory.md
@@ -31,7 +31,7 @@ has no daemon, database, server, UI, plugin system, or package dependency.
   .locks/                local state locks
 ```
 
-Initialization adds `.attention-relay/` to the project’s `.gitignore` once. It does
+Initialization adds `.baton/` to the project’s `.gitignore` once. It does
 not replace existing files unless `--force` is used. `--force` refreshes the
 CLI and manuals but preserves `config.toml`, `memory.md`, tasks, and work.
 Initialization and normal commands reject symlinks anywhere in managed runtime
@@ -46,7 +46,7 @@ The orchestrator talks to the user. It creates tasks, runs workers, reviews
 reports and diffs, and approves or returns work.
 
 A worker handles one task attempt. It may submit a result only for the task id,
-attempt, and lease in its `RELAY_TASK_ID`, `RELAY_ATTEMPT`, and `RELAY_LEASE`
+attempt, and lease in its `BATON_TASK_ID`, `BATON_ATTEMPT`, and `BATON_LEASE`
 environment variables.
 Worker processes cannot use normal orchestrator commands while those variables
 are present.
@@ -74,7 +74,7 @@ Required JSON fields:
   "title": "Add email validation",
   "status": "queued",
   "attempt": 1,
-  "tier": "default",
+  "tier": "hard",
   "scope": ["src/auth/**"],
   "depends_on": [],
   "created_at": "...",
@@ -102,11 +102,12 @@ cancelled
 
 Lifecycle rules:
 
-1. `task create` creates a queued task.
+1. `task create` requires an explicit validated `--tier` and creates a queued
+   task. It never silently selects `default` or another difficulty.
 2. `run` claims the task as running before starting a worker.
 3. `task finish --brief TOKEN` writes an attempt result but leaves the task
    running. By default, the token must come from a fresh report-phase brief.
-4. After the worker exits, Relay writes the diff and validates any submitted
+4. After the worker exits, Baton writes the diff and validates any submitted
    result before applying its worker status. Timeout, interruption, and
    runner/launch errors unconditionally become `failed`. An ordinary nonzero
    exit with no result becomes `failed` with `worker_exit_N`; with a result,
@@ -129,7 +130,7 @@ Lifecycle rules:
     a mismatch becomes `failed` with `changed_paths_mismatch`.
 
 Task state changes use file locks. JSON and generated Markdown writes use a
-temporary file followed by atomic replacement. Two Relay processes must not
+temporary file followed by atomic replacement. Two Baton processes must not
 claim the same task. A dedicated execution lock serializes separate real `run`
 processes from their first snapshot through finalization; one process may still
 run a parallel wave. `run --dry-run` does not take the execution lock.
@@ -149,7 +150,7 @@ A task scope is a project-relative path pattern. It supports `*`, `?`, and `**`.
 character classes are rejected. `.` and an omitted scope mean the whole
 project.
 
-Relay normalizes scopes before saving them and compares paths with Unicode
+Baton normalizes scopes before saving them and compares paths with Unicode
 case-folding so case variants cannot collide on case-insensitive filesystems.
 It decides possible overlap from the fixed path segments before the first
 wildcard. It may serialize tasks that could have run together, but it must not
@@ -162,27 +163,29 @@ run scopes together when their fixed prefixes can address the same path.
 - the wave has not reached `max_parallel`.
 
 `run --dry-run` lists selected tasks and explains every skipped requested task.
-Selected tasks with a non-default tier are annotated with that resolved tier.
+Every selected identity includes task id, title, explicit difficulty, and the
+bounded safe worker label resolved from that validated tier. Real launch output
+repeats the same identity before starting the worker.
 
-Workers in a wave share the project working tree. Relay takes a Git tree
+Workers in a wave share the project working tree. Baton takes a Git tree
 snapshot before launch and another after all workers exit. Each attempt diff is
 the change between those trees, limited to that task’s scope. Existing dirty
 work and earlier accepted attempts are therefore excluded from the new diff.
 Binary files, modes, additions, deletions, and unborn repositories are handled
 through Git trees. The real Git index is not used as task state.
 
-Git-ignored files are not added to snapshots or diffs and are outside Relay’s
+Git-ignored files are not added to snapshots or diffs and are outside Baton’s
 scope guarantee. Workers must not modify them. Capturing them would require
 reading ignored dependencies, build outputs, and possible secrets. Tracked Git
 submodules in either `HEAD` or the index are rejected rather than silently
 omitted. Generated snapshots are also checked for gitlinks.
 
 Any changed Git-visible path outside the union of the wave’s scopes is recorded
-on the wave tasks and blocks acceptance. Relay writes those changes to a
+on the wave tasks and blocks acceptance. Baton writes those changes to a
 separate `attempt-N.violations.diff`. The paths must be restored to the
 pre-wave tree before the task can be returned. In a shared parallel working
 tree, every worker must declare each exact changed path with repeated
-`--changed PATH` arguments to `task finish`. Relay compares each declaration
+`--changed PATH` arguments to `task finish`. Baton compares each declaration
 with that task's observed scoped diff. This detects distinct cross-scope writes
 and prevents silent attribution, while the orchestrator still compares each
 report with its diff before approval. Shared-tree workers are cooperative, not
@@ -194,10 +197,10 @@ working tree; `accept`, `return`, and `cancel` do not apply or revert patches.
 
 ## Orchestrator phases and handoff
 
-`relay orchestrator brief --phase start|plan|run|review|close [ID]` is available
+`.baton/baton orchestrator brief --phase start|plan|run|review|close [ID]` is available
 only outside a leased worker. The orchestrator runs the matching brief before
 task creation, run, review/accept, and session close. Close is invoked as
-`relay orchestrator brief --phase close --goal TEXT [--note TEXT]...
+`.baton/baton orchestrator brief --phase close --goal TEXT [--note TEXT]...
 [--avoid TEXT]...`.
 
 - `start` prints a short role summary and a `Harness memory` notice of at most 12
@@ -206,21 +209,23 @@ task creation, run, review/accept, and session close. Close is invoked as
   controls, including the managed-policy exclusion limit and the warning that
   `claude --bare` disables hooks. It offers Hermes `--ignore-rules`, warns that
   `--safe-mode` drops user config and `hermes memory reset` is destructive, and
-  says framework workers are already clean by default. The orchestrator relays
+  says framework workers are already clean by default. The orchestrator shares
   these choices in its first response and never auto-applies one. Start also
-  checks the optional conventional tier tables `[tiers.hard]`, `[tiers.medium]`,
+  checks the conventional tier tables `[tiers.hard]`, `[tiers.medium]`,
   and `[tiers.easy]`. While any are absent, it prints exactly one `Difficulty
   levels:` section of at most 12 lines naming configured and missing conventional
-  levels. The section directs the orchestrator to ask the user in its first
-  response which model, and optionally provider, each missing level should use.
+  levels. The section directs the orchestrator to ask the user to configure the
+  requested routes: hard is GPT 5.6 Sol/high/elite senior, medium is GPT 5.6
+  Sol/medium/elite senior, and easy is Claude Code Opus 4.8/xhigh/senior with GPT
+  5.6 Terra/high only when Claude usage is exhausted.
   It includes commented, copy-ready TOML tables for only the missing levels;
-  stripping each leading `# ` produces valid TOML. Every command uses the
-  memory-clean Hermes pattern with `-m MODEL` and optional `--provider PROVIDER`
-  placeholders. It notes that per-level `worker_timeout_minutes` and
+  stripping each leading `# ` produces valid TOML. Hard uses the memory-clean
+  Hermes pattern, while medium and easy name local wrapper/profile skeletons
+  required to implement their effort and exhaustion semantics. It notes that per-level `worker_timeout_minutes` and
   `capsule_max_chars` are optional, that Hermes has no per-invocation reasoning
-  override so reasoning follows the harness's own configuration, and that these
-  level names are optional conventions. The section is absent only when all
-  three tables exist. Relay never prompts interactively, registers a level,
+  override so reasoning follows the harness's own configuration, and that every
+  task needs an explicitly selected validated tier. The section is absent only when all
+  three tables exist. Baton never prompts interactively, registers a level,
   chooses a fallback, schedules from these names, or writes configuration. Start
   also prints the current handoff when present, task counts, unresolved
   decision/review ids, and one recommended next command. Directly beneath the
@@ -229,11 +234,12 @@ task creation, run, review/accept, and session close. Close is invoked as
   characters, and labeled `worker question:`. A decision recommendation always
   names a real task id, never an overflow marker. Under a dedicated handoff leaf
   lock, start atomically marks the handoff consumed without deleting it.
-- `plan` prints the task-spec quality checklist and a bounded queued/blocked
-  dependency graph.
+- `plan` first requires choosing and announcing one explicit configured
+  difficulty, then prints the remaining task-spec quality checklist and a bounded
+  queued/blocked dependency graph.
 - `run` uses the read-only wave selection logic to print what would run and
-  cautions for overlapping scopes or unmet dependencies. Selected tasks with a
-  non-default tier are annotated with that resolved tier.
+  cautions for overlapping scopes or unmet dependencies. Every selected task is
+  shown with id, title, difficulty, and safe worker label.
 - `review ID` is valid only for a `needs_review` task. Under the task lock it
   freshly compiles the task capsule but displays the stored launch capsule when
   `attempt-N.brief.md` exists. If the fresh and stored capsules differ, it prints
@@ -255,7 +261,7 @@ task creation, run, review/accept, and session close. Close is invoked as
   Retried tasks also list existing report and diff paths for at most the three
   most recent prior attempts, newest first, with an older-attempt overflow marker.
   The review-only `--include-log-tail` flag appends an explicitly labeled
-  `Untrusted worker log tail (opt-in):` block. Relay seeks within only the final
+  `Untrusted worker log tail (opt-in):` block. Baton seeks within only the final
   64 KiB of the current attempt log, sanitizes ANSI/OSC and C0/C1 controls except
   tab, redacts environment/credential values, and emits at most the final 15
   lines, 240 characters per line, and 1500 characters for the whole block. A
@@ -318,7 +324,7 @@ task creation, run, review/accept, and session close. Close is invoked as
   `+N more` counts, until the artifact fits or both caps reach zero. Only then it
   applies the same per-pass reduction to next and then unresolved. Metadata,
   goal, warning, notes, and avoid are never naively truncated or dropped. Close
-  atomically writes `.attention-relay/orchestrator-handoff.md`, prints it, and
+  atomically writes `.baton/orchestrator-handoff.md`, prints it, and
   reminds the orchestrator to start a fresh session. The 8000-character handoff
   reader and hook-output cap are unchanged.
 
@@ -332,7 +338,12 @@ consumption. Missing, wrong, replaced, replayed, or stale-attempt tokens are
 rejected. Return, decide, and cancel remove any review token and manifest. With
 the gate disabled, accept bypasses the manifest exactly as it bypasses `--brief`.
 
-`relay status`, `relay task show`, and each real `relay run` end with a
+`.baton/baton task create`, list/show output, `.baton/baton status`, dry-run
+selection, and real launch output all expose task id, title where appropriate,
+explicit difficulty, and a safe effective worker label. JSON list/show enriches
+the displayed copy with `difficulty`, `worker_label`, and a safe `routing` string;
+these derived fields are never stored in task state. `.baton/baton status`,
+`.baton/baton task show`, and each real `.baton/baton run` end with a
 deterministic `Next actions` block whose heading is followed by at most five
 content lines globally across reviews, decisions, and overflow markers. Reviews
 come first, followed by one line per displayed decision; overflow markers remain
@@ -342,7 +353,7 @@ explicitly labeled `worker question:`; a missing or non-text question leaves an
 id-only decision line. The block otherwise derives report paths or create/run
 commands from current task state and contains no generic advice.
 
-`relay stats` is an orchestrator-only, read-only aggregate over active and
+`.baton/baton stats` is an orchestrator-only, read-only aggregate over active and
 archived task state and work. With no task state it prints exactly `no task data`.
 Otherwise it prints deterministic bounded sections for status counts, a
 histogram of tasks' current attempt numbers, failed/blocked reason-code counts,
@@ -361,53 +372,54 @@ is labeled `command-use evidence, not proof of attention`. Stats reads archived
 receipts from the work directories moved by `archive`; it acquires no
 write-capable lock and creates or changes no runtime file.
 
-`relay tiers` is orchestrator-only and read-only. It prints one deterministic
+`.baton/baton tiers` is orchestrator-only and read-only. It prints one deterministic
 block for `default` followed by each configured tier in sorted name order. Each
-block shows only the command executable (`argv[0]`, never its flags or remaining
-arguments), whether the command comes from `default` or the tier, the effective
-worker timeout in minutes, and the effective capsule budget in characters. If
-any of the optional conventional `hard`, `medium`, and `easy` tables is absent,
+block shows the difficulty and bounded safe worker label, then only the command
+executable (`argv[0]`, never its flags or remaining arguments), whether the
+command comes from `default` or the tier, the effective worker timeout in minutes,
+and the effective capsule budget in characters. If any conventional `hard`,
+`medium`, and `easy` table is absent,
 it appends exactly one line `Conventional levels missing: <comma-separated
 names>` in hard, medium, easy order. The line is omitted when all three are
 configured; every tier block is otherwise byte-unchanged.
 
 ## Optional Claude Code integration
 
-`relay hooks claude-code [--write]` is an orchestrator-only, opt-in setup
+`.baton/baton hooks claude-code [--write]` is an orchestrator-only, opt-in setup
 command. Without `--write` it prints the exact JSON hook fragment and one-line
 merge instructions. With `--write` it atomically creates or merges
 `.claude/settings.json`, preserving the order and contents of existing hook
-arrays. It appends only missing Attention Relay entries, identified by their
+arrays. It appends only missing Baton entries, identified by their
 command strings, so repeated setup is idempotent. Invalid JSON is rejected
 without changing the file.
 
 The fragment registers exactly one command hook under each of `SessionStart`
 and `UserPromptSubmit`, using Claude Code's matcher-free `[{"hooks": [...]}]`
 shape. Commands invoke the project-local adapter through
-`"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event ...`.
+`"$CLAUDE_PROJECT_DIR"/.baton/baton hook-event ...`.
 
 The matcher-free `SessionStart` entry fires at startup and after automatic or
 manual compaction; post-compaction stdin carries `"source": "compact"`. Claude
-adds SessionStart stdout back to session context. `relay hook-event
+adds SessionStart stdout back to session context. `.baton/baton hook-event
 session-start` normally emits the same plain stdout as the start-phase
 orchestrator brief. For a compact source, it omits the `Difficulty levels:`
 section and prefixes the otherwise unchanged brief with the single line
-`attention-relay: context was compacted; state re-injected below.` so the new
+`Baton: context was compacted; state re-injected below.` so the new
 context is explicitly re-grounded. PreCompact stdout does not reach Claude's
 summarizer or the resulting context, so this integration intentionally has no
 PreCompact hook and re-injects state through the post-compaction SessionStart.
 
-`relay hook-event user-prompt-submit` emits `hookSpecificOutput` JSON whose
-`hookEventName` is `UserPromptSubmit` and whose `additionalContext` is an
-`attention-relay state:` line followed by the deterministic `Next actions`
+`.baton/baton hook-event user-prompt-submit` emits `hookSpecificOutput` JSON whose
+`hookEventName` is `UserPromptSubmit` and whose `additionalContext` is a
+`Baton state:` line followed by the deterministic `Next actions`
 block. Both emitted outputs are always at most 9000 characters. Truncation
 retains the first and last lines and places `(truncated)` immediately before the
 last line; if both edge lines cannot fit, the adapter emits nothing and fails
 open.
 
-Hook events tolerate empty or malformed stdin, never write Relay state, and
+Hook events tolerate empty or malformed stdin, never write Baton state, and
 fail open: a missing or broken runtime exits successfully with no stdout or
-stderr, so Relay cannot break the host session. The adapter and setup commands
+stderr, so Baton cannot break the host session. The adapter and setup commands
 are unavailable to leased workers. Claude's `--bare` mode disables hooks and
 therefore conflicts with this integration.
 
@@ -418,18 +430,19 @@ shell. It must contain exactly one complete `{prompt}` or `{prompt_file}`
 argument. Shell operators are not supported; users can call a wrapper script
 when needed.
 
-Relay exports:
+Baton exports:
 
 ```text
-RELAY_TASK_ID
-RELAY_ATTEMPT
-RELAY_LEASE
-RELAY_DIR
-RELAY_ROOT
+BATON_TASK_ID
+BATON_ATTEMPT
+BATON_LEASE
+BATON_DIR
+BATON_ROOT
 ```
 
-Workers reprint the current attempt's launch capsule at each moment of action
-with `relay task brief ID --phase edit|verify|report`. The capsule is followed by
+The launch prompt explicitly states the validated task difficulty and safe worker
+label without including the worker command or flags. Workers reprint the current attempt's launch capsule at each moment of action
+with `.baton/baton task brief ID --phase edit|verify|report`. The capsule is followed by
 a short phase-specific checklist. The command is available only to the matching
 leased worker while its task is running: task id, attempt, and lease must all
 match the worker environment.
@@ -456,7 +469,7 @@ The optional `phase_sequence_requires_briefs` gate defaults to false. Recording
 always occurs, and while the gate is off edit, verify, and report retain their
 existing non-blocking behavior. When true, a verify brief requires a
 current-attempt edit receipt, and a report brief requires current-attempt edit
-and verify receipts; rejection names the exact missing `relay task brief ID
+and verify receipts; rejection names the exact missing `.baton/baton task brief ID
 --phase PHASE` remediation. A new edit receipt after a report receipt removes an
 outstanding finish token, requiring report to be briefed again. This is the only
 sequence-gate change to finish-token one-use semantics.
@@ -473,19 +486,19 @@ non-regular, undecodable, or malformed reports are rejected with a precise
 problem and instructions to correct the report and refinish with the same token.
 `needs_decision`, `blocked`, and `failed` reports are never structure-checked.
 
-Each worker runs in a separate process group. Relay captures combined output and
+Each worker runs in a separate process group. Baton captures combined output and
 enforces the task tier's effective `worker_timeout_minutes`, so workers in one
 wave may have different timeouts. It terminates process groups on timeout or
 `SIGINT`, `SIGTERM`, or `SIGHUP` interruption. It signals every active group
 before one shared grace interval. Interrupted tasks become `failed` instead of
 remaining stale. Timeout, interruption, and runner/launch errors override any
-submitted result. For an ordinary nonzero exit, Relay first applies every normal
+submitted result. For an ordinary nonzero exit, Baton first applies every normal
 result check, including report, scope, and changed-path validation. Invalid
 submissions retain their normal failure, while a fully valid submission retains
 its worker status with a structured `worker_exit_N_after_submission` warning in
 task state, status output, history, and the review brief.
 
-Before launch, Relay compiles a deterministic Critical Context Capsule from the
+Before launch, Baton compiles a deterministic Critical Context Capsule from the
 task state, the existing `Objective`, `Acceptance criteria`, `Not allowed`,
 `Verification`, and retry sections, and the memory index at compile time. The
 same task state, spec text, and memory index produce byte-identical capsule text.
@@ -494,11 +507,11 @@ section in the task template. Empty objectives or acceptance criteria, and
 either section retaining its template placeholder line, are actionable launch
 errors. `validate` reports the same errors for queued tasks.
 
-Relay scans only the spec's `Context` section for ordered, deduplicated
+Baton scans only the spec's `Context` section for ordered, deduplicated
 `M\d{3,}` references. When any exist, the capsule includes `Referenced memory`
 after `Verification` and before `Retry delta`. It contains one instruction to
 load full entries with
-`python3 .attention-relay/relay memory show ID` and one
+`python3 .baton/baton memory show ID` and one
 `- M###: summary` line per reference. It never includes full memory bodies.
 With no references this section is absent and the capsule format is unchanged.
 More than six distinct references is an error that directs the orchestrator to
@@ -509,7 +522,7 @@ these errors without dropping or truncating references.
 
 On attempts after the first, the capsule also contains a `Retry delta` with only
 the newest entry from `Review feedback` and/or `Decisions`. The previous-attempt
-report remains a file pointer in the middle of the prompt. Relay places the
+report remains a file pointer in the middle of the prompt. Baton places the
 byte-identical capsule at the exact beginning and end of the launch prompt,
 around the task metadata, file pointers, and finish mechanics. It also writes
 that capsule to `work/<id>/attempt-N.brief.md` with its SHA-256 content digest.
@@ -525,7 +538,7 @@ Capsules are never truncated. The budget resolves from each task's tier. If one
 exceeds the tier's effective `capsule_max_chars`, launch and validation fail
 with the measured size and overflow.
 
-`relay task capsule ID [--raw]` is a read-only, orchestrator-only preview. For a
+`.baton/baton task capsule ID [--raw]` is a read-only, orchestrator-only preview. For a
 non-running active task it compiles the current spec prospectively. For a
 running task it reads the stored `attempt-N.brief.md` launch capsule and never
 recompiles mutable spec text. Unknown and archived ids are rejected.
@@ -556,6 +569,12 @@ command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m provi
 capsule_max_chars = 6000
 worker_timeout_minutes = 90
 
+[tiers.premium.display]
+model = "GPT 5.6 Sol"
+harness = "Hermes"
+effort = "high"
+engineering_role = "elite senior"
+
 [gates]
 phase_sequence_requires_briefs = false
 finish_requires_brief = true
@@ -578,19 +597,26 @@ All gate values must be booleans. `phase_sequence_requires_briefs` defaults to
 `accept_requires_brief = false` lets `task accept` work without a review token.
 Each disabled token gate ignores its corresponding `--brief` argument.
 
-The `default` tier is always available and uses `[commands].worker` plus the
-global limits. Each non-default task tier must have a matching `[tiers.<name>]`
+The `default` tier is always available when explicitly passed to task creation and
+uses `[commands].worker` plus the global limits. Each non-default task tier must have a matching `[tiers.<name>]`
 table; unknown and blank tier names are errors at creation, validation, preview,
 and launch rather than falling back to the default command. A literal
 `[tiers.default]` table is reserved and invalid.
 
-Each tier table may set `command`, `worker_timeout_minutes`, and
-`capsule_max_chars`. Unset keys inherit their global values, so a limits-only
+Each tier table may set `command`, `worker_timeout_minutes`, `capsule_max_chars`,
+and a `[tiers.<name>.display]` table. Display supports only `model`, `harness`,
+`effort`, `engineering_role`, and `fallback`. Every configured value is nonblank
+text of at most 80 characters, contains no C0/C1 controls or command flags, and is
+credential-redacted before rendering. Unknown fields and malformed display
+tables are errors. The assembled label is single-line and at most 240 characters;
+missing metadata deterministically renders `unlabeled worker`. Unset routing keys inherit their global values, so a limits-only
 tier inherits `[commands].worker`. Tier commands obey the same one-placeholder
 rule as the default command. Tier limits obey the same type and range rules as
 their global counterparts. `validate` checks every configured tier, including
-unused tiers. `relay tiers` displays all effective settings without exposing
-command flags. `hard`, `medium`, and `easy` have no special validation or
+unused tiers. `.baton/baton tiers` displays all effective settings without exposing
+command flags. Display metadata never changes routing: worker argv, timeout, and
+capsule budget still come from the task's strictly validated tier, and Baton never
+infers display values by parsing command strings. `hard`, `medium`, and `easy` have no special validation or
 scheduling semantics: they are ordinary strict opt-in tiers whose names are
 used only by the onboarding section and missing-level hint.
 
@@ -616,14 +642,14 @@ needed.
 Commands:
 
 ```text
-relay memory index [--for worker|orchestrator]
-relay memory show M001
-relay memory add --for worker|orchestrator|both "summary" "body"
+.baton/baton memory index [--for worker|orchestrator]
+.baton/baton memory show M001
+.baton/baton memory add --for worker|orchestrator|both "summary" "body"
 ```
 
 ## Verification
 
-`python3 tests/test_relay.py` must pass. The suite uses temporary Git projects
+`python3 tests/test_baton.py` must pass. The suite uses temporary Git projects
 and stub workers. It covers:
 
 - Git-only, idempotent initialization, root checks, nested symlink rejection,

@@ -20,4 +20,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: python3 tests/test_relay.py
+      - run: |
+          python3 -m py_compile framework/baton tests/test_baton.py tools/measure_context.py tests/test_context_footprint.py
+          python3 tests/test_baton.py
+          python3 tests/test_context_footprint.py

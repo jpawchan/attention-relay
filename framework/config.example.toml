@@ -1,7 +1,7 @@
-# Attention Relay worker configuration
+# Baton worker configuration
 
 [commands]
-# The placeholder must be one complete argument. Relay does not use a shell.
+# The placeholder must be one complete argument. Baton does not use a shell.
 # --ignore-rules skips auto-injection of AGENTS.md, SOUL.md, .cursorrules,
 # saved memory, and preloaded skills while keeping the user's configured
 # model/reasoning.
@@ -18,22 +18,41 @@ worker = "hermes chat -Q -t terminal,file --source tool --ignore-rules -q {promp
 # Memory-clean Claude Code worker:
 # worker = "claude -p --bare {prompt}"
 
-# Optional conventional difficulty levels. Choose each model/provider explicitly;
-# remove `--provider provider` when `-m model` already identifies the provider.
+# Conventional routing requested for coding tasks. Metadata is display-only and
+# must truthfully describe the command or wrapper in the same tier. Baton never
+# parses commands to infer these values. Uncomment and adapt executable/model
+# identifiers to those installed locally before assigning the tier.
 # [tiers.hard]
-# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m model --provider provider -q {prompt}"
+# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m GPT-5.6-Sol -q {prompt}"
 # worker_timeout_minutes = 90
 # capsule_max_chars = 6000
+# [tiers.hard.display]
+# model = "GPT 5.6 Sol"
+# harness = "Hermes"
+# effort = "high"
+# engineering_role = "elite senior"
 #
 # [tiers.medium]
-# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m model --provider provider -q {prompt}"
+# command = "hermes-medium-worker {prompt_file}" # wrapper/profile configured for medium effort
+# [tiers.medium.display]
+# model = "GPT 5.6 Sol"
+# harness = "Hermes"
+# effort = "medium"
+# engineering_role = "elite senior"
 #
 # [tiers.easy]
-# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m model --provider provider -q {prompt}"
+# command = "baton-easy-worker {prompt_file}" # Claude first; Terra only on exhausted Claude usage
 # worker_timeout_minutes = 30
 # capsule_max_chars = 3000
+# [tiers.easy.display]
+# model = "Claude Code Opus 4.8"
+# harness = "Claude Code"
+# effort = "xhigh"
+# engineering_role = "senior"
+# fallback = "GPT 5.6 Terra/high when Claude usage is exhausted"
 #
-# These names are optional conventions, not automatically registered tiers.
+# The easy wrapper must implement that exact exhaustion-only fallback; metadata
+# cannot change routing. These names are not automatically registered tiers.
 
 # Optional commands for selected task tiers:
 # [tiers.cheap]

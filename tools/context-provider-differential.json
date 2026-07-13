@@ -1,0 +1,31 @@
+{
+  "boundary": "The exact 15126-byte activation-context.txt payload inserted between fixed inert-data markers; provider-reported logical input is uncached input + cache read + cache creation/write.",
+  "payload_bytes": 15126,
+  "payload_sha256": "f3ca7044b52318effe0e371048e12b4fff4927be928a9d1b11827fefe80d0616",
+  "logical_input_accounting": "uncached input + cache-read input + cache-write input (cache creation)",
+  "tested_paths": {
+    "gpt_5_6_sol": {
+      "model": "gpt-5.6-sol",
+      "harness_path": "Hermes via OpenAI Codex"
+    },
+    "claude_opus_4_8": {
+      "model": "claude-opus-4-8",
+      "harness_path": "Claude Code"
+    }
+  },
+  "gpt_5_6_sol_via_hermes_openai_codex": {
+    "model": "gpt-5.6-sol",
+    "baseline_1_logical_input_tokens": 5011,
+    "payload_logical_input_tokens": 8437,
+    "baseline_2_logical_input_tokens": 5011,
+    "payload_differential_tokens": 3426
+  },
+  "claude_opus_4_8_via_claude_code": {
+    "model": "claude-opus-4-8",
+    "baseline_1_logical_input_tokens": 1809,
+    "payload_logical_input_tokens": 7132,
+    "baseline_2_logical_input_tokens": 1809,
+    "payload_differential_tokens": 5323
+  },
+  "interpretation": "Provider-reported harness/API differential for the recorded tested model revision and message construction, not a standalone offline tokenizer count. Identical baselines on both sides validate the differential in this run."
+}

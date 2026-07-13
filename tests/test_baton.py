@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""End-to-end tests for Attention Relay."""
+"""End-to-end tests for Baton."""
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -14,10 +15,12 @@ import tempfile
 import time
 import tomllib
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_RELAY = ROOT / "framework" / "relay"
+SOURCE_BATON = ROOT / "framework" / "baton"
 AUTHOR_EMAIL = "78247292+jpawchan@users.noreply.github.com"
 
 GOOD_WORKER = r'''
@@ -28,10 +31,10 @@ import subprocess
 import sys
 import time
 
-root = Path(os.environ["RELAY_ROOT"])
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+root = Path(os.environ["BATON_ROOT"])
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 task = json.loads((rd / "tasks" / f"{tid}.json").read_text())
 
 starts = os.environ.get("STARTS")
@@ -73,7 +76,7 @@ if marker:
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
 brief = subprocess.run(
-    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    [sys.executable, str(rd / "baton"), "task", "brief", tid, "--phase", "report"],
     cwd=root, check=True, capture_output=True, text=True,
 )
 token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
@@ -83,7 +86,7 @@ report.write_text(
     f"# {tid} report\n\n## Result\n{status}\n\n## Changes\n- updated task output\n\n"
     "## Verification\n- worker completed\n\n## Decisions and risks\n- none\n"
 )
-finish = [sys.executable, str(rd / "relay"), "task", "finish", tid,
+finish = [sys.executable, str(rd / "baton"), "task", "finish", tid,
           "--status", status, "--brief", token]
 for path in changed:
     finish.extend(["--changed", path])
@@ -91,7 +94,7 @@ subprocess.run(finish, cwd=root, check=True)
 
 self_accept = os.environ.get("SELF_ACCEPT_RESULT")
 if self_accept:
-    result = subprocess.run([sys.executable, str(rd / "relay"), "task", "accept", tid],
+    result = subprocess.run([sys.executable, str(rd / "baton"), "task", "accept", tid],
                             cwd=root)
     Path(self_accept).write_text(str(result.returncode))
 
@@ -111,14 +114,14 @@ from pathlib import Path
 import subprocess
 import sys
 
-root = Path(os.environ["RELAY_ROOT"])
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+root = Path(os.environ["BATON_ROOT"])
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
 brief = subprocess.run(
-    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    [sys.executable, str(rd / "baton"), "task", "brief", tid, "--phase", "report"],
     cwd=root, check=True, capture_output=True, text=True,
 )
 token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
@@ -127,7 +130,7 @@ report.write_text(
     "# no-change report\n\n## Result\nneeds_review\n\n## Changes\n- no changes\n\n"
     "## Verification\n- worker completed\n\n## Decisions and risks\n- none\n"
 )
-subprocess.run([sys.executable, str(rd / "relay"), "task", "finish", tid,
+subprocess.run([sys.executable, str(rd / "baton"), "task", "finish", tid,
                 "--status", "needs_review", "--brief", token], cwd=root, check=True)
 '''
 
@@ -153,10 +156,10 @@ import subprocess
 import sys
 import time
 
-root = Path(os.environ["RELAY_ROOT"])
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+root = Path(os.environ["BATON_ROOT"])
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 task = json.loads((rd / "tasks" / f"{tid}.json").read_text())
 if task["tier"] == "short":
     time.sleep(10)
@@ -164,7 +167,7 @@ if task["tier"] == "short":
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
 brief = subprocess.run(
-    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    [sys.executable, str(rd / "baton"), "task", "brief", tid, "--phase", "report"],
     cwd=root, check=True, capture_output=True, text=True,
 )
 token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
@@ -173,7 +176,7 @@ report.write_text(
     "# tier timeout report\n\n## Result\nneeds_review\n\n## Changes\n- no changes\n\n"
     "## Verification\n- worker completed\n\n## Decisions and risks\n- none\n"
 )
-subprocess.run([sys.executable, str(rd / "relay"), "task", "finish", tid,
+subprocess.run([sys.executable, str(rd / "baton"), "task", "finish", tid,
                 "--status", "needs_review", "--brief", token], cwd=root, check=True)
 '''
 
@@ -183,13 +186,13 @@ import json
 import os
 from pathlib import Path
 
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 path = rd / "work" / tid / f"attempt-{attempt}.result.json"
 path.write_text(json.dumps({
     "status": "needs_review", "note": "manual", "at": "now",
-    "lease": os.environ["RELAY_LEASE"], "changed_paths": [],
+    "lease": os.environ["BATON_LEASE"], "changed_paths": [],
 }))
 '''
 
@@ -198,15 +201,15 @@ import json
 import os
 from pathlib import Path
 
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.mkdir()
 result = rd / "work" / tid / f"attempt-{attempt}.result.json"
 result.write_text(json.dumps({
     "status": "needs_review", "note": {"not": "text"}, "at": "now",
-    "lease": os.environ["RELAY_LEASE"],
+    "lease": os.environ["BATON_LEASE"],
 }))
 '''
 
@@ -214,9 +217,9 @@ NON_UTF8_RESULT_WORKER = r'''
 import os
 from pathlib import Path
 
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 path = rd / "work" / tid / f"attempt-{attempt}.result.json"
 path.write_bytes(b"\xff\xfe")
 '''
@@ -227,13 +230,13 @@ import json
 import os
 from pathlib import Path
 
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 path = rd / "work" / tid / f"attempt-{attempt}.result.json"
 path.write_text(
     '{"status":"failed","note":"otherwise valid","at":"now","lease":'
-    + json.dumps(os.environ["RELAY_LEASE"])
+    + json.dumps(os.environ["BATON_LEASE"])
     + ',"changed_paths":[],"oversized":' + "9" * 5000 + "}\n"
 )
 '''
@@ -245,10 +248,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-root = Path(os.environ["RELAY_ROOT"])
-rd = Path(os.environ["RELAY_DIR"])
-tid = os.environ["RELAY_TASK_ID"]
-attempt = os.environ["RELAY_ATTEMPT"]
+root = Path(os.environ["BATON_ROOT"])
+rd = Path(os.environ["BATON_DIR"])
+tid = os.environ["BATON_TASK_ID"]
+attempt = os.environ["BATON_ATTEMPT"]
 path = root / "new" / "staged.txt"
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text("staged\n")
@@ -256,7 +259,7 @@ subprocess.run(["git", "add", str(path)], cwd=root, check=True)
 report = rd / "work" / tid / f"attempt-{attempt}.report.md"
 report.parent.mkdir(parents=True, exist_ok=True)
 brief = subprocess.run(
-    [sys.executable, str(rd / "relay"), "task", "brief", tid, "--phase", "report"],
+    [sys.executable, str(rd / "baton"), "task", "brief", tid, "--phase", "report"],
     cwd=root, check=True, capture_output=True, text=True,
 )
 token = next(line.removeprefix("Brief token: ") for line in brief.stdout.splitlines()
@@ -265,16 +268,16 @@ report.write_text(
     "# staged report\n\n## Result\nneeds_review\n\n## Changes\n- staged file\n\n"
     "## Verification\n- worker completed\n\n## Decisions and risks\n- none\n"
 )
-subprocess.run([sys.executable, str(rd / "relay"), "task", "finish", tid,
+subprocess.run([sys.executable, str(rd / "baton"), "task", "finish", tid,
                 "--status", "needs_review", "--brief", token,
                 "--changed", "new/staged.txt"],
                cwd=root, check=True)
 '''
 
 
-class RelayTests(unittest.TestCase):
+class BatonTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="attention-relay-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="baton-test-")
         self.base = Path(self.temp.name)
         self.worker_number = 0
 
@@ -310,12 +313,12 @@ class RelayTests(unittest.TestCase):
             self.git(project, "add", "seed.txt")
             self.git(project, "commit", "-qm", "seed")
         if initialize:
-            self.command([SOURCE_RELAY, "init", project], project, check=True)
+            self.command([SOURCE_BATON, "init", project], project, check=True)
         return project
 
-    def relay(self, project, *args, env=None, check=False, timeout=15):
+    def baton(self, project, *args, env=None, check=False, timeout=15):
         return self.command(
-            [project / ".attention-relay" / "relay", *args], project,
+            [project / ".baton" / "baton", *args], project,
             env=env, check=check, timeout=timeout,
         )
 
@@ -336,9 +339,9 @@ class RelayTests(unittest.TestCase):
             f"capsule_max_chars = {capsule_max_chars}\n"
             f"worker_timeout_minutes = {timeout_minutes}\n"
         )
-        (project / ".attention-relay" / "config.toml").write_text(config)
+        (project / ".baton" / "config.toml").write_text(config)
 
-    def task_create_command(self, title, scope=None, depends_on=None, tier=None):
+    def task_create_command(self, title, scope=None, depends_on=None, tier="default"):
         args = ["task", "create", "--title", title]
         for item in scope or []:
             args += ["--scope", item]
@@ -348,11 +351,11 @@ class RelayTests(unittest.TestCase):
             args += ["--tier", tier]
         return args
 
-    def create_task(self, project, title, scope=None, depends_on=None, tier=None):
+    def create_task(self, project, title, scope=None, depends_on=None, tier="default"):
         args = self.task_create_command(title, scope, depends_on, tier)
-        result = self.relay(project, *args, check=True)
+        result = self.baton(project, *args, check=True)
         task_id = result.stdout.split()[1]
-        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
         content = spec.read_text().replace(
             "Replace this line with one clear outcome.",
             f"Complete the {title} task.",
@@ -364,7 +367,7 @@ class RelayTests(unittest.TestCase):
         return task_id
 
     def write_memory(self, project, entries):
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         index = "\n".join(
             f"- {memory_id} [{audience}] {summary}"
             for memory_id, audience, summary, _body in entries
@@ -377,23 +380,23 @@ class RelayTests(unittest.TestCase):
             "# Memory\n\n## Index\n" + index + "\n\n## Entries\n\n" + bodies + "\n"
         )
 
-    def try_create_task(self, project, title, scope=None, depends_on=None, tier=None):
+    def try_create_task(self, project, title, scope=None, depends_on=None, tier="default"):
         args = self.task_create_command(title, scope, depends_on, tier)
-        return self.relay(project, *args)
+        return self.baton(project, *args)
 
     def state(self, project, task_id):
-        path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
+        path = project / ".baton" / "tasks" / f"{task_id}.json"
         return json.loads(path.read_text())
 
     def lease_task(self, project, task_id, lease):
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         state_path = runtime / "tasks" / f"{task_id}.json"
         task = json.loads(state_path.read_text())
         task["status"] = "running"
         task["runner"] = {"pid": None, "started_at": "now", "lease": lease}
         state_path.write_text(json.dumps(task))
         spec = (runtime / "tasks" / f"{task_id}.md").read_text()
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_brief_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_brief_probe")
         memory_entries = module["memory_index_entries"](
             (runtime / "memory.md").read_text()
         )
@@ -403,15 +406,15 @@ class RelayTests(unittest.TestCase):
         brief.parent.mkdir(parents=True, exist_ok=True)
         brief.write_text(f"Content digest: sha256:{digest}\n\n{capsule}")
         return {
-            "RELAY_TASK_ID": task_id,
-            "RELAY_ATTEMPT": str(task["attempt"]),
-            "RELAY_LEASE": lease,
-            "RELAY_DIR": runtime,
-            "RELAY_ROOT": project,
+            "BATON_TASK_ID": task_id,
+            "BATON_ATTEMPT": str(task["attempt"]),
+            "BATON_LEASE": lease,
+            "BATON_DIR": runtime,
+            "BATON_ROOT": project,
         }
 
     def report_brief_token(self, project, task_id, env):
-        brief = self.relay(
+        brief = self.baton(
             project, "task", "brief", task_id, "--phase", "report",
             env=env, check=True,
         )
@@ -435,14 +438,14 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, name)
         env = self.lease_task(project, task_id, name + "-lease")
         _brief, token = self.report_brief_token(project, task_id, env)
-        work = project / ".attention-relay" / "work" / task_id
+        work = project / ".baton" / "work" / task_id
         return project, task_id, env, work / "attempt-1.report.md", token
 
     def review_brief_token(self, project, task_id, env=None, include_log_tail=False):
         args = ["orchestrator", "brief", "--phase", "review", task_id]
         if include_log_tail:
             args.append("--include-log-tail")
-        brief = self.relay(
+        brief = self.baton(
             project, *args, env=env, check=True,
         )
         token = next(
@@ -454,27 +457,27 @@ class RelayTests(unittest.TestCase):
 
     def accept_task(self, project, task_id):
         _brief, token = self.review_brief_token(project, task_id)
-        return self.relay(
+        return self.baton(
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
 
     def test_init_requires_git_and_creates_only_runtime_files(self):
         plain = self.base / "plain"
         plain.mkdir()
-        result = self.command([SOURCE_RELAY, "init", plain], plain)
+        result = self.command([SOURCE_BATON, "init", plain], plain)
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((plain / ".attention-relay").exists())
+        self.assertFalse((plain / ".baton").exists())
 
         project = self.make_project()
-        initialized = self.command([SOURCE_RELAY, "init", project], project, check=True)
+        initialized = self.command([SOURCE_BATON, "init", project], project, check=True)
         self.assertIn(
-            ".attention-relay/relay orchestrator brief --phase start",
+            ".baton/baton orchestrator brief --phase start",
             initialized.stdout,
         )
         lines = (project / ".gitignore").read_text().splitlines()
-        self.assertEqual(lines.count(".attention-relay/"), 1)
-        runtime = project / ".attention-relay"
-        self.assertTrue(os.access(runtime / "relay", os.X_OK))
+        self.assertEqual(lines.count(".baton/"), 1)
+        runtime = project / ".baton"
+        self.assertTrue(os.access(runtime / "baton", os.X_OK))
         self.assertTrue((runtime / "config.toml").exists())
         self.assertFalse((runtime / "config.example.toml").exists())
 
@@ -482,25 +485,25 @@ class RelayTests(unittest.TestCase):
         memory = runtime / "memory.md"
         config.write_text("# preserved config\n")
         memory.write_text("# preserved memory\n")
-        self.command([SOURCE_RELAY, "init", project, "--force"], project, check=True)
+        self.command([SOURCE_BATON, "init", project, "--force"], project, check=True)
         self.assertEqual(config.read_text(), "# preserved config\n")
         self.assertEqual(memory.read_text(), "# preserved memory\n")
 
         nested = project / "nested"
         nested.mkdir()
-        nested_result = self.command([SOURCE_RELAY, "init", nested], nested)
+        nested_result = self.command([SOURCE_BATON, "init", nested], nested)
         self.assertNotEqual(nested_result.returncode, 0)
-        self.assertFalse((nested / ".attention-relay").exists())
+        self.assertFalse((nested / ".baton").exists())
 
         symlink_project = self.make_project("symlink-project", initialize=False)
         external = self.base / "external"
         external.mkdir()
         (external / "sentinel").write_text("unchanged\n")
-        (symlink_project / ".attention-relay").symlink_to(
+        (symlink_project / ".baton").symlink_to(
             external, target_is_directory=True,
         )
         escaped = self.command(
-            [SOURCE_RELAY, "init", symlink_project], symlink_project,
+            [SOURCE_BATON, "init", symlink_project], symlink_project,
         )
         self.assertNotEqual(escaped.returncode, 0)
         self.assertEqual(
@@ -522,27 +525,82 @@ class RelayTests(unittest.TestCase):
         )
         self.git(submodule_project, "commit", "-qam", "add submodule")
         unsupported = self.command(
-            [SOURCE_RELAY, "init", submodule_project], submodule_project,
+            [SOURCE_BATON, "init", submodule_project], submodule_project,
         )
         self.assertNotEqual(unsupported.returncode, 0)
         self.git(submodule_project, "rm", "--cached", "-q", "vendor")
         staged_removal = self.command(
-            [SOURCE_RELAY, "init", submodule_project], submodule_project,
+            [SOURCE_BATON, "init", submodule_project], submodule_project,
         )
         self.assertNotEqual(staged_removal.returncode, 0)
-        self.assertFalse((submodule_project / ".attention-relay").exists())
+        self.assertFalse((submodule_project / ".baton").exists())
+
+    def test_runtime_safety_rejects_nested_file_and_directory_symlinks(self):
+        for target_is_directory in (False, True):
+            with self.subTest(target_is_directory=target_is_directory):
+                project = self.make_project(
+                    "runtime-symlink-{}".format(
+                        "directory" if target_is_directory else "file"
+                    )
+                )
+                external = self.base / (
+                    "external-directory" if target_is_directory else "external-file"
+                )
+                if target_is_directory:
+                    external.mkdir()
+                else:
+                    external.write_text("outside runtime\n")
+                link = project / ".baton" / "work" / "nested-link"
+                link.symlink_to(external, target_is_directory=target_is_directory)
+
+                rejected = self.baton(project, "status")
+                self.assertEqual(rejected.returncode, 1)
+                self.assertIn(
+                    "managed runtime paths cannot be symlinks:",
+                    rejected.stderr,
+                )
+                self.assertIn("nested-link", rejected.stderr)
+
+    def test_status_reuses_loaded_tasks_when_rendering_next_actions(self):
+        project = self.make_project("status-load-count")
+        self.create_task(project, "status load count", ["status/**"])
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_status_load_probe")
+        globals_dict = module["cmd_status"].__globals__
+        original = globals_dict["load_all_tasks"]
+        calls = []
+
+        def counted_load(baton_dir, validate_history=True):
+            calls.append((baton_dir, validate_history))
+            return original(baton_dir, validate_history)
+
+        globals_dict["load_all_tasks"] = counted_load
+        previous_directory = os.getcwd()
+        previous_baton_dir = os.environ.get("BATON_DIR")
+        try:
+            os.chdir(project)
+            os.environ["BATON_DIR"] = str(project / ".baton")
+            with redirect_stdout(io.StringIO()):
+                module["cmd_status"](SimpleNamespace())
+        finally:
+            globals_dict["load_all_tasks"] = original
+            os.chdir(previous_directory)
+            if previous_baton_dir is None:
+                os.environ.pop("BATON_DIR", None)
+            else:
+                os.environ["BATON_DIR"] = previous_baton_dir
+        self.assertEqual(len(calls), 1)
 
     def test_scope_normalization_and_input_validation(self):
         project = self.make_project()
         first = self.create_task(project, "plain scope", ["src/**"])
         second = self.create_task(project, "dot scope", ["./src/**"])
-        dry = self.relay(project, "run", "--dry-run", check=True)
+        dry = self.baton(project, "run", "--dry-run", check=True)
         self.assertIn(first, dry.stdout)
         self.assertIn(f"skip {second}: scope conflicts", dry.stdout)
 
         upper = self.create_task(project, "upper scope", ["Case/**"])
         lower = self.create_task(project, "lower scope", ["case/**"])
-        case_dry = self.relay(project, "run", upper, lower, "--dry-run", check=True)
+        case_dry = self.baton(project, "run", upper, lower, "--dry-run", check=True)
         self.assertIn(f"would run: {upper}", case_dry.stdout)
         self.assertIn(f"skip {lower}: scope conflicts", case_dry.stdout)
 
@@ -552,27 +610,63 @@ class RelayTests(unittest.TestCase):
         for bad in ("../src/**", absolute_scope, "src/[ab].py", "src/**x/file"):
             result = self.try_create_task(project, "bad scope", [bad])
             self.assertNotEqual(result.returncode, 0, bad)
-        rejected_id = self.relay(
+        rejected_id = self.baton(
             project, "task", "create", "--title", "bad", "--id", "T999-bad",
         )
         self.assertNotEqual(rejected_id.returncode, 0)
         secret = project / "secret.json"
         secret.write_text('{"sentinel": "do-not-read"}\n')
-        traversal = self.relay(project, "task", "show", "../../secret")
+        traversal = self.baton(project, "task", "show", "../../secret")
         self.assertNotEqual(traversal.returncode, 0)
         self.assertNotIn("do-not-read", traversal.stdout)
         for bad_id in ("T000-lower", "T1-bad", "../T001-bad"):
-            result = self.relay(project, "task", "show", bad_id)
+            result = self.baton(project, "task", "show", bad_id)
             self.assertNotEqual(result.returncode, 0, bad_id)
-        empty_title = self.relay(
+        empty_title = self.baton(
             project, "task", "create", "--title", "", "--scope", "empty/**",
         )
         self.assertNotEqual(empty_title.returncode, 0)
         truncated = self.create_task(project, "x" * 39 + " next", ["slug/**"])
         self.assertEqual(truncated, "T006-" + "x" * 39)
         for value in ("0", "-1"):
-            result = self.relay(project, "run", "--dry-run", "--max-parallel", value)
+            result = self.baton(project, "run", "--dry-run", "--max-parallel", value)
             self.assertNotEqual(result.returncode, 0, value)
+
+    def test_task_create_rejects_multiline_title_section_injection(self):
+        project = self.make_project()
+        runtime = project / ".baton"
+        title = "normal title\n\n## Objective\nInjected objective from title"
+        rejected = self.baton(
+            project, "task", "create", "--title", title, "--tier", "default",
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("single-line", rejected.stderr)
+        self.assertEqual(list((runtime / "tasks").iterdir()), [])
+
+        unicode_title = "aperçu 東京 😀"
+        task_id = self.create_task(project, unicode_title)
+        self.assertEqual(self.state(project, task_id)["title"], unicode_title)
+        spec = runtime / "tasks" / f"{task_id}.md"
+        self.assertEqual(spec.read_text().count("## Objective\n"), 1)
+
+    def test_task_create_rejects_unicode_line_separators_without_artifacts(self):
+        for separator in ("\u2028", "\u2029"):
+            for variant, title in (
+                    ("embedded", f"safe{separator}unsafe"),
+                    ("trailing", f"trailing{separator}")):
+                with self.subTest(separator=hex(ord(separator)), variant=variant):
+                    project = self.make_project(
+                        f"unicode-title-{ord(separator):x}-{variant}"
+                    )
+                    runtime = project / ".baton"
+                    rejected = self.baton(
+                        project, "task", "create", "--title", title,
+                        "--tier", "default",
+                    )
+                    self.assertEqual(rejected.returncode, 1)
+                    self.assertIn("single-line", rejected.stderr)
+                    self.assertNotIn("Traceback", rejected.stderr)
+                    self.assertEqual(list((runtime / "tasks").iterdir()), [])
 
     def test_parallel_wave_reports_diffs_and_lifecycle(self):
         project = self.make_project()
@@ -581,11 +675,11 @@ class RelayTests(unittest.TestCase):
         one = self.create_task(project, "alpha", ["alpha/**"])
         two = self.create_task(project, "beta", ["beta/**"])
         barrier = self.base / "barrier"
-        run = self.relay(project, "run", env={"BARRIER": barrier}, check=True)
+        run = self.baton(project, "run", env={"BARRIER": barrier}, check=True)
         self.assertIn(one, run.stdout)
         for task_id in (one, two):
             self.assertEqual(self.state(project, task_id)["status"], "needs_review")
-            work = project / ".attention-relay" / "work" / task_id
+            work = project / ".baton" / "work" / task_id
             self.assertTrue((work / "attempt-1.report.md").stat().st_size)
             diff = (work / "attempt-1.diff").read_text()
             self.assertIn(f"{task_id}.txt", diff)
@@ -597,23 +691,23 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         first = self.create_task(project, "first", ["same/**"])
-        self.relay(project, "run", check=True)
+        self.baton(project, "run", check=True)
         self.accept_task(project, first)
 
         human = project / "same" / "human.txt"
         human.write_text("already here\n")
         second = self.create_task(project, "second", ["same/**"], [first])
-        self.relay(project, "run", check=True)
-        diff = (project / ".attention-relay" / "work" / second / "attempt-1.diff").read_text()
+        self.baton(project, "run", check=True)
+        diff = (project / ".baton" / "work" / second / "attempt-1.diff").read_text()
         self.assertIn(f"{second}.txt", diff)
         self.assertNotIn(f"{first}.txt", diff)
         self.assertNotIn("human.txt", diff)
 
-        self.relay(project, "task", "return", second, "--reason", "retry", check=True)
+        self.baton(project, "task", "return", second, "--reason", "retry", check=True)
         no_change = self.write_worker(NO_CHANGE_WORKER)
         self.configure(project, no_change)
-        self.relay(project, "run", second, check=True)
-        retry_diff = project / ".attention-relay" / "work" / second / "attempt-2.diff"
+        self.baton(project, "run", second, check=True)
+        retry_diff = project / ".baton" / "work" / second / "attempt-2.diff"
         self.assertEqual(retry_diff.read_text(), "")
 
     def test_scope_violation_blocks_acceptance_even_when_file_was_dirty(self):
@@ -623,24 +717,24 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "scoped", ["inside/**"])
-        run = self.relay(project, "run", env={"WRITE_OUTSIDE": "outside.txt"}, check=True)
+        run = self.baton(project, "run", env={"WRITE_OUTSIDE": "outside.txt"}, check=True)
         self.assertIn("scope violation", run.stdout.lower())
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "blocked")
         self.assertIn("outside.txt", state["scope_violations"])
         violations_diff = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "attempt-1.violations.diff"
         )
         self.assertIn("outside.txt", violations_diff.read_text())
-        accept = self.relay(project, "task", "accept", task_id)
+        accept = self.baton(project, "task", "accept", task_id)
         self.assertNotEqual(accept.returncode, 0)
-        returned = self.relay(
+        returned = self.baton(
             project, "task", "return", task_id, "--reason", "retry",
         )
         self.assertNotEqual(returned.returncode, 0)
         outside.write_text("before\n")
-        self.relay(
+        self.baton(
             project, "task", "return", task_id,
             "--reason", "outside file restored", check=True,
         )
@@ -651,31 +745,55 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "workflow", [".github/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         self.assertEqual(self.state(project, task_id)["status"], "needs_review")
-        diff = project / ".attention-relay" / "work" / task_id / "attempt-1.diff"
+        diff = project / ".baton" / "work" / task_id / "attempt-1.diff"
         self.assertIn(f".github/{task_id}.txt", diff.read_text())
+
+    def test_changed_paths_preserve_literal_posix_filename_characters(self):
+        worker = self.write_worker(GOOD_WORKER.replace(
+            'target_file = target / f"{tid}.txt"',
+            'target_file = target / os.environ["LITERAL_NAME"]',
+        ))
+        names = (
+            "[id].txt", "what?.txt", "star*.txt", " trailing.txt ",
+            "back\\slash.txt",
+        )
+        for index, name in enumerate(names):
+            with self.subTest(name=name):
+                project = self.make_project(f"literal-path-{index}")
+                self.configure(project, worker)
+                task_id = self.create_task(project, f"literal path {index}", ["src/**"])
+                self.baton(
+                    project, "run", task_id, env={"LITERAL_NAME": name}, check=True,
+                )
+                state = self.state(project, task_id)
+                self.assertEqual(state["status"], "needs_review")
+                worker_exit = state["history"][-1]
+                expected = ["src/" + name]
+                self.assertEqual(worker_exit["declared_paths"], expected)
+                self.assertEqual(worker_exit["observed_paths"], expected)
 
     def test_needs_decision_round_trip(self):
         project = self.make_project()
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "decision", ["decision/**"])
-        self.relay(
+        self.baton(
             project, "run", task_id,
             env={"SUBMIT_STATUS": "needs_decision"}, check=True,
         )
         self.assertEqual(self.state(project, task_id)["status"], "needs_decision")
-        self.relay(
+        self.baton(
             project, "task", "decide", task_id,
             "--answer", "Use option A", check=True,
         )
         self.assertEqual(self.state(project, task_id)["attempt"], 2)
-        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
         self.assertIn("Use option A", spec.read_text())
 
     def test_decision_question_text_is_sanitized_flattened_and_exactly_bounded(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_decision_text_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_decision_text_probe")
         flatten = module["flatten_bounded_text"]
         raw = (
             "\x1b]terminal title\x07 First\r\n\t\x1b[31msecond\x1b[0m"
@@ -707,7 +825,7 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         reviews = [self.create_task(project, f"review {index}") for index in range(4)]
         decisions = [self.create_task(project, f"decision {index}") for index in range(3)]
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         raw_question = (
             "Choose\n\x1b[31moption\x1b[0m \x00\x85 carefully: " + "x" * 200
         )
@@ -728,7 +846,7 @@ class RelayTests(unittest.TestCase):
             })
             path.write_text(json.dumps(task))
 
-        status = self.relay(project, "status", check=True)
+        status = self.baton(project, "status", check=True)
         self.assertNotIn("\x1b", status.stdout)
         self.assertNotIn("\x00", status.stdout)
         self.assertIn(" - worker question: Choose option carefully: ", status.stdout)
@@ -747,7 +865,7 @@ class RelayTests(unittest.TestCase):
         fallback_project = self.make_project("decision-fallback")
         fallback = self.create_task(fallback_project, "missing question")
         fallback_path = (
-            fallback_project / ".attention-relay" / "tasks" / f"{fallback}.json"
+            fallback_project / ".baton" / "tasks" / f"{fallback}.json"
         )
         fallback_task = json.loads(fallback_path.read_text())
         fallback_task["status"] = "needs_decision"
@@ -756,14 +874,14 @@ class RelayTests(unittest.TestCase):
             "event": "worker_exited", "status": "needs_decision", "note": None,
         })
         fallback_path.write_text(json.dumps(fallback_task))
-        fallback_status = self.relay(fallback_project, "status", check=True)
+        fallback_status = self.baton(fallback_project, "status", check=True)
         self.assertIn(f"\n- decide {fallback}\n", fallback_status.stdout)
         self.assertNotIn("worker question:", fallback_status.stdout)
 
     def test_start_brief_bounds_questions_and_recommends_a_real_decision_id(self):
         project = self.make_project()
         decisions = [self.create_task(project, f"start decision {index}") for index in range(5)]
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         for index, task_id in enumerate(decisions):
             path = runtime / "tasks" / f"{task_id}.json"
             task = json.loads(path.read_text())
@@ -775,7 +893,7 @@ class RelayTests(unittest.TestCase):
             })
             path.write_text(json.dumps(task))
 
-        started = self.relay(
+        started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
         decision_block = started.stdout.split("Needs decision: ", 1)[1].split(
@@ -793,10 +911,10 @@ class RelayTests(unittest.TestCase):
             question_lines[1], f"- {decisions[1]}: worker question: Worker question 1?",
         )
         self.assertIn(
-            f"Recommended next command: relay task decide {decisions[0]} --answer ANSWER",
+            f"Recommended next command: .baton/baton task decide {decisions[0]} --answer ANSWER",
             started.stdout,
         )
-        self.assertNotIn("relay task decide +1 more", started.stdout)
+        self.assertNotIn(".baton/baton task decide +1 more", started.stdout)
 
     def test_start_brief_difficulty_levels_are_missing_only_parseable_and_bounded(self):
         project = self.make_project()
@@ -807,7 +925,7 @@ class RelayTests(unittest.TestCase):
             body = output.split(marker, 1)[1].split("\n\n", 1)[0]
             return ["Difficulty levels:", *body.splitlines()]
 
-        started = self.relay(
+        started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
         section = difficulty_section(started)
@@ -817,7 +935,7 @@ class RelayTests(unittest.TestCase):
             section,
         )
         self.assertTrue(any(
-            "ask the USER" in line and "model (and optionally provider)" in line
+            "Ask the USER" in line and "GPT 5.6 Sol/high/elite senior" in line
             for line in section
         ))
         snippet = "\n".join(
@@ -825,12 +943,16 @@ class RelayTests(unittest.TestCase):
         )
         parsed = tomllib.loads(snippet)
         self.assertEqual(list(parsed["tiers"]), ["hard", "medium", "easy"])
-        for tier in parsed["tiers"].values():
-            command = tier["command"]
-            self.assertIn("--ignore-rules", command)
-            self.assertIn("-m MODEL", command)
-            self.assertIn("--provider PROVIDER", command)
-            self.assertIn("-q {prompt}", command)
+        self.assertIn("--ignore-rules", parsed["tiers"]["hard"]["command"])
+        self.assertIn("GPT-5.6-Sol", parsed["tiers"]["hard"]["command"])
+        self.assertEqual(
+            parsed["tiers"]["medium"]["command"],
+            "hermes-medium-worker {prompt_file}",
+        )
+        self.assertEqual(
+            parsed["tiers"]["easy"]["command"],
+            "baton-easy-worker {prompt_file}",
+        )
         self.assertTrue(any(
             "worker_timeout_minutes/capsule_max_chars are optional" in line
             for line in section
@@ -838,14 +960,14 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(any(
             "no per-invocation reasoning override" in line for line in section
         ))
-        self.assertTrue(any("optional conventions" in line for line in section))
+        self.assertTrue(any("requires an explicit validated --tier" in line for line in section))
 
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text() + (
             "\n[tiers.hard]\ncapsule_max_chars = 5000\n"
             "\n[tiers.custom]\ncapsule_max_chars = 4500\n"
         ))
-        partial = self.relay(
+        partial = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
         partial_section = difficulty_section(partial)
@@ -868,7 +990,7 @@ class RelayTests(unittest.TestCase):
             "\n[tiers.medium]\nworker_timeout_minutes = 45\n"
             "\n[tiers.easy]\nworker_timeout_minutes = 20\n"
         ))
-        complete = self.relay(
+        complete = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
         self.assertNotIn("Difficulty levels:", complete)
@@ -881,7 +1003,7 @@ class RelayTests(unittest.TestCase):
         marker = self.base / "finished"
         self_accept = self.base / "self-accept"
         proc = subprocess.Popen(
-            [str(project / ".attention-relay" / "relay"), "run", task_id],
+            [str(project / ".baton" / "baton"), "run", task_id],
             cwd=project,
             env=dict(os.environ, FINISH_MARKER=str(marker), SELF_ACCEPT_RESULT=str(self_accept)),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -891,27 +1013,27 @@ class RelayTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(marker.exists())
         self.assertEqual(self.state(project, task_id)["status"], "running")
-        self.assertNotEqual(self.relay(project, "task", "accept", task_id).returncode, 0)
-        dry = self.relay(project, "run", task_id, "--dry-run")
+        self.assertNotEqual(self.baton(project, "task", "accept", task_id).returncode, 0)
+        dry = self.baton(project, "run", task_id, "--dry-run")
         self.assertIn("status is running", dry.stdout)
         stdout, stderr = proc.communicate(timeout=10)
         self.assertEqual(proc.returncode, 0, stdout + stderr)
         self.assertNotEqual(self_accept.read_text(), "0")
         self.assertEqual(self.state(project, task_id)["status"], "needs_review")
-        diff = project / ".attention-relay" / "work" / task_id / "attempt-1.diff"
+        diff = project / ".baton" / "work" / task_id / "attempt-1.diff"
         self.assertIn("after-finish.txt", diff.read_text())
 
     def test_worker_phase_briefs_and_default_finish_gate(self):
         project = self.make_project()
         task_id = self.create_task(project, "brief gate", ["brief/**"])
         env = self.lease_task(project, task_id, "lease-one")
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         token_path = runtime / "work" / task_id / "finish-brief-token.json"
 
-        unleased = self.relay(project, "task", "brief", task_id, "--phase", "edit")
+        unleased = self.baton(project, "task", "brief", task_id, "--phase", "edit")
         self.assertNotEqual(unleased.returncode, 0)
         for phase, heading in (("edit", "Edit"), ("verify", "Verify")):
-            output = self.relay(
+            output = self.baton(
                 project, "task", "brief", task_id, "--phase", phase,
                 env=env, check=True,
             )
@@ -931,15 +1053,15 @@ class RelayTests(unittest.TestCase):
         finish = ["task", "finish", task_id, "--status", "needs_review"]
         for token in (None, "foreign-token", first_token):
             command = finish + (["--brief", token] if token else [])
-            rejected = self.relay(project, *command, env=env)
+            rejected = self.baton(project, *command, env=env)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("report-phase brief token is required", rejected.stderr)
 
-        self.relay(project, *finish, "--brief", second_token, env=env, check=True)
+        self.baton(project, *finish, "--brief", second_token, env=env, check=True)
         self.assertFalse(token_path.exists())
         result = runtime / "work" / task_id / "attempt-1.result.json"
         result.unlink()
-        replay = self.relay(
+        replay = self.baton(
             project, *finish, "--brief", second_token, env=env,
         )
         self.assertNotEqual(replay.returncode, 0)
@@ -950,12 +1072,12 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "brief receipts", ["receipts/**"])
         env = self.lease_task(project, task_id, "receipt-lease")
         receipt_path = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "attempt-1.briefs.json"
         )
         receipt_path.write_text('{"phases": ["malformed"], "token": "must-disappear"}\n')
 
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "edit",
             env=env, check=True,
         )
@@ -972,7 +1094,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(first["phases"]["edit"]["count"], 1)
         self.assertNotIn("token", receipt_path.read_text())
 
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "edit",
             env=env, check=True,
         )
@@ -988,7 +1110,7 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         task_id = self.create_task(project, "oversized receipt", ["receipts/**"])
         env = self.lease_task(project, task_id, "oversized-receipt-lease")
-        work = project / ".attention-relay" / "work" / task_id
+        work = project / ".baton" / "work" / task_id
         receipt_path = work / "attempt-1.briefs.json"
         digest = (work / "attempt-1.brief.md").read_text().splitlines()[0].removeprefix(
             "Content digest: ",
@@ -1001,7 +1123,7 @@ class RelayTests(unittest.TestCase):
             + "9" * 5000 + "}}}\n"
         )
 
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "edit",
             env=env, check=True,
         )
@@ -1011,7 +1133,7 @@ class RelayTests(unittest.TestCase):
 
     def test_phase_sequence_gate_enforces_order_and_edit_invalidates_report_token(self):
         project = self.make_project()
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text().replace(
             "phase_sequence_requires_briefs = false",
             "phase_sequence_requires_briefs = true",
@@ -1019,53 +1141,53 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "phase sequence", ["sequence/**"])
         env = self.lease_task(project, task_id, "sequence-lease")
 
-        verify = self.relay(
+        verify = self.baton(
             project, "task", "brief", task_id, "--phase", "verify", env=env,
         )
         self.assertEqual(
             verify.stderr,
-            f"error: phase sequence requires an edit brief; run `relay task brief "
+            f"error: phase sequence requires an edit brief; run `.baton/baton task brief "
             f"{task_id} --phase edit`\n",
         )
-        report = self.relay(
+        report = self.baton(
             project, "task", "brief", task_id, "--phase", "report", env=env,
         )
         self.assertEqual(report.stderr, verify.stderr)
 
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "edit",
             env=env, check=True,
         )
-        report = self.relay(
+        report = self.baton(
             project, "task", "brief", task_id, "--phase", "report", env=env,
         )
         self.assertEqual(
             report.stderr,
-            f"error: phase sequence requires a verify brief; run `relay task brief "
+            f"error: phase sequence requires a verify brief; run `.baton/baton task brief "
             f"{task_id} --phase verify`\n",
         )
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "verify",
             env=env, check=True,
         )
         _brief, stale_token = self.report_brief_token(project, task_id, env)
         token_path = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "finish-brief-token.json"
         )
         self.assertTrue(token_path.exists())
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "edit",
             env=env, check=True,
         )
         self.assertFalse(token_path.exists())
-        stale = self.relay(
+        stale = self.baton(
             project, "task", "finish", task_id, "--status", "failed",
             "--brief", stale_token, env=env,
         )
         self.assertIn("fresh report-phase brief token is required", stale.stderr)
         _brief, fresh_token = self.report_brief_token(project, task_id, env)
-        self.relay(
+        self.baton(
             project, "task", "finish", task_id, "--status", "failed",
             "--brief", fresh_token, env=env, check=True,
         )
@@ -1075,12 +1197,12 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "phase sequence off", ["sequence-off/**"])
         env = self.lease_task(project, task_id, "sequence-off-lease")
         self.report_brief_token(project, task_id, env)
-        self.relay(
+        self.baton(
             project, "task", "brief", task_id, "--phase", "verify",
             env=env, check=True,
         )
         receipt_path = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "attempt-1.briefs.json"
         )
         self.assertEqual(
@@ -1089,18 +1211,18 @@ class RelayTests(unittest.TestCase):
 
     def test_finish_gate_can_be_disabled(self):
         project = self.make_project()
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text().replace(
             "finish_requires_brief = true", "finish_requires_brief = false",
         ))
         task_id = self.create_task(project, "gate off", ["off/**"])
         env = self.lease_task(project, task_id, "gate-off-lease")
         report = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "attempt-1.report.md"
         )
         report.write_text(self.report_text())
-        self.relay(
+        self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             env=env, check=True,
         )
@@ -1113,7 +1235,7 @@ class RelayTests(unittest.TestCase):
         work = report.parent
         token_path = work / "finish-brief-token.json"
         result_path = work / "attempt-1.result.json"
-        state_path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
         state_before = state_path.read_bytes()
         token_before = token_path.read_bytes()
         command = [
@@ -1121,7 +1243,7 @@ class RelayTests(unittest.TestCase):
             "--brief", token,
         ]
 
-        rejected = self.relay(project, *command, env=env)
+        rejected = self.baton(project, *command, env=env)
         self.assertEqual(rejected.returncode, 1)
         self.assertEqual(
             rejected.stderr,
@@ -1134,14 +1256,14 @@ class RelayTests(unittest.TestCase):
         self.assertFalse(result_path.exists())
 
         report.write_text(self.report_text())
-        self.relay(project, *command, env=env, check=True)
+        self.baton(project, *command, env=env, check=True)
         self.assertFalse(token_path.exists())
         self.assertEqual(json.loads(result_path.read_text())["status"], "needs_review")
 
     def test_report_empty_verification_body_is_rejected(self):
         project, task_id, env, report, token = self.prepare_finish("empty-verification")
         report.write_text(self.report_text().replace("- test verification", ""))
-        rejected = self.relay(
+        rejected = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env,
         )
@@ -1149,10 +1271,30 @@ class RelayTests(unittest.TestCase):
         self.assertIn("report section `## Verification` has an empty body", rejected.stderr)
         self.assertIn("same `--brief` token", rejected.stderr)
 
+    def test_report_empty_fenced_core_sections_are_rejected(self):
+        project, task_id, env, report, token = self.prepare_finish("empty-fences")
+        report.write_text(
+            "# report\n\n## Result\nneeds_review\n\n## Changes\n```\n```\n\n"
+            "## Verification\n~~~\n~~~\n\n## Decisions and risks\n- none\n"
+        )
+        command = [
+            "task", "finish", task_id, "--status", "needs_review",
+            "--brief", token,
+        ]
+        rejected = self.baton(project, *command, env=env)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("report section `## Changes` has an empty body", rejected.stderr)
+        self.assertIn("report section `## Verification` has an empty body", rejected.stderr)
+        self.assertFalse((report.parent / "attempt-1.result.json").exists())
+        self.assertTrue((report.parent / "finish-brief-token.json").exists())
+
+        report.write_text(self.report_text())
+        self.baton(project, *command, env=env, check=True)
+
     def test_report_result_must_match_submitted_status(self):
         project, task_id, env, report, token = self.prepare_finish("result-mismatch")
         report.write_text(self.report_text(status="failed"))
-        rejected = self.relay(
+        rejected = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env,
         )
@@ -1170,7 +1312,7 @@ class RelayTests(unittest.TestCase):
             "```markdown\n## Verification\n- fake verification\n```\n\n"
             "## Decisions and risks\n- none\n"
         )
-        rejected = self.relay(
+        rejected = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env,
         )
@@ -1184,7 +1326,7 @@ class RelayTests(unittest.TestCase):
             "   ```\n## Verification\n- fake verification\n   ````\n\n"
             "## Decisions and risks\n- none\n"
         )
-        rejected = self.relay(
+        rejected = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env,
         )
@@ -1198,7 +1340,7 @@ class RelayTests(unittest.TestCase):
             "```\n~~~\n## Verification\n- fake verification\n```\n\n"
             "## Decisions and risks\n- none\n"
         )
-        rejected = self.relay(
+        rejected = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env,
         )
@@ -1213,7 +1355,7 @@ class RelayTests(unittest.TestCase):
             "````\n```\n## Verification\n- fake verification\n````\n\n"
             "## Decisions and risks\n- none\n"
         )
-        rejected = self.relay(
+        rejected = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env,
         )
@@ -1224,19 +1366,19 @@ class RelayTests(unittest.TestCase):
     def test_crlf_structured_report_is_accepted(self):
         project, task_id, env, report, token = self.prepare_finish("crlf-report")
         report.write_bytes(self.report_text(newline="\r\n").encode("utf-8"))
-        self.relay(
+        self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env, check=True,
         )
 
     def test_report_section_gate_off_accepts_free_form_report(self):
         project, task_id, env, report, token = self.prepare_finish("section-gate-off")
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text().replace(
             "report_requires_sections = true", "report_requires_sections = false",
         ))
         report.write_text("free-form review report\n")
-        self.relay(
+        self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", token, env=env, check=True,
         )
@@ -1247,7 +1389,7 @@ class RelayTests(unittest.TestCase):
                 project, task_id, env, _report, token = self.prepare_finish(
                     "unstructured-" + status.replace("_", "-"),
                 )
-                self.relay(
+                self.baton(
                     project, "task", "finish", task_id, "--status", status,
                     "--brief", token, env=env, check=True,
                 )
@@ -1267,7 +1409,7 @@ class RelayTests(unittest.TestCase):
                 else:
                     expected = "report file is missing"
                 token_path = report.parent / "finish-brief-token.json"
-                rejected = self.relay(
+                rejected = self.baton(
                     project, "task", "finish", task_id, "--status", "needs_review",
                     "--brief", token, env=env,
                 )
@@ -1277,11 +1419,11 @@ class RelayTests(unittest.TestCase):
 
     def test_non_boolean_report_section_gate_fails_validate(self):
         project = self.make_project("invalid-report-gate")
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text().replace(
             "report_requires_sections = true", 'report_requires_sections = "yes"',
         ))
-        validation = self.relay(project, "validate")
+        validation = self.baton(project, "validate")
         self.assertEqual(validation.returncode, 1)
         self.assertIn(
             "config: report_requires_sections must be true or false",
@@ -1290,12 +1432,12 @@ class RelayTests(unittest.TestCase):
 
     def test_non_boolean_phase_sequence_gate_fails_validate(self):
         project = self.make_project("invalid-phase-sequence-gate")
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text().replace(
             "phase_sequence_requires_briefs = false",
             'phase_sequence_requires_briefs = "yes"',
         ))
-        validation = self.relay(project, "validate")
+        validation = self.baton(project, "validate")
         self.assertEqual(validation.returncode, 1)
         self.assertIn(
             "config: phase_sequence_requires_briefs must be true or false",
@@ -1308,13 +1450,13 @@ class RelayTests(unittest.TestCase):
         first_env = self.lease_task(project, task_id, "first-lease")
         _brief, old_token = self.report_brief_token(project, task_id, first_env)
 
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         state_path = runtime / "tasks" / f"{task_id}.json"
         task = json.loads(state_path.read_text())
         task["status"] = "needs_review"
         task.pop("runner")
         state_path.write_text(json.dumps(task))
-        self.relay(
+        self.baton(
             project, "task", "return", task_id, "--reason", "retry token",
             check=True,
         )
@@ -1322,7 +1464,7 @@ class RelayTests(unittest.TestCase):
         second_env = self.lease_task(project, task_id, "second-lease")
         report = runtime / "work" / task_id / "attempt-2.report.md"
         report.write_text("# retry report\n")
-        stale = self.relay(
+        stale = self.baton(
             project, "task", "finish", task_id, "--status", "needs_review",
             "--brief", old_token, env=second_env,
         )
@@ -1333,9 +1475,9 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         self.configure(project, self.write_worker(GOOD_WORKER))
         task_id = self.create_task(project, "review gate", ["review/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
 
-        missing = self.relay(project, "task", "accept", task_id)
+        missing = self.baton(project, "task", "accept", task_id)
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("review-phase brief token is required", missing.stderr)
         brief, first_token = self.review_brief_token(project, task_id)
@@ -1348,7 +1490,7 @@ class RelayTests(unittest.TestCase):
         for artifact in ("Report", "Result", "Diff"):
             self.assertRegex(brief.stdout, rf"- {artifact}: .* \(sha256:[0-9a-f]{{12}}\)")
         token_record = json.loads((
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "review-brief-token.json"
         ).read_text())
         self.assertEqual(token_record["token"], first_token)
@@ -1362,42 +1504,42 @@ class RelayTests(unittest.TestCase):
             self.assertRegex(token_record["evidence"][name], r"^sha256:[0-9a-f]{64}$")
         _replacement, current_token = self.review_brief_token(project, task_id)
         for token in ("wrong", first_token):
-            rejected = self.relay(
+            rejected = self.baton(
                 project, "task", "accept", task_id, "--brief", token,
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("review-phase brief token is required", rejected.stderr)
 
         worker_env = {
-            "RELAY_TASK_ID": task_id, "RELAY_ATTEMPT": "1", "RELAY_LEASE": "worker",
+            "BATON_TASK_ID": task_id, "BATON_ATTEMPT": "1", "BATON_LEASE": "worker",
         }
-        denied = self.relay(
+        denied = self.baton(
             project, "orchestrator", "brief", "--phase", "review", task_id,
             env=worker_env,
         )
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
 
-        self.relay(
+        self.baton(
             project, "task", "accept", task_id, "--brief", current_token, check=True,
         )
         token_path = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "review-brief-token.json"
         )
         self.assertFalse(token_path.exists())
-        state_path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
         state["status"] = "needs_review"
         state_path.write_text(json.dumps(state))
-        replay = self.relay(
+        replay = self.baton(
             project, "task", "accept", task_id, "--brief", current_token,
         )
         self.assertNotEqual(replay.returncode, 0)
         self.assertIn("review-phase brief token is required", replay.stderr)
 
     def test_attempt_diff_summary_uses_observed_paths_and_exact_patch_state(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_diff_stat_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_diff_stat_probe")
         patch = self.base / "attempt.diff"
         patch.write_bytes(
             b"diff --git a/added.txt b/added.txt\n"
@@ -1444,8 +1586,8 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
         task_id = self.create_task(project, "review context", ["context/**"])
-        self.relay(project, "run", task_id, check=True)
-        runtime = project / ".attention-relay"
+        self.baton(project, "run", task_id, check=True)
+        runtime = project / ".baton"
         work = runtime / "work" / task_id
         state_path = runtime / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
@@ -1517,7 +1659,7 @@ class RelayTests(unittest.TestCase):
             "Untrusted worker log tail (opt-in):\nlog tail unavailable",
             unavailable.stdout,
         )
-        rejected = self.relay(
+        rejected = self.baton(
             project, "orchestrator", "brief", "--phase", "start",
             "--include-log-tail",
         )
@@ -1527,7 +1669,7 @@ class RelayTests(unittest.TestCase):
         )
 
     def test_sanitize_log_text_redacts_lowercase_and_mixed_case_labels(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_log_sanitizer_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_log_sanitizer_probe")
         sanitize = module["sanitize_log_text"]
         self.assertEqual(sanitize("password: hunter2\n"), "password: [redacted]\n")
         labels = (
@@ -1547,35 +1689,35 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         self.configure(project, self.write_worker(GOOD_WORKER))
         task_id = self.create_task(project, "return review", ["return-review/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         _brief, stale_token = self.review_brief_token(project, task_id)
         token_path = (
-            project / ".attention-relay" / "work" / task_id
+            project / ".baton" / "work" / task_id
             / "review-brief-token.json"
         )
-        self.relay(
+        self.baton(
             project, "task", "return", task_id, "--reason", "try again", check=True,
         )
         self.assertFalse(token_path.exists())
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-        self.relay(project, "run", task_id, check=True)
-        invalidated = self.relay(
+        self.baton(project, "run", task_id, check=True)
+        invalidated = self.baton(
             project, "task", "accept", task_id, "--brief", stale_token,
         )
         self.assertNotEqual(invalidated.returncode, 0)
 
         gate_off = self.make_project("gate-off-accept")
         self.configure(gate_off, self.write_worker(GOOD_WORKER))
-        config = gate_off / ".attention-relay" / "config.toml"
+        config = gate_off / ".baton" / "config.toml"
         config.write_text(config.read_text() + "\n[gates]\naccept_requires_brief = false\n")
         gate_off_id = self.create_task(gate_off, "accept gate off", ["gate-off/**"])
-        self.relay(gate_off, "run", gate_off_id, check=True)
+        self.baton(gate_off, "run", gate_off_id, check=True)
         gate_off_report = (
-            gate_off / ".attention-relay" / "work" / gate_off_id
+            gate_off / ".baton" / "work" / gate_off_id
             / "attempt-1.report.md"
         )
         gate_off_report.write_text(gate_off_report.read_text() + "changed without brief\n")
-        self.relay(gate_off, "task", "accept", gate_off_id, check=True)
+        self.baton(gate_off, "task", "accept", gate_off_id, check=True)
 
     def test_review_evidence_mutations_reject_without_consuming_token(self):
         for artifact in ("report.md", "result.json", "diff"):
@@ -1583,10 +1725,10 @@ class RelayTests(unittest.TestCase):
                 project = self.make_project("mutated-" + artifact.replace(".", "-"))
                 self.configure(project, self.write_worker(GOOD_WORKER))
                 task_id = self.create_task(project, "mutate " + artifact, ["mutate/**"])
-                self.relay(project, "run", task_id, check=True)
+                self.baton(project, "run", task_id, check=True)
                 _brief, token = self.review_brief_token(project, task_id)
                 token_path = (
-                    project / ".attention-relay" / "work" / task_id
+                    project / ".baton" / "work" / task_id
                     / "review-brief-token.json"
                 )
                 evidence_path = (
@@ -1594,7 +1736,7 @@ class RelayTests(unittest.TestCase):
                 )
                 evidence_path.write_text(evidence_path.read_text() + "\n")
 
-                rejected = self.relay(
+                rejected = self.baton(
                     project, "task", "accept", task_id, "--brief", token,
                 )
                 self.assertNotEqual(rejected.returncode, 0)
@@ -1606,29 +1748,65 @@ class RelayTests(unittest.TestCase):
                 self.assertEqual(self.state(project, task_id)["status"], "needs_review")
 
                 _fresh, fresh_token = self.review_brief_token(project, task_id)
-                self.relay(
+                self.baton(
                     project, "task", "accept", task_id,
                     "--brief", fresh_token, check=True,
                 )
+
+    def test_review_and_accept_reject_structurally_invalid_report_drift(self):
+        project = self.make_project()
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "semantic report drift", ["drift/**"])
+        self.baton(project, "run", task_id, check=True)
+        work = project / ".baton" / "work" / task_id
+        report = work / "attempt-1.report.md"
+        valid_report = report.read_text()
+        token_path = work / "review-brief-token.json"
+
+        report.write_text("# malformed before review\n")
+        review = self.baton(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+        )
+        self.assertEqual(review.returncode, 1)
+        self.assertIn("report rejected", review.stderr)
+        self.assertFalse(token_path.exists())
+
+        report.write_text(valid_report)
+        _brief, stale_token = self.review_brief_token(project, task_id)
+        report.write_text("# malformed after review brief\n")
+        rejected = self.baton(
+            project, "task", "accept", task_id, "--brief", stale_token,
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("report rejected", rejected.stderr)
+        self.assertEqual(json.loads(token_path.read_text())["token"], stale_token)
+        self.assertEqual(self.state(project, task_id)["status"], "needs_review")
+
+        report.write_text(valid_report)
+        _fresh, fresh_token = self.review_brief_token(project, task_id)
+        self.baton(
+            project, "task", "accept", task_id, "--brief", fresh_token,
+            check=True,
+        )
 
     def test_review_manifest_uses_launch_capsule_and_accepts_empty_diff(self):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
         task_id = self.create_task(project, "empty evidence diff", ["empty/**"])
-        self.relay(project, "run", task_id, check=True)
-        work = project / ".attention-relay" / "work" / task_id
+        self.baton(project, "run", task_id, check=True)
+        work = project / ".baton" / "work" / task_id
         self.assertEqual((work / "attempt-1.diff").read_text(), "")
         (work / "attempt-1.briefs.json").unlink()
         brief, token = self.review_brief_token(project, task_id)
         self.assertIn("Diff stat: no changes", brief.stdout)
         self.assertIn("Phase briefs: none recorded", brief.stdout)
 
-        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
         spec.write_text(spec.read_text().replace(
             f"Complete the empty evidence diff task.",
             "Complete the edited specification task.",
         ))
-        self.relay(
+        self.baton(
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
 
@@ -1636,20 +1814,20 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
         task_id = self.create_task(project, "fresh review capsule", ["fresh/**"])
-        self.relay(project, "run", task_id, check=True)
-        work = project / ".attention-relay" / "work" / task_id
+        self.baton(project, "run", task_id, check=True)
+        work = project / ".baton" / "work" / task_id
         (work / "attempt-1.brief.md").unlink()
 
         brief, token = self.review_brief_token(project, task_id)
         self.assertTrue(brief.stdout.startswith("# Critical Context Capsule\n"))
         self.assertTrue((work / "review-brief-token.json").exists())
-        self.relay(
+        self.baton(
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
         self.assertEqual(self.state(project, task_id)["status"], "done")
 
     def test_review_brief_requires_regular_complete_evidence(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_review_hash_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_review_hash_probe")
         digest_file = self.base / "digest.bin"
         digest_file.write_bytes(b"x" * (1024 * 1024 + 17))
         self.assertEqual(
@@ -1668,10 +1846,10 @@ class RelayTests(unittest.TestCase):
                 project = self.make_project("missing-" + missing.replace(".", "-"))
                 self.configure(project, self.write_worker(GOOD_WORKER))
                 task_id = self.create_task(project, "missing " + missing, ["missing/**"])
-                self.relay(project, "run", task_id, check=True)
-                work = project / ".attention-relay" / "work" / task_id
+                self.baton(project, "run", task_id, check=True)
+                work = project / ".baton" / "work" / task_id
                 (work / f"attempt-1.{missing}").unlink()
-                rejected = self.relay(
+                rejected = self.baton(
                     project, "orchestrator", "brief", "--phase", "review", task_id,
                 )
                 self.assertNotEqual(rejected.returncode, 0)
@@ -1680,14 +1858,14 @@ class RelayTests(unittest.TestCase):
         project = self.make_project("symlink-report")
         self.configure(project, self.write_worker(GOOD_WORKER))
         task_id = self.create_task(project, "symlink report", ["symlink/**"])
-        self.relay(project, "run", task_id, check=True)
-        work = project / ".attention-relay" / "work" / task_id
+        self.baton(project, "run", task_id, check=True)
+        work = project / ".baton" / "work" / task_id
         report = work / "attempt-1.report.md"
         external = self.base / "external-report.md"
         external.write_text(report.read_text())
         report.unlink()
         report.symlink_to(external)
-        rejected = self.relay(
+        rejected = self.baton(
             project, "orchestrator", "brief", "--phase", "review", task_id,
         )
         self.assertNotEqual(rejected.returncode, 0)
@@ -1699,12 +1877,12 @@ class RelayTests(unittest.TestCase):
         self.configure(project, self.write_worker(GOOD_WORKER))
         self.write_memory(project, [("M001", "W", "Launch-only fact", "Full body")])
         task_id = self.create_task(project, "stored capsule fallback", ["fallback/**"])
-        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
         spec.write_text(spec.read_text().replace(
             "List the paths and facts the worker needs. Reference memory ids when useful.",
             "Memory: M001.",
         ))
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         self.write_memory(project, [])
 
         brief, token = self.review_brief_token(project, task_id)
@@ -1714,13 +1892,13 @@ class RelayTests(unittest.TestCase):
         self.assertLess(len(next(
             line for line in brief.stdout.splitlines() if line.startswith("WARNING:")
         )), 600)
-        self.relay(
+        self.baton(
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
 
         no_launch = self.make_project("no-launch-capsule")
         task_id = self.create_task(no_launch, "no launch compile", ["none/**"])
-        runtime = no_launch / ".attention-relay"
+        runtime = no_launch / ".baton"
         state_path = runtime / "tasks" / f"{task_id}.json"
         task = json.loads(state_path.read_text())
         task["status"] = "needs_review"
@@ -1735,7 +1913,7 @@ class RelayTests(unittest.TestCase):
             f"Complete the no launch compile task.",
             "Replace this line with one clear outcome.",
         ))
-        failed = self.relay(
+        failed = self.baton(
             no_launch, "orchestrator", "brief", "--phase", "review", task_id,
         )
         self.assertNotEqual(failed.returncode, 0)
@@ -1746,7 +1924,7 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         self.configure(project, self.write_worker(GOOD_WORKER))
         task_id = self.create_task(project, "phase output", ["phase/**"])
-        started = self.relay(
+        started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
         harness = started.stdout.split("Harness memory:\n", 1)[1].split(
@@ -1767,25 +1945,25 @@ class RelayTests(unittest.TestCase):
             "already clean by default via the config worker command",
         ):
             self.assertIn(control, harness)
-        plan = self.relay(
+        plan = self.baton(
             project, "orchestrator", "brief", "--phase", "plan", check=True,
         )
         self.assertIn("Task-spec quality checklist:", plan.stdout)
         self.assertIn(f"{task_id} [queued]", plan.stdout)
-        run_brief = self.relay(
+        run_brief = self.baton(
             project, "orchestrator", "brief", "--phase", "run", check=True,
         )
         self.assertIn(f"Would run: {task_id}", run_brief.stdout)
 
-        status = self.relay(project, "status", check=True)
+        status = self.baton(project, "status", check=True)
         self.assertIn("\nNext actions:\n", status.stdout)
-        run = self.relay(project, "run", task_id, check=True)
+        run = self.baton(project, "run", task_id, check=True)
         self.assertIn("\nNext actions:\n", run.stdout)
         self.assertIn("attempt-1.report.md", run.stdout.rsplit("Next actions:", 1)[1])
-        shown = self.relay(project, "task", "show", task_id, check=True)
+        shown = self.baton(project, "task", "show", task_id, check=True)
         self.assertIn("\nNext actions:\n", shown.stdout)
 
-        closed = self.relay(
+        closed = self.baton(
             project, "orchestrator", "brief", "--phase", "close",
             "--goal", "Finish\n\x1b[31mhandoff\x1b[0m context",
             "--avoid", "Do not\n\x1b[33minherit\x1b[0m old goals",
@@ -1798,7 +1976,7 @@ class RelayTests(unittest.TestCase):
             "--note", "\x1b[31m" + "n" * 161,
             check=True,
         )
-        handoff = project / ".attention-relay" / "orchestrator-handoff.md"
+        handoff = project / ".baton" / "orchestrator-handoff.md"
         self.assertTrue(handoff.exists())
         handoff_text = handoff.read_text()
         self.assertIn("consumed_at: (not yet)", handoff_text)
@@ -1825,7 +2003,7 @@ class RelayTests(unittest.TestCase):
         )
         self.assertNotIn("(fill in)", avoid_block)
         self.assertIn("Start a fresh session", closed.stdout)
-        started = self.relay(
+        started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
         self.assertIn("Current handoff:", started.stdout)
@@ -1845,7 +2023,7 @@ class RelayTests(unittest.TestCase):
         )
         for extra in ([], ["--goal", " \n\t "]):
             with self.subTest(extra=extra):
-                rejected = self.relay(
+                rejected = self.baton(
                     project, "orchestrator", "brief", "--phase", "close", *extra,
                 )
                 self.assertNotEqual(rejected.returncode, 0)
@@ -1856,7 +2034,7 @@ class RelayTests(unittest.TestCase):
             for number in range(6)
             for item in ("--avoid", f"note {number}")
         ]
-        too_many = self.relay(
+        too_many = self.baton(
             project, "orchestrator", "brief", "--phase", "close",
             "--goal", "Continue the work", *too_many_args,
         )
@@ -1871,7 +2049,7 @@ class RelayTests(unittest.TestCase):
             for number in range(4)
             for item in ("--note", f"context {number}")
         ]
-        rejected_notes = self.relay(
+        rejected_notes = self.baton(
             project, "orchestrator", "brief", "--phase", "close",
             "--goal", "Continue the work", *too_many_notes,
         )
@@ -1885,7 +2063,7 @@ class RelayTests(unittest.TestCase):
             for flag, value in (
                     ("--goal", "next"), ("--avoid", "risk"), ("--note", "fact")):
                 with self.subTest(phase=phase, flag=flag):
-                    rejected = self.relay(
+                    rejected = self.baton(
                         project, "orchestrator", "brief", "--phase", phase,
                         flag, value,
                     )
@@ -1895,11 +2073,11 @@ class RelayTests(unittest.TestCase):
                         f"error: `{flag}` is valid only for the close phase\n",
                     )
 
-        closed = self.relay(
+        closed = self.baton(
             project, "orchestrator", "brief", "--phase", "close",
             "--goal", "g" * 201, "--note", " \n\t ", check=True,
         )
-        handoff = project / ".attention-relay" / "orchestrator-handoff.md"
+        handoff = project / ".baton" / "orchestrator-handoff.md"
         goal_line = next(
             line for line in handoff.read_text().splitlines() if line.startswith("goal: ")
         )
@@ -1909,7 +2087,7 @@ class RelayTests(unittest.TestCase):
         self.assertIn(goal_line, closed.stdout)
 
     def test_handoff_start_and_close_lock_complete_update(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_handoff_lock_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_handoff_lock_probe")
         events = []
         handoff = (
             "# Orchestrator handoff\n"
@@ -1931,9 +2109,9 @@ class RelayTests(unittest.TestCase):
 
         globals_ = module["orchestrator_start_brief"].__globals__
         globals_["file_lock"] = LockProbe
-        globals_["read_handoff"] = lambda _relay_dir: events.append("read") or handoff
+        globals_["read_handoff"] = lambda _baton_dir: events.append("read") or handoff
         globals_["atomic_write"] = lambda *_args: events.append("write")
-        globals_["load_archived_tasks"] = lambda _relay_dir: events.append("archive") or []
+        globals_["load_archived_tasks"] = lambda _baton_dir: events.append("archive") or []
         globals_["task_lock"] = lambda *_args: self.fail(
             "task lock nested in handoff lock"
         )
@@ -1941,16 +2119,16 @@ class RelayTests(unittest.TestCase):
         globals_["say"] = lambda *_args: None
 
         module["orchestrator_start_brief"](
-            "/relay", [], consume_handoff=True, include_levels_ask=False,
+            "/baton", [], consume_handoff=True, include_levels_ask=False,
         )
         self.assertEqual(events, [
             ("enter", "orchestrator-handoff.lock"), "read", "write",
             ("exit", "orchestrator-handoff.lock"),
         ])
         events.clear()
-        archived = globals_["load_archived_tasks"]("/relay")
+        archived = globals_["load_archived_tasks"]("/baton")
         module["orchestrator_close_brief"](
-            "/relay", [], archived, "next goal", [], [], False,
+            "/baton", [], archived, "next goal", [], [], False,
         )
         self.assertEqual(events, [
             "archive", ("enter", "orchestrator-handoff.lock"), "read", "write",
@@ -1959,8 +2137,8 @@ class RelayTests(unittest.TestCase):
 
     def test_handoff_done_outcomes_are_matched_flattened_and_line_bounded(self):
         project = self.make_project()
-        runtime = project / ".attention-relay"
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_outcome_probe")
+        runtime = project / ".baton"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_outcome_probe")
         accepted_at = "2026-01-01T00:00:00Z"
         tasks = [
             {
@@ -2000,12 +2178,12 @@ class RelayTests(unittest.TestCase):
         clean = self.make_project("clean-warning")
         self.git(clean, "add", ".gitignore")
         self.git(clean, "commit", "-qm", "ignore runtime")
-        self.relay(
+        self.baton(
             clean, "orchestrator", "brief", "--phase", "close",
             "--goal", "clean close", check=True,
         )
         clean_handoff = (
-            clean / ".attention-relay" / "orchestrator-handoff.md"
+            clean / ".baton" / "orchestrator-handoff.md"
         ).read_text()
         self.assertNotIn("warning:", clean_handoff)
         self.assertIn("goal: clean close\ndone:\n", clean_handoff)
@@ -2013,12 +2191,12 @@ class RelayTests(unittest.TestCase):
         dirty = self.make_project("dirty-warning")
         leaked_path = "private-path-must-not-leak.txt"
         (dirty / leaked_path).write_text("dirty\n")
-        self.relay(
+        self.baton(
             dirty, "orchestrator", "brief", "--phase", "close",
             "--goal", "dirty close", check=True,
         )
         dirty_handoff = (
-            dirty / ".attention-relay" / "orchestrator-handoff.md"
+            dirty / ".baton" / "orchestrator-handoff.md"
         ).read_text()
         self.assertIn(
             "goal: dirty close\n"
@@ -2029,13 +2207,13 @@ class RelayTests(unittest.TestCase):
         self.assertNotIn(leaked_path, dirty_handoff)
 
         unavailable = self.make_project("unavailable-warning")
-        unavailable_result = self.relay(
+        unavailable_result = self.baton(
             unavailable, "orchestrator", "brief", "--phase", "close",
             "--goal", "unavailable close",
             env={"GIT_DIR": unavailable / "missing-git-dir"}, check=True,
         )
         unavailable_handoff = (
-            unavailable / ".attention-relay" / "orchestrator-handoff.md"
+            unavailable / ".baton" / "orchestrator-handoff.md"
         ).read_text()
         self.assertIn(
             "goal: unavailable close\n"
@@ -2046,7 +2224,7 @@ class RelayTests(unittest.TestCase):
         self.assertNotIn("fatal:", unavailable_result.stdout + unavailable_handoff)
 
     def test_handoff_total_budget_degrades_whole_sections_in_order(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_budget_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_budget_probe")
         done = [
             (f"T{number:03d}-done", "t" * 240, "o" * 120)
             for number in range(12)
@@ -2082,7 +2260,7 @@ class RelayTests(unittest.TestCase):
 
     def test_close_to_start_round_trip_includes_outcome_warning_and_notes(self):
         project = self.make_project()
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         task_id = self.create_task(project, "round trip outcome", ["round/**"])
         state_path = runtime / "tasks" / f"{task_id}.json"
         task = json.loads(state_path.read_text())
@@ -2092,12 +2270,12 @@ class RelayTests(unittest.TestCase):
             "note": "Verified round-trip result",
         })
         state_path.write_text(json.dumps(task))
-        self.relay(
+        self.baton(
             project, "orchestrator", "brief", "--phase", "close",
             "--goal", "continue round trip", "--note", "User prefers the safe path",
             check=True,
         )
-        started = self.relay(
+        started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
         for expected in (
@@ -2109,7 +2287,7 @@ class RelayTests(unittest.TestCase):
 
     def test_start_brief_and_hooks_do_not_write_beyond_handoff_consumption(self):
         project = self.make_project()
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         handoff = runtime / "orchestrator-handoff.md"
         handoff.write_text(
             "# Orchestrator handoff\n"
@@ -2127,7 +2305,7 @@ class RelayTests(unittest.TestCase):
             }
 
         before = snapshot()
-        started = self.relay(
+        started = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
         self.assertIn("Difficulty levels:", started.stdout)
@@ -2139,7 +2317,7 @@ class RelayTests(unittest.TestCase):
         self.assertNotIn("consumed_at: (not yet)", handoff.read_text())
 
         hook_command = [
-            runtime / "relay", "hook-event", "session-start",
+            runtime / "baton", "hook-event", "session-start",
         ]
         for hook_input in ('{"source":"startup"}', '{"source":"compact"}'):
             hooked = subprocess.run(
@@ -2153,7 +2331,7 @@ class RelayTests(unittest.TestCase):
     def test_handoff_same_second_acceptance_is_emitted_once(self):
         project = self.make_project()
         task_id = self.create_task(project, "same second", ["same-second/**"])
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         boundary = "2026-01-01T00:00:00Z"
         handoff_path = runtime / "orchestrator-handoff.md"
         handoff_path.write_text(
@@ -2168,7 +2346,7 @@ class RelayTests(unittest.TestCase):
             "event": "accepted", "at": boundary,
             "note": "Reviewer-confirmed result",
         })
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_boundary_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_boundary_probe")
         globals_ = module["orchestrator_close_brief"].__globals__
         globals_["now"] = lambda: boundary
         globals_["say"] = lambda *_args: None
@@ -2190,25 +2368,25 @@ class RelayTests(unittest.TestCase):
         self.assertIn(" — outcome: Reviewer-confirmed result", first)
         self.assertNotIn(task_id, second)
 
-    def test_worker_manual_uses_installed_relay_commands(self):
+    def test_worker_manual_uses_installed_baton_commands(self):
         worker = (ROOT / "framework" / "worker.md").read_text()
-        self.assertNotIn("`relay ", worker)
+        self.assertNotIn("`baton ", worker)
         self.assertNotIn("`task finish ", worker)
-        self.assertIn("python3 .attention-relay/relay task brief", worker)
-        self.assertIn("python3 .attention-relay/relay task finish", worker)
+        self.assertIn("python3 .baton/baton task brief", worker)
+        self.assertIn("python3 .baton/baton task finish", worker)
 
     def test_claude_code_hook_fragment_is_exactly_two_matcher_free_commands(self):
         project = self.make_project()
-        printed = self.relay(project, "hooks", "claude-code", check=True)
+        printed = self.baton(project, "hooks", "claude-code", check=True)
         fragment_text = printed.stdout.rsplit("\n", 2)[0]
         fragment = json.loads(fragment_text)
         commands = {
             "SessionStart": (
-                '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay '
+                '"$CLAUDE_PROJECT_DIR"/.baton/baton '
                 "hook-event session-start"
             ),
             "UserPromptSubmit": (
-                '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay '
+                '"$CLAUDE_PROJECT_DIR"/.baton/baton '
                 "hook-event user-prompt-submit"
             ),
         }
@@ -2225,16 +2403,16 @@ class RelayTests(unittest.TestCase):
 
     def test_claude_code_hook_setup_prints_creates_merges_and_is_idempotent(self):
         project = self.make_project()
-        printed = self.relay(project, "hooks", "claude-code", check=True)
+        printed = self.baton(project, "hooks", "claude-code", check=True)
         fragment_text, instruction = printed.stdout.rsplit("\n", 2)[:2]
         fragment = json.loads(fragment_text)
         self.assertEqual(set(fragment["hooks"]), {"SessionStart", "UserPromptSubmit"})
-        self.assertIn(".attention-relay/relay hook-event", printed.stdout)
+        self.assertIn(".baton/baton hook-event", printed.stdout)
         self.assertIn("Merge this fragment into .claude/settings.json", instruction)
         for event in ("SessionStart", "UserPromptSubmit"):
             self.assertNotIn("matcher", fragment["hooks"][event][0])
 
-        self.relay(project, "hooks", "claude-code", "--write", check=True)
+        self.baton(project, "hooks", "claude-code", "--write", check=True)
         created_path = project / ".claude" / "settings.json"
         self.assertEqual(json.loads(created_path.read_text()), fragment)
 
@@ -2256,7 +2434,7 @@ class RelayTests(unittest.TestCase):
             },
         }))
         for _ in range(2):
-            self.relay(
+            self.baton(
                 merged_project, "hooks", "claude-code", "--write", check=True,
             )
         merged = json.loads(settings_path.read_text())
@@ -2271,7 +2449,7 @@ class RelayTests(unittest.TestCase):
         invalid_path.parent.mkdir()
         invalid_path.write_text("{not valid json\n")
         before = invalid_path.read_text()
-        rejected = self.relay(
+        rejected = self.baton(
             invalid_project, "hooks", "claude-code", "--write",
         )
         self.assertNotEqual(rejected.returncode, 0)
@@ -2280,11 +2458,11 @@ class RelayTests(unittest.TestCase):
 
     def test_session_start_hook_marks_compaction_and_caps_reinjected_brief(self):
         project = self.make_project()
-        brief = self.relay(
+        brief = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         ).stdout
         command = [
-            project / ".attention-relay" / "relay", "hook-event", "session-start",
+            project / ".baton" / "baton", "hook-event", "session-start",
         ]
 
         for hook_input in ("", '{"source":"startup"}', "not json", "[]"):
@@ -2298,7 +2476,7 @@ class RelayTests(unittest.TestCase):
                     (0, brief, ""),
                 )
 
-        notice = "attention-relay: context was compacted; state re-injected below."
+        notice = "Baton: context was compacted; state re-injected below."
         difficulty_start = brief.index("\nDifficulty levels:\n")
         difficulty_end = brief.index("\n\n", difficulty_start + 1)
         compact_brief = brief[:difficulty_start] + brief[difficulty_end + 1:]
@@ -2311,7 +2489,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(compact.stdout, notice + "\n" + compact_brief)
         self.assertNotIn("Difficulty levels:", compact.stdout)
 
-        (project / ".attention-relay" / "orchestrator-handoff.md").write_text(
+        (project / ".baton" / "orchestrator-handoff.md").write_text(
             "goal: " + "x" * 10000 + "\nlast handoff line\n"
         )
         capped = subprocess.run(
@@ -2326,11 +2504,11 @@ class RelayTests(unittest.TestCase):
 
     def test_claude_code_hook_events_match_brief_emit_json_and_fail_open(self):
         project = self.make_project()
-        brief = self.relay(
+        brief = self.baton(
             project, "orchestrator", "brief", "--phase", "start", check=True,
         )
         session = subprocess.run(
-            [project / ".attention-relay" / "relay", "hook-event", "session-start"],
+            [project / ".baton" / "baton", "hook-event", "session-start"],
             cwd=project, input="not json", text=True, capture_output=True,
         )
         self.assertEqual(session.returncode, 0)
@@ -2338,7 +2516,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(session.stdout, brief.stdout)
         decision = self.create_task(project, "hook decision")
         decision_path = (
-            project / ".attention-relay" / "tasks" / f"{decision}.json"
+            project / ".baton" / "tasks" / f"{decision}.json"
         )
         decision_task = json.loads(decision_path.read_text())
         question = "May we\n\x1b[31mchange\x1b[0m the interface?"
@@ -2350,7 +2528,7 @@ class RelayTests(unittest.TestCase):
         decision_path.write_text(json.dumps(decision_task))
         prompt = subprocess.run(
             [
-                project / ".attention-relay" / "relay", "hook-event",
+                project / ".baton" / "baton", "hook-event",
                 "user-prompt-submit",
             ],
             cwd=project, input="{malformed", text=True, capture_output=True,
@@ -2361,20 +2539,20 @@ class RelayTests(unittest.TestCase):
         specific = payload["hookSpecificOutput"]
         self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
         self.assertTrue(specific["additionalContext"].startswith(
-            "attention-relay state:\nNext actions:\n",
+            "Baton state:\nNext actions:\n",
         ))
         self.assertIn(
             f"- decide {decision}: worker question: May we change the interface?",
             specific["additionalContext"],
         )
 
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_hook_cap_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_hook_cap_probe")
         capped = module["cap_hook_output"]("first\n" + "x" * 10000 + "\nlast\n")
         self.assertLessEqual(len(capped), 9000)
         self.assertTrue(capped.startswith("first\n"))
         self.assertTrue(capped.endswith("(truncated)\nlast\n"))
         bounded_json = module["claude_user_prompt_output"](
-            "attention-relay state:\n" + "x" * 10000 + "\nlast",
+            "Baton state:\n" + "x" * 10000 + "\nlast",
         )
         self.assertLessEqual(len(bounded_json), 9000)
         self.assertIn("(truncated)\nlast", json.loads(bounded_json)[
@@ -2384,28 +2562,28 @@ class RelayTests(unittest.TestCase):
         broken_runtime = self.base / "empty-runtime"
         broken_runtime.mkdir()
         for name in ("session-start", "user-prompt-submit"):
-            broken = self.relay(
-                project, "hook-event", name, env={"RELAY_DIR": broken_runtime},
+            broken = self.baton(
+                project, "hook-event", name, env={"BATON_DIR": broken_runtime},
             )
             self.assertEqual((broken.returncode, broken.stdout, broken.stderr), (0, "", ""))
         outside = self.command(
-            [SOURCE_RELAY, "hook-event", "session-start"], self.base,
+            [SOURCE_BATON, "hook-event", "session-start"], self.base,
         )
         self.assertEqual((outside.returncode, outside.stdout, outside.stderr), (0, "", ""))
 
         worker_env = {
-            "RELAY_TASK_ID": "T999-worker", "RELAY_ATTEMPT": "1",
-            "RELAY_LEASE": "worker",
+            "BATON_TASK_ID": "T999-worker", "BATON_ATTEMPT": "1",
+            "BATON_LEASE": "worker",
         }
         for command in (
                 ("hooks", "claude-code"),
                 ("hook-event", "session-start")):
-            denied = self.relay(project, *command, env=worker_env)
+            denied = self.baton(project, *command, env=worker_env)
             self.assertNotEqual(denied.returncode, 0)
             self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
 
     def test_hook_cap_handles_edge_lines_and_preserves_normal_input(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_hook_edges_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_hook_edges_probe")
         cap = module["cap_hook_output"]
         prompt_output = module["claude_user_prompt_output"]
         normal = "first\nmiddle\nlast\n"
@@ -2440,7 +2618,7 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "once", ["once/**"])
         starts = self.base / "starts"
         env = dict(os.environ, STARTS=str(starts), FINISH_MARKER=str(self.base / "wait"))
-        commands = [str(project / ".attention-relay" / "relay"), "run", task_id]
+        commands = [str(project / ".baton" / "baton"), "run", task_id]
         first = subprocess.Popen(commands, cwd=project, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         second = subprocess.Popen(commands, cwd=project, env=env, stdout=subprocess.PIPE,
@@ -2458,10 +2636,10 @@ class RelayTests(unittest.TestCase):
         self.configure(project, worker)
         one = self.create_task(project, "alpha", ["alpha/**"])
         two = self.create_task(project, "beta", ["beta/**"])
-        relay = str(project / ".attention-relay" / "relay")
+        baton = str(project / ".baton" / "baton")
         env = dict(os.environ, SLEEP_AFTER_FINISH="0.8")
         first = subprocess.Popen(
-            [relay, "run", one], cwd=project, env=env,
+            [baton, "run", one], cwd=project, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         deadline = time.monotonic() + 3
@@ -2472,7 +2650,7 @@ class RelayTests(unittest.TestCase):
         else:
             self.fail("first run did not claim its task")
         second = subprocess.Popen(
-            [relay, "run", two], cwd=project, env=env,
+            [baton, "run", two], cwd=project, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         time.sleep(0.2)
@@ -2490,13 +2668,13 @@ class RelayTests(unittest.TestCase):
     def test_invalid_command_fails_before_task_claim(self):
         project = self.make_project()
         task_id = self.create_task(project, "bad command", ["a/**"])
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(
             '[commands]\nworker = "true {prompt} embedded{prompt}"\n'
             '[limits]\nmax_parallel = 1\n'
         )
-        self.assertNotEqual(self.relay(project, "validate").returncode, 0)
-        result = self.relay(project, "run")
+        self.assertNotEqual(self.baton(project, "validate").returncode, 0)
+        result = self.baton(project, "run")
         self.assertNotEqual(result.returncode, 0)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "queued")
@@ -2509,17 +2687,29 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(RESULT_WITHOUT_REPORT_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "missing report", ["src/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "missing_review_report")
+
+    def test_finalization_rejects_report_drift_after_finish(self):
+        project = self.make_project()
+        worker = self.write_worker(
+            NO_CHANGE_WORKER + '\nreport.write_text("# malformed after finish\\n")\n'
+        )
+        self.configure(project, worker)
+        task_id = self.create_task(project, "report drift after finish", ["drift/**"])
+        self.baton(project, "run", task_id, check=True)
+        state = self.state(project, task_id)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "invalid_review_report")
 
     def test_malformed_result_and_directory_report_are_rejected(self):
         project = self.make_project()
         worker = self.write_worker(MALFORMED_OUTPUT_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "malformed output", ["src/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "invalid_worker_output")
@@ -2530,7 +2720,7 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "submitted before exit", ["src/**"])
-        self.relay(project, "run", task_id, env={"EXIT_CODE": "1"}, check=True)
+        self.baton(project, "run", task_id, env={"EXIT_CODE": "1"}, check=True)
 
         state = self.state(project, task_id)
         warning = "worker_exit_1_after_submission"
@@ -2541,14 +2731,14 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(worker_exit["exit_code"], 1)
         self.assertEqual(worker_exit["warning"], warning)
 
-        status = self.relay(project, "status", check=True)
+        status = self.baton(project, "status", check=True)
         self.assertIn(f"WARNING: {warning}", status.stdout)
         brief, token = self.review_brief_token(project, task_id)
         self.assertIn("WARNING: Worker exited with code 1 after submission", brief.stdout)
         self.assertIn(
-            f".attention-relay/work/{task_id}/attempt-1.log", brief.stdout,
+            f".baton/work/{task_id}/attempt-1.log", brief.stdout,
         )
-        self.relay(
+        self.baton(
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
         self.assertEqual(self.state(project, task_id)["status"], "done")
@@ -2557,7 +2747,7 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         self.configure(project, self.write_worker("raise SystemExit(1)\n"))
         task_id = self.create_task(project, "exit without result", ["src/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "worker_exit_1")
@@ -2568,7 +2758,7 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(MALFORMED_OUTPUT_WORKER + "\nraise SystemExit(1)\n")
         self.configure(project, worker)
         task_id = self.create_task(project, "malformed before exit", ["src/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "invalid_worker_output")
@@ -2579,7 +2769,7 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker, max_parallel=1, timeout_minutes=0.02)
         task_id = self.create_task(project, "submitted before timeout", ["src/**"])
-        self.relay(
+        self.baton(
             project, "run", task_id, env={"SLEEP_AFTER_FINISH": "10"}, check=True,
         )
         state = self.state(project, task_id)
@@ -2595,7 +2785,7 @@ class RelayTests(unittest.TestCase):
         ))
         self.configure(project, worker)
         task_id = self.create_task(project, "mismatch before exit", ["src/**"])
-        self.relay(project, "run", task_id, env={"EXIT_CODE": "1"}, check=True)
+        self.baton(project, "run", task_id, env={"EXIT_CODE": "1"}, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "changed_paths_mismatch")
@@ -2606,7 +2796,7 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(NON_UTF8_RESULT_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "non utf8 output", ["src/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "invalid_worker_output")
@@ -2617,7 +2807,7 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(OVERSIZED_INTEGER_RESULT_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "oversized integer output", ["src/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         state = self.state(project, task_id)
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "invalid_worker_output")
@@ -2630,10 +2820,10 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(project, "symlink artifact", ["src/**"])
         sentinel = self.base / "log-sentinel"
         sentinel.write_text("unchanged\n")
-        directory = project / ".attention-relay" / "work" / task_id
+        directory = project / ".baton" / "work" / task_id
         directory.mkdir(parents=True)
         (directory / "attempt-1.log").symlink_to(sentinel)
-        result = self.relay(project, "run", task_id)
+        result = self.baton(project, "run", task_id)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(sentinel.read_text(), "unchanged\n")
         self.assertEqual(self.state(project, task_id)["status"], "queued")
@@ -2644,7 +2834,7 @@ class RelayTests(unittest.TestCase):
         self.configure(project, worker, max_parallel=2)
         alpha = self.create_task(project, "alpha", ["alpha/**"])
         beta = self.create_task(project, "beta", ["beta/**"])
-        result = self.relay(
+        result = self.baton(
             project, "run", alpha, beta,
             env={"WRITE_OUTSIDE": "beta/injected.txt", "WRITE_OUTSIDE_TASK": alpha},
         )
@@ -2657,7 +2847,7 @@ class RelayTests(unittest.TestCase):
     def test_stale_finalizer_cannot_overwrite_a_new_lease(self):
         project = self.make_project()
         task_id = self.create_task(project, "lease guard", ["src/**"])
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         state_path = runtime / "tasks" / f"{task_id}.json"
         old_task = json.loads(state_path.read_text())
         old_task["status"] = "running"
@@ -2673,10 +2863,10 @@ class RelayTests(unittest.TestCase):
             "lease": "old", "changed_paths": [],
         }))
         (result.parent / "attempt-1.report.md").write_text("# old report\n")
-        relay_module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_module")
-        finalized = relay_module["finalize_task"](
+        baton_module = runpy.run_path(str(SOURCE_BATON), run_name="baton_module")
+        finalized = baton_module["finalize_task"](
             str(runtime), old_task, {"returncode": 0}, [], [],
-            "baseline", "old",
+            "baseline", "old", True,
         )
         self.assertFalse(finalized)
         after = json.loads(state_path.read_text())
@@ -2695,18 +2885,212 @@ class RelayTests(unittest.TestCase):
             "max_parallel = 1\n"
             "worker_timeout_minutes = 1\n"
         )
-        (project / ".attention-relay" / "config.toml").write_text(config)
+        (project / ".baton" / "config.toml").write_text(config)
         marker = self.base / "injected"
         scope = f"safe/$(touch {marker})/**"
         task_id = self.create_task(project, "literal prompt", [scope])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         self.assertFalse(marker.exists())
         self.assertEqual(self.state(project, task_id)["status"], "needs_review")
+
+    def test_task_creation_requires_explicit_difficulty(self):
+        project = self.make_project()
+        missing = self.baton(project, "task", "create", "--title", "implicit")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("--tier", missing.stderr)
+
+        task_id = self.create_task(project, "explicit", tier="default")
+        self.assertEqual(self.state(project, task_id)["tier"], "default")
+
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state.pop("tier")
+        state_path.write_text(json.dumps(state))
+        launch = self.baton(project, "run", task_id, "--dry-run")
+        self.assertNotEqual(launch.returncode, 0)
+        self.assertIn("tier name must be non-blank", launch.stdout + launch.stderr)
+        self.assertEqual(self.state(project, task_id)["status"], "queued")
+
+    def test_difficulty_and_worker_label_are_visible_before_and_during_launch(self):
+        project = self.make_project()
+        worker = self.write_worker(NO_CHANGE_WORKER)
+        self.configure(project, worker)
+        config = project / ".baton" / "config.toml"
+        tier_command = f"{sys.executable} {worker} --api-key do-not-print {{prompt_file}}"
+        config.write_text(config.read_text() + (
+            "\n[tiers.hard]\n"
+            f"command = {json.dumps(tier_command)}\n"
+            "\n[tiers.hard.display]\n"
+            'model = "GPT 5.6 Sol"\n'
+            'harness = "Hermes"\n'
+            'effort = "high"\n'
+            'engineering_role = "elite senior"\n'
+        ))
+
+        created = self.baton(
+            project, "task", "create", "--title", "Visible routing",
+            "--scope", "routing/**", "--tier", "hard", check=True,
+        )
+        task_id = created.stdout.split()[1]
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
+        spec.write_text(spec.read_text().replace(
+            "Replace this line with one clear outcome.", "Verify visible routing.",
+        ).replace(
+            "- Add observable requirements.", "- Routing is visible.",
+        ))
+        identity = (
+            f"{task_id} | title=Visible routing | difficulty=hard | "
+            "worker=model=GPT 5.6 Sol; harness=Hermes; effort=high; "
+            "engineering_role=elite senior"
+        )
+        outputs = [
+            created.stdout,
+            self.baton(project, "task", "list", check=True).stdout,
+            self.baton(project, "task", "list", "--json", check=True).stdout,
+            self.baton(project, "task", "show", task_id, check=True).stdout,
+            self.baton(project, "status", check=True).stdout,
+            self.baton(project, "run", task_id, "--dry-run", check=True).stdout,
+            self.baton(project, "tiers", check=True).stdout,
+        ]
+        for output in outputs:
+            self.assertIn("difficulty=hard", output)
+            self.assertIn("GPT 5.6 Sol", output)
+            self.assertNotIn("--api-key", output)
+            self.assertNotIn("do-not-print", output)
+        for output in outputs[:6]:
+            self.assertIn(task_id, output)
+        for output in (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4]):
+            self.assertIn("Visible routing", output)
+        self.assertIn(identity, created.stdout)
+
+        launched = self.baton(project, "run", task_id, check=True)
+        self.assertIn(identity, launched.stdout)
+        self.assertNotIn("--api-key", launched.stdout)
+        self.assertNotIn("do-not-print", launched.stdout)
+        self.assertEqual(self.state(project, task_id)["status"], "needs_review")
+
+    def test_launch_prompt_records_effective_difficulty_and_safe_worker_label(self):
+        project = self.make_project()
+        worker = self.write_worker(NO_CHANGE_WORKER)
+        self.configure(project, worker)
+        config = project / ".baton" / "config.toml"
+        command = f"{sys.executable} {worker} --credential hidden {{prompt_file}}"
+        config.write_text(config.read_text() + (
+            "\n[tiers.medium]\n"
+            f"command = {json.dumps(command)}\n"
+            "\n[tiers.medium.display]\n"
+            'model = "GPT 5.6 Sol"\n'
+            'harness = "Hermes"\n'
+            'effort = "medium"\n'
+            'engineering_role = "elite senior"\n'
+        ))
+        task_id = self.create_task(project, "prompt routing", tier="medium")
+        self.baton(project, "run", task_id, check=True)
+
+        prompt = (
+            project / ".baton" / "work" / task_id / "attempt-1.prompt.md"
+        ).read_text()
+        self.assertIn("Difficulty: medium", prompt)
+        self.assertIn(
+            "Worker: model=GPT 5.6 Sol; harness=Hermes; effort=medium; "
+            "engineering_role=elite senior",
+            prompt,
+        )
+        self.assertNotIn("--credential", prompt)
+        self.assertNotIn("hidden", prompt)
+
+    def test_worker_label_metadata_is_bounded_sanitized_and_has_safe_fallback(self):
+        project = self.make_project()
+        worker = self.write_worker(NO_CHANGE_WORKER)
+        self.configure(project, worker)
+        config = project / ".baton" / "config.toml"
+        config.write_text(config.read_text() + (
+            "\n[tiers.safe]\n"
+            "\n[tiers.safe.display]\n"
+            'model = "api_key=worker-secret"\n'
+            'harness = "Hermes"\n'
+            'effort = "high"\n'
+            'engineering_role = "elite senior"\n'
+            'fallback = "GPT 5.6 Terra/high when Claude usage is exhausted"\n'
+        ))
+
+        default_created = self.baton(
+            project, "task", "create", "--title", "fallback label",
+            "--tier", "default", check=True,
+        )
+        self.assertIn("difficulty=default | worker=unlabeled worker", default_created.stdout)
+        safe_created = self.baton(
+            project, "task", "create", "--title", "safe label",
+            "--tier", "safe", check=True,
+        )
+        self.assertIn("model=api_key=[redacted]", safe_created.stdout)
+        self.assertIn("engineering_role=elite senior", safe_created.stdout)
+        self.assertNotIn("worker-secret", safe_created.stdout)
+        self.assertNotIn("--", safe_created.stdout)
+
+        tier_output = self.baton(project, "tiers", check=True).stdout
+        safe_routing = next(
+            line for line in tier_output.splitlines()
+            if line.startswith("Routing: difficulty=safe")
+        )
+        worker_label = safe_routing.split("worker=", 1)[1]
+        self.assertLessEqual(len(worker_label), 240)
+        self.assertNotIn("worker-secret", tier_output)
+
+        invalid_values = (
+            ('display = "not-a-table"\n', "must be a table"),
+            ('[tiers.bad.display]\nmodel = "' + "x" * 81 + '"\n', "exceeds 80"),
+            ('[tiers.bad.display]\nharness = "Hermes\\u001b"\n', "control characters"),
+            ('[tiers.bad.display]\nfallback = "--api-key hidden"\n', "command flags"),
+            ('[tiers.bad.display]\nunknown = "value"\n', "unknown tier display metadata"),
+        )
+        for index, (display_config, message) in enumerate(invalid_values):
+            with self.subTest(message=message):
+                invalid = self.make_project(f"invalid-display-{index}")
+                self.configure(invalid, worker)
+                invalid_config = invalid / ".baton" / "config.toml"
+                invalid_config.write_text(invalid_config.read_text() + (
+                    "\n[tiers.bad]\n" + display_config
+                ))
+                validation = self.baton(invalid, "validate")
+                tiers = self.baton(invalid, "tiers")
+                self.assertNotEqual(validation.returncode, 0)
+                self.assertNotEqual(tiers.returncode, 0)
+                self.assertIn(message, validation.stdout + validation.stderr)
+                self.assertIn(message, tiers.stdout + tiers.stderr)
+                self.assertNotIn("hidden", tiers.stdout)
+
+    def test_tier_display_rejects_command_flags_after_punctuation(self):
+        worker = self.write_worker(NO_CHANGE_WORKER)
+        for index, value in enumerate(("x;--flag", "(--flag)", "x --flag")):
+            with self.subTest(value=value):
+                project = self.make_project(f"punctuated-display-flag-{index}")
+                self.configure(project, worker)
+                config = project / ".baton" / "config.toml"
+                config.write_text(config.read_text() + (
+                    "\n[tiers.audit]\n\n[tiers.audit.display]\n"
+                    f"model = {json.dumps(value)}\n"
+                ))
+                validation = self.baton(project, "validate")
+                tiers = self.baton(project, "tiers")
+                self.assertEqual(validation.returncode, 1)
+                self.assertEqual(tiers.returncode, 1)
+                self.assertIn("command flags", validation.stdout)
+                self.assertIn("command flags", tiers.stderr)
+
+        valid = self.make_project("hyphenated-display-prose")
+        self.configure(valid, worker)
+        config = valid / ".baton" / "config.toml"
+        config.write_text(config.read_text() + (
+            "\n[tiers.audit]\n\n[tiers.audit.display]\n"
+            'model = "ordinary hyphenated-prose"\n'
+        ))
+        self.baton(valid, "validate", check=True)
 
     def test_tiers_are_strict_at_create_validate_preview_and_launch(self):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text() + "\n[tiers.premium]\ncapsule_max_chars = 5000\n")
 
         unknown = self.try_create_task(project, "unknown tier", tier="mystery")
@@ -2720,21 +3104,24 @@ class RelayTests(unittest.TestCase):
         task_id = self.create_task(
             project, "strict premium", ["premium/**"], tier="premium",
         )
-        brief = self.relay(
+        brief = self.baton(
             project, "orchestrator", "brief", "--phase", "run", check=True,
         )
-        dry = self.relay(project, "run", "--dry-run", check=True)
-        annotation = f"{task_id} [tier=premium]"
+        dry = self.baton(project, "run", "--dry-run", check=True)
+        annotation = (
+            f"{task_id} | title=strict premium | difficulty=premium | "
+            "worker=unlabeled worker"
+        )
         self.assertIn("Would run: " + annotation, brief.stdout)
         self.assertIn("would run: " + annotation, dry.stdout)
 
-        state_path = project / ".attention-relay" / "tasks" / f"{task_id}.json"
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
         state["tier"] = "removed"
         state_path.write_text(json.dumps(state))
-        validation = self.relay(project, "validate")
-        preview = self.relay(project, "task", "capsule", task_id)
-        launch = self.relay(project, "run", task_id)
+        validation = self.baton(project, "validate")
+        preview = self.baton(project, "task", "capsule", task_id)
+        launch = self.baton(project, "run", task_id)
         for result in (validation, preview, launch):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unknown tier 'removed'", result.stdout + result.stderr)
@@ -2745,24 +3132,24 @@ class RelayTests(unittest.TestCase):
         self.configure(
             roomy, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=100,
         )
-        config = roomy / ".attention-relay" / "config.toml"
+        config = roomy / ".baton" / "config.toml"
         config.write_text(config.read_text() + "\n[tiers.roomy]\ncapsule_max_chars = 4000\n")
         roomy_id = self.create_task(roomy, "roomy capsule", ["roomy/**"], tier="roomy")
-        preview = self.relay(roomy, "task", "capsule", roomy_id, check=True)
+        preview = self.baton(roomy, "task", "capsule", roomy_id, check=True)
         self.assertIn("of 4000 chars", preview.stdout)
-        self.relay(roomy, "validate", check=True)
-        self.relay(roomy, "run", roomy_id, check=True)
+        self.baton(roomy, "validate", check=True)
+        self.baton(roomy, "run", roomy_id, check=True)
         self.assertEqual(self.state(roomy, roomy_id)["status"], "needs_review")
 
         tight = self.make_project("tight-tier")
         self.configure(tight, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=4000)
-        config = tight / ".attention-relay" / "config.toml"
+        config = tight / ".baton" / "config.toml"
         config.write_text(config.read_text() + "\n[tiers.tight]\ncapsule_max_chars = 100\n")
         tight_id = self.create_task(tight, "tight capsule", ["tight/**"], tier="tight")
         results = (
-            self.relay(tight, "task", "capsule", tight_id),
-            self.relay(tight, "validate"),
-            self.relay(tight, "run", tight_id),
+            self.baton(tight, "task", "capsule", tight_id),
+            self.baton(tight, "validate"),
+            self.baton(tight, "run", tight_id),
         )
         for result in results:
             self.assertNotEqual(result.returncode, 0)
@@ -2775,22 +3162,155 @@ class RelayTests(unittest.TestCase):
             project, self.write_worker(TIER_TIMEOUT_WORKER),
             max_parallel=2, timeout_minutes=1,
         )
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text() + (
             "\n[tiers.short]\nworker_timeout_minutes = 0.005\n"
             "\n[tiers.long]\nworker_timeout_minutes = 0.1\n"
         ))
         short = self.create_task(project, "short timeout", ["short/**"], tier="short")
         long = self.create_task(project, "long timeout", ["long/**"], tier="long")
-        self.relay(project, "run", short, long, check=True)
+        self.baton(project, "run", short, long, check=True)
         self.assertEqual(self.state(project, short)["status"], "failed")
         self.assertEqual(self.state(project, short)["last_note"], "worker_timeout")
         self.assertEqual(self.state(project, long)["status"], "needs_review")
 
+    def test_validate_rejects_non_object_task_state_and_malformed_history(self):
+        project = self.make_project("non-object-task-state")
+        task_id = self.create_task(project, "non object task state")
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+        state_path.write_text("[]\n")
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        self.assertIn("PROBLEM: cannot read task state:", validation.stdout)
+        self.assertIn("must contain a JSON object", validation.stdout)
+        self.assertNotIn("Traceback", validation.stderr)
+        for command in (("task", "list"), ("status",), ("stats",)):
+            rejected = self.baton(project, *command)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("must contain a JSON object", rejected.stderr)
+            self.assertNotIn("Traceback", rejected.stderr)
+
+        malformed_entries = (1, None, [], "entry", {}, {"event": 1, "at": []})
+        for index, entry in enumerate(malformed_entries):
+            with self.subTest(entry=entry):
+                project = self.make_project(f"malformed-history-{index}")
+                task_id = self.create_task(project, f"malformed history {index}")
+                state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["history"] = [entry]
+                state_path.write_text(json.dumps(state))
+                validation = self.baton(project, "validate")
+                self.assertEqual(validation.returncode, 1)
+                self.assertIn("history entry 0", validation.stdout)
+                self.assertNotIn("Traceback", validation.stderr)
+                if not isinstance(entry, dict):
+                    status = self.baton(project, "status")
+                    self.assertEqual(status.returncode, 1)
+                    self.assertIn("history entry 0", status.stderr)
+                    self.assertNotIn("Traceback", status.stderr)
+
+    def test_validate_rejects_malformed_active_task_field_shapes(self):
+        cases = (
+            ("id", ["bad"], "task id must look like"),
+            ("depends_on", 1, "depends_on must be a list of task ids"),
+            ("scope", 1, "scope must be a list"),
+        )
+        for index, (field, value, message) in enumerate(cases):
+            with self.subTest(field=field, value=value):
+                project = self.make_project(f"malformed-active-{index}")
+                task_id = self.create_task(project, f"malformed active {index}")
+                state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state[field] = value
+                state_path.write_text(json.dumps(state))
+                validation = self.baton(project, "validate")
+                self.assertEqual(validation.returncode, 1)
+                self.assertIn("PROBLEM:", validation.stdout)
+                self.assertIn(message, validation.stdout)
+                self.assertNotIn("ok:", validation.stdout)
+                self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+
+        project = self.make_project("aggregate-malformed-active")
+        task_id = self.create_task(project, "aggregate malformed active")
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state.update({
+            "status": 7,
+            "attempt": False,
+            "tier": [],
+            "title": 1,
+            "scope": 1,
+            "depends_on": 1,
+            "history": "bad",
+        })
+        state_path.write_text(json.dumps(state))
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        for message in (
+                "invalid status", "attempt must be a positive integer",
+                "tier must be non-empty text", "title must be non-empty text",
+                "scope must be a list", "depends_on must be a list of task ids",
+                "history must be a list"):
+            self.assertIn(message, validation.stdout)
+        self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+
+    def test_validate_rejects_malformed_archived_task_field_shapes(self):
+        cases = (
+            ("scope", 1, "scope must be a list"),
+            ("depends_on", 1, "depends_on must be a list of task ids"),
+            ("status", 7, "invalid status"),
+            ("attempt", False, "attempt must be a positive integer"),
+        )
+        for index, (field, value, message) in enumerate(cases):
+            with self.subTest(field=field, value=value):
+                project = self.make_project(f"malformed-archive-{index}")
+                archived_id = self.create_task(project, f"archived source {index}")
+                state_path = project / ".baton" / "tasks" / f"{archived_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                self.baton(project, "archive", check=True)
+                dependent_id = self.create_task(
+                    project, f"active dependent {index}", depends_on=[archived_id],
+                )
+                archive_path = project / ".baton" / "archive" / f"{archived_id}.json"
+                archived = json.loads(archive_path.read_text())
+                archived[field] = value
+                archive_path.write_text(json.dumps(archived))
+
+                validation = self.baton(project, "validate")
+                self.assertEqual(validation.returncode, 1)
+                self.assertIn("PROBLEM:", validation.stdout)
+                self.assertIn(message, validation.stdout)
+                self.assertNotIn("ok:", validation.stdout)
+                self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+                if field == "status":
+                    self.assertIn(
+                        f"{dependent_id}: dependency {archived_id} has invalid status",
+                        validation.stdout,
+                    )
+
+    def test_valid_archived_done_and_cancelled_records_validate(self):
+        project = self.make_project()
+        done_id = self.create_task(project, "valid archived done")
+        done_path = project / ".baton" / "tasks" / f"{done_id}.json"
+        done = json.loads(done_path.read_text())
+        done["status"] = "done"
+        done_path.write_text(json.dumps(done))
+        cancelled_id = self.create_task(project, "valid archived cancelled")
+        self.baton(
+            project, "task", "cancel", cancelled_id, "--reason", "not needed",
+            check=True,
+        )
+        self.baton(project, "archive", check=True)
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
+        self.assertEqual(validation.stdout, "ok: 0 active task(s)\n")
+
     def test_validate_reports_every_malformed_unused_tier_setting_and_name(self):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         config.write_text(config.read_text() + (
             "\n[tiers.broken]\n"
             "command = \"\"\n"
@@ -2799,7 +3319,7 @@ class RelayTests(unittest.TestCase):
             "\n[tiers.\"\"]\ncapsule_max_chars = 100\n"
             "\n[tiers.default]\ncapsule_max_chars = 200\n"
         ))
-        validation = self.relay(project, "validate")
+        validation = self.baton(project, "validate")
         self.assertNotEqual(validation.returncode, 0)
         for message in (
                 "tier 'broken': no worker command configured",
@@ -2816,7 +3336,7 @@ class RelayTests(unittest.TestCase):
                 with self.subTest(value=value, location=location):
                     project = self.make_project(f"non-finite-{location}-{value}")
                     self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-                    config = project / ".attention-relay" / "config.toml"
+                    config = project / ".baton" / "config.toml"
                     if location == "global":
                         config.write_text(config.read_text().replace(
                             "worker_timeout_minutes = 1",
@@ -2827,10 +3347,10 @@ class RelayTests(unittest.TestCase):
                             f"\n[tiers.bad]\nworker_timeout_minutes = {value}\n"
                         ))
 
-                    validation = self.relay(project, "validate")
+                    validation = self.baton(project, "validate")
                     self.assertEqual(validation.returncode, 1)
                     self.assertIn(message, validation.stdout)
-                    tiers = self.relay(project, "tiers")
+                    tiers = self.baton(project, "tiers")
                     self.assertEqual(tiers.returncode, 1)
                     self.assertIn(message, tiers.stderr)
                     self.assertNotIn(f"{value} minutes", tiers.stdout)
@@ -2839,7 +3359,7 @@ class RelayTests(unittest.TestCase):
         project = self.make_project()
         worker = self.write_worker(NO_CHANGE_WORKER)
         self.configure(project, worker, timeout_minutes=2.5, capsule_max_chars=4000)
-        config = project / ".attention-relay" / "config.toml"
+        config = project / ".baton" / "config.toml"
         tier_command = f"{sys.executable} {worker} --secret do-not-print {{prompt_file}}"
         config.write_text(config.read_text() + (
             "\n[tiers.alpha]\ncapsule_max_chars = 5000\n"
@@ -2847,7 +3367,7 @@ class RelayTests(unittest.TestCase):
             f"command = {json.dumps(tier_command)}\n"
             "worker_timeout_minutes = 0\n"
         ))
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
 
         def snapshot():
             return {
@@ -2856,14 +3376,17 @@ class RelayTests(unittest.TestCase):
             }
 
         before = snapshot()
-        tiers = self.relay(project, "tiers", check=True)
+        tiers = self.baton(project, "tiers", check=True)
         executable = sys.executable
         tier_blocks = (
-            f"Tier: default\nExecutable: {executable}\nCommand source: default\n"
+            "Tier: default\nRouting: difficulty=default | worker=unlabeled worker\n"
+            f"Executable: {executable}\nCommand source: default\n"
             "Worker timeout: 2.5 minutes\nCapsule budget: 4000 characters\n\n"
-            f"Tier: alpha\nExecutable: {executable}\nCommand source: default\n"
+            "Tier: alpha\nRouting: difficulty=alpha | worker=unlabeled worker\n"
+            f"Executable: {executable}\nCommand source: default\n"
             "Worker timeout: 2.5 minutes\nCapsule budget: 5000 characters\n\n"
-            f"Tier: zeta\nExecutable: {executable}\nCommand source: tier\n"
+            "Tier: zeta\nRouting: difficulty=zeta | worker=unlabeled worker\n"
+            f"Executable: {executable}\nCommand source: tier\n"
             "Worker timeout: 0 minutes\nCapsule budget: 4000 characters\n"
         )
         expected = tier_blocks + "Conventional levels missing: hard, medium, easy\n"
@@ -2873,7 +3396,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(snapshot(), before)
 
         config.write_text(config.read_text() + "\n[tiers.hard]\ncapsule_max_chars = 4100\n")
-        partial = self.relay(project, "tiers", check=True)
+        partial = self.baton(project, "tiers", check=True)
         self.assertTrue(partial.stdout.endswith(
             "Conventional levels missing: medium, easy\n",
         ))
@@ -2881,10 +3404,10 @@ class RelayTests(unittest.TestCase):
             "\n[tiers.medium]\ncapsule_max_chars = 4200\n"
             "\n[tiers.easy]\ncapsule_max_chars = 4300\n"
         ))
-        complete = self.relay(project, "tiers", check=True)
+        complete = self.baton(project, "tiers", check=True)
         self.assertNotIn("Conventional levels missing:", complete.stdout)
-        denied = self.relay(
-            project, "tiers", env={"RELAY_TASK_ID": "T999-worker"},
+        denied = self.baton(
+            project, "tiers", env={"BATON_TASK_ID": "T999-worker"},
         )
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
@@ -2895,7 +3418,7 @@ class RelayTests(unittest.TestCase):
         self.configure(project, worker, max_parallel=1, timeout_minutes=0.005)
         task_id = self.create_task(project, "timeout", ["timeout/**"])
         marker = self.base / "late-marker"
-        self.relay(project, "run", task_id, env={"LATE_MARKER": marker}, check=True)
+        self.baton(project, "run", task_id, env={"LATE_MARKER": marker}, check=True)
         time.sleep(0.8)
         self.assertFalse(marker.exists())
         state = self.state(project, task_id)
@@ -2912,7 +3435,7 @@ class RelayTests(unittest.TestCase):
                 task_id = self.create_task(project, "interrupt", ["interrupt/**"])
                 marker = self.base / (name + "-late-marker")
                 process = subprocess.Popen(
-                    [str(project / ".attention-relay" / "relay"), "run", task_id],
+                    [str(project / ".baton" / "baton"), "run", task_id],
                     cwd=project,
                     env=dict(os.environ, LATE_MARKER=str(marker)),
                     text=True,
@@ -2966,7 +3489,7 @@ class RelayTests(unittest.TestCase):
         ]
         marker = self.base / "parallel-late-marker"
         process = subprocess.Popen(
-            [str(project / ".attention-relay" / "relay"), "run", *task_ids],
+            [str(project / ".baton" / "baton"), "run", *task_ids],
             cwd=project, env=dict(os.environ, LATE_MARKER=str(marker)),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -3001,31 +3524,31 @@ class RelayTests(unittest.TestCase):
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         first = self.create_task(project, "first", ["first/**"])
-        self.relay(project, "run", check=True)
+        self.baton(project, "run", check=True)
         self.accept_task(project, first)
         second = self.create_task(project, "second", ["second/**"], [first])
-        self.relay(project, "archive", check=True)
-        dry = self.relay(project, "run", "--dry-run", check=True)
+        self.baton(project, "archive", check=True)
+        dry = self.baton(project, "run", "--dry-run", check=True)
         self.assertIn(f"would run: {second}", dry.stdout)
-        self.assertEqual(self.relay(project, "validate").returncode, 0)
+        self.assertEqual(self.baton(project, "validate").returncode, 0)
 
         third = self.create_task(project, "third", ["third/**"])
         self.assertTrue(third.startswith("T003-"), third)
-        second_path = project / ".attention-relay" / "tasks" / f"{second}.json"
-        third_path = project / ".attention-relay" / "tasks" / f"{third}.json"
+        second_path = project / ".baton" / "tasks" / f"{second}.json"
+        third_path = project / ".baton" / "tasks" / f"{third}.json"
         second_state = json.loads(second_path.read_text())
         third_state = json.loads(third_path.read_text())
         second_state["depends_on"] = [third]
         third_state["depends_on"] = [second]
         second_path.write_text(json.dumps(second_state))
         third_path.write_text(json.dumps(third_state))
-        validation = self.relay(project, "validate")
+        validation = self.baton(project, "validate")
         self.assertNotEqual(validation.returncode, 0)
         self.assertIn("dependency cycle", validation.stdout)
 
     def test_stats_empty_runtime_is_read_only_and_denied_to_workers(self):
         project = self.make_project()
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
 
         def snapshot():
             return {
@@ -3034,20 +3557,20 @@ class RelayTests(unittest.TestCase):
             }
 
         before = snapshot()
-        stats = self.relay(project, "stats", check=True)
+        stats = self.baton(project, "stats", check=True)
         self.assertEqual(stats.stdout, "no task data\n")
         self.assertEqual(snapshot(), before)
-        denied = self.relay(
+        denied = self.baton(
             project, "stats",
-            env={"RELAY_TASK_ID": "T999-worker", "RELAY_ATTEMPT": "1",
-                 "RELAY_LEASE": "worker"},
+            env={"BATON_TASK_ID": "T999-worker", "BATON_ATTEMPT": "1",
+                 "BATON_LEASE": "worker"},
         )
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
 
     def test_stats_exact_mixed_outcomes_and_archived_receipt_coverage(self):
         project = self.make_project()
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         task_ids = [
             self.create_task(project, "stats queued", ["queued/**"]),
             self.create_task(project, "stats failed", ["failed/**"]),
@@ -3106,13 +3629,13 @@ class RelayTests(unittest.TestCase):
         write_receipt(task_ids[1], 1, ("edit", "verify", "report"))
         write_receipt(task_ids[1], 2, ("edit",))
         write_receipt(task_ids[3], 1, ("report",))
-        self.relay(project, "archive", check=True)
+        self.baton(project, "archive", check=True)
         archived_receipt = (
             runtime / "archive" / f"{task_ids[3]}.work" / "attempt-1.briefs.json"
         )
         self.assertTrue(archived_receipt.exists())
 
-        stats = self.relay(project, "stats", check=True)
+        stats = self.baton(project, "stats", check=True)
         self.assertEqual(
             stats.stdout,
             "Status counts:\n"
@@ -3143,7 +3666,7 @@ class RelayTests(unittest.TestCase):
             self.create_task(project, "archive one", ["one/**"]),
             self.create_task(project, "archive two", ["two/**"]),
         ]
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         for task_id in task_ids:
             state_path = runtime / "tasks" / f"{task_id}.json"
             state = json.loads(state_path.read_text())
@@ -3154,7 +3677,7 @@ class RelayTests(unittest.TestCase):
             (work / "artifact").write_text("test\n")
         collision = runtime / "archive" / f"{task_ids[1]}.work"
         collision.write_text("collision\n")
-        archived = self.relay(project, "archive")
+        archived = self.baton(project, "archive")
         self.assertNotEqual(archived.returncode, 0)
         for task_id in task_ids:
             self.assertTrue((runtime / "tasks" / f"{task_id}.json").exists())
@@ -3163,7 +3686,7 @@ class RelayTests(unittest.TestCase):
     def test_archive_defers_sigterm_until_transaction_is_complete(self):
         project = self.make_project()
         task_id = self.create_task(project, "archive signal", ["archive/**"])
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         state_path = runtime / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
         state["status"] = "done"
@@ -3180,7 +3703,7 @@ import sys
 import time
 from types import SimpleNamespace
 
-module = runpy.run_path(sys.argv[1], run_name="relay_archive_probe")
+module = runpy.run_path(sys.argv[1], run_name="baton_archive_probe")
 original = module["shutil"].move
 marker = Path(sys.argv[3])
 
@@ -3195,7 +3718,7 @@ os.chdir(sys.argv[2])
 module["cmd_archive"](SimpleNamespace())
 '''
         process = subprocess.Popen(
-            [sys.executable, "-c", code, str(SOURCE_RELAY), str(project), str(marker)],
+            [sys.executable, "-c", code, str(SOURCE_BATON), str(project), str(marker)],
             cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         deadline = time.monotonic() + 5
@@ -3217,8 +3740,8 @@ module["cmd_archive"](SimpleNamespace())
         worker = self.write_worker(STAGE_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "stage", ["new/**"])
-        self.relay(project, "run", task_id, check=True)
-        diff = project / ".attention-relay" / "work" / task_id / "attempt-1.diff"
+        self.baton(project, "run", task_id, check=True)
+        diff = project / ".baton" / "work" / task_id / "attempt-1.diff"
         self.assertIn("new/staged.txt", diff.read_text())
 
     def test_capsule_sandwich_brief_digest_and_retry_delta(self):
@@ -3226,9 +3749,9 @@ module["cmd_archive"](SimpleNamespace())
         worker = self.write_worker(GOOD_WORKER)
         self.configure(project, worker)
         task_id = self.create_task(project, "capsule", ["capsule/**"])
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
 
-        work = project / ".attention-relay" / "work" / task_id
+        work = project / ".baton" / "work" / task_id
         prompt = (work / "attempt-1.prompt.md").read_text()
         brief = (work / "attempt-1.brief.md").read_text()
         digest_line, capsule = brief.split("\n\n", 1)
@@ -3243,21 +3766,21 @@ module["cmd_archive"](SimpleNamespace())
         self.assertTrue(prompt.endswith(capsule))
         self.assertEqual(prompt.count(capsule), 2)
 
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_capsule_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_capsule_probe")
         task = self.state(project, task_id)
-        spec = (project / ".attention-relay" / "tasks" / f"{task_id}.md").read_text()
+        spec = (project / ".baton" / "tasks" / f"{task_id}.md").read_text()
         entries = module["memory_index_entries"](
-            (project / ".attention-relay" / "memory.md").read_text()
+            (project / ".baton" / "memory.md").read_text()
         )
         self.assertEqual(module["compile_context_capsule"](task, spec, entries), capsule)
         self.assertEqual(module["compile_context_capsule"](task, spec, entries), capsule)
 
-        self.relay(
+        self.baton(
             project, "task", "return", task_id,
             "--reason", "Preserve the capsule boundary", check=True,
         )
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         retry_prompt = (work / "attempt-2.prompt.md").read_text()
         retry_brief = (work / "attempt-2.brief.md").read_text()
         _retry_digest, retry_capsule = retry_brief.split("\n\n", 1)
@@ -3271,12 +3794,13 @@ module["cmd_archive"](SimpleNamespace())
     def test_placeholder_and_empty_specs_are_rejected_by_run_and_validate(self):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-        created = self.relay(
-            project, "task", "create", "--title", "unfinished spec", check=True,
+        created = self.baton(
+            project, "task", "create", "--title", "unfinished spec",
+            "--tier", "default", check=True,
         )
         task_id = created.stdout.split()[1]
-        run = self.relay(project, "run", task_id)
-        validation = self.relay(project, "validate")
+        run = self.baton(project, "run", task_id)
+        validation = self.baton(project, "validate")
         self.assertNotEqual(run.returncode, 0)
         self.assertNotEqual(validation.returncode, 0)
         shared = "Objective still contains the template placeholder"
@@ -3284,12 +3808,12 @@ module["cmd_archive"](SimpleNamespace())
         self.assertIn(shared, validation.stdout)
         self.assertEqual(self.state(project, task_id)["status"], "queued")
 
-        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
         spec.write_text(spec.read_text().replace(
             "Replace this line with one clear outcome.", "",
         ))
-        empty_run = self.relay(project, "run", task_id)
-        empty_validation = self.relay(project, "validate")
+        empty_run = self.baton(project, "run", task_id)
+        empty_validation = self.baton(project, "validate")
         self.assertIn("Objective is empty", empty_run.stderr)
         self.assertIn("Objective is empty", empty_validation.stdout)
 
@@ -3299,8 +3823,8 @@ module["cmd_archive"](SimpleNamespace())
             project, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=100,
         )
         task_id = self.create_task(project, "over budget", ["budget/**"])
-        run = self.relay(project, "run", task_id)
-        validation = self.relay(project, "validate")
+        run = self.baton(project, "run", task_id)
+        validation = self.baton(project, "validate")
         self.assertNotEqual(run.returncode, 0)
         self.assertNotEqual(validation.returncode, 0)
         for output in (run.stderr, validation.stdout):
@@ -3313,24 +3837,24 @@ module["cmd_archive"](SimpleNamespace())
         task_id = self.create_task(project, "stored capsule", ["capsule/**"])
         env = self.lease_task(project, task_id, "stored-capsule-lease")
         brief = (
-            project / ".attention-relay" / "work" / task_id / "attempt-1.brief.md"
+            project / ".baton" / "work" / task_id / "attempt-1.brief.md"
         ).read_text()
         _digest_header, stored_capsule = brief.split("\n\n", 1)
-        spec = project / ".attention-relay" / "tasks" / f"{task_id}.md"
+        spec = project / ".baton" / "tasks" / f"{task_id}.md"
         spec.write_text(spec.read_text().replace(
             "Complete the stored capsule task.", "This changed after launch.",
         ))
 
-        raw = self.relay(project, "task", "capsule", task_id, "--raw", check=True)
+        raw = self.baton(project, "task", "capsule", task_id, "--raw", check=True)
         self.assertEqual(raw.stdout.encode(), stored_capsule.encode())
-        shown = self.relay(project, "task", "capsule", task_id, check=True)
+        shown = self.baton(project, "task", "capsule", task_id, check=True)
         self.assertTrue(shown.stdout.startswith(stored_capsule + "\n\nCapsule diagnostics:\n"))
         self.assertIn("Source: launch (attempt 1)\n", shown.stdout)
         self.assertIn(
             "Digest: sha256:" + hashlib.sha256(stored_capsule.encode()).hexdigest(),
             shown.stdout,
         )
-        denied = self.relay(project, "task", "capsule", task_id, env=env)
+        denied = self.baton(project, "task", "capsule", task_id, env=env)
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
 
@@ -3338,7 +3862,7 @@ module["cmd_archive"](SimpleNamespace())
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
         task_id = self.create_task(project, "prospective capsule", ["preview/**"])
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
 
         def snapshot():
             return {
@@ -3350,15 +3874,15 @@ module["cmd_archive"](SimpleNamespace())
             }
 
         before = snapshot()
-        shown = self.relay(project, "task", "capsule", task_id, check=True)
+        shown = self.baton(project, "task", "capsule", task_id, check=True)
         self.assertEqual(snapshot(), before)
         self.assertIn("Source: current spec (prospective)\n", shown.stdout)
-        prospective = self.relay(
+        prospective = self.baton(
             project, "task", "capsule", task_id, "--raw", check=True,
         ).stdout
         self.assertEqual(snapshot(), before)
 
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         brief = runtime / "work" / task_id / "attempt-1.brief.md"
         _digest_header, launched = brief.read_text().split("\n\n", 1)
         self.assertEqual(prospective, launched)
@@ -3367,7 +3891,7 @@ module["cmd_archive"](SimpleNamespace())
         project = self.make_project()
         title = "aperçu 😀 東京"
         task_id = self.create_task(project, title, ["café/**"])
-        shown = self.relay(project, "task", "capsule", task_id, check=True)
+        shown = self.baton(project, "task", "capsule", task_id, check=True)
         task_line = f"Task: {task_id}: {title}"
         scope_line = "Scope: café/**"
         objective = f"## Objective\nComplete the {title} task."
@@ -3384,7 +3908,7 @@ module["cmd_archive"](SimpleNamespace())
             project, self.write_worker(NO_CHANGE_WORKER), capsule_max_chars=100,
         )
         task_id = self.create_task(project, "preview overflow", ["budget/**"])
-        shown = self.relay(project, "task", "capsule", task_id)
+        shown = self.baton(project, "task", "capsule", task_id)
         self.assertNotEqual(shown.returncode, 0)
         self.assertTrue(shown.stdout.startswith("# Critical Context Capsule\n"))
         self.assertRegex(
@@ -3398,7 +3922,7 @@ module["cmd_archive"](SimpleNamespace())
         self.assertIn("Source: current spec (prospective)\n", shown.stdout)
         self.assertIn("capsule_max_chars=100", shown.stderr)
 
-        raw = self.relay(project, "task", "capsule", task_id, "--raw")
+        raw = self.baton(project, "task", "capsule", task_id, "--raw")
         self.assertNotEqual(raw.returncode, 0)
         self.assertEqual(raw.stdout, "")
         self.assertIn("capsule_max_chars=100", raw.stderr)
@@ -3406,27 +3930,28 @@ module["cmd_archive"](SimpleNamespace())
     def test_task_capsule_errors_pass_through_and_reject_unknown_or_archived(self):
         project = self.make_project()
         self.configure(project, self.write_worker(NO_CHANGE_WORKER))
-        created = self.relay(
-            project, "task", "create", "--title", "unfinished preview", check=True,
+        created = self.baton(
+            project, "task", "create", "--title", "unfinished preview",
+            "--tier", "default", check=True,
         )
         unfinished = created.stdout.split()[1]
-        preview = self.relay(project, "task", "capsule", unfinished)
-        launch = self.relay(project, "run", unfinished)
+        preview = self.baton(project, "task", "capsule", unfinished)
+        launch = self.baton(project, "run", unfinished)
         self.assertNotEqual(preview.returncode, 0)
         self.assertEqual(preview.stderr, launch.stderr)
         self.assertIn("Objective still contains the template placeholder", preview.stderr)
 
-        unknown = self.relay(project, "task", "capsule", "T999-not-here")
+        unknown = self.baton(project, "task", "capsule", "T999-not-here")
         self.assertNotEqual(unknown.returncode, 0)
         self.assertIn("no such task: T999-not-here", unknown.stderr)
 
         archived = self.create_task(project, "archived preview", ["archive/**"])
-        state_path = project / ".attention-relay" / "tasks" / f"{archived}.json"
+        state_path = project / ".baton" / "tasks" / f"{archived}.json"
         state = json.loads(state_path.read_text())
         state["status"] = "done"
         state_path.write_text(json.dumps(state))
-        self.relay(project, "archive", check=True)
-        rejected = self.relay(project, "task", "capsule", archived)
+        self.baton(project, "archive", check=True)
+        rejected = self.baton(project, "task", "capsule", archived)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn(f"{archived} is archived", rejected.stderr)
 
@@ -3438,22 +3963,22 @@ module["cmd_archive"](SimpleNamespace())
             ("M1000", "B", "Four-digit shared fact", "SECOND FULL BODY MUST NOT LEAK"),
         ])
         task_id = self.create_task(project, "referenced memory", ["memory/**"])
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         spec_path = runtime / "tasks" / f"{task_id}.md"
         spec_path.write_text(spec_path.read_text().replace(
             "List the paths and facts the worker needs. Reference memory ids when useful.",
             "Use M1000, then M001, then M1000 again. Other sections do not count.",
         ))
 
-        preview = self.relay(project, "task", "capsule", task_id, check=True)
+        preview = self.baton(project, "task", "capsule", task_id, check=True)
         self.assertIn("- Referenced memory: ", preview.stdout)
-        prospective = self.relay(
+        prospective = self.baton(
             project, "task", "capsule", task_id, "--raw", check=True,
         ).stdout
         expected_section = (
             "## Referenced memory\n"
             "Load full entries as needed with "
-            "`python3 .attention-relay/relay memory show ID`.\n"
+            "`python3 .baton/baton memory show ID`.\n"
             "- M1000: Four-digit shared fact\n"
             "- M001: First worker fact"
         )
@@ -3465,12 +3990,12 @@ module["cmd_archive"](SimpleNamespace())
         )
         for body in ("FIRST FULL BODY MUST NOT LEAK", "SECOND FULL BODY MUST NOT LEAK"):
             self.assertNotIn(body, prospective)
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_stored_memory_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_stored_memory_probe")
         stored_result = module["stored_context_capsule_components"](prospective)
         self.assertEqual(stored_result["text"], prospective)
         self.assertIn("Referenced memory", dict(stored_result["section_chars"]))
 
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         work = runtime / "work" / task_id
         _digest, launch_capsule = (work / "attempt-1.brief.md").read_text().split(
             "\n\n", 1,
@@ -3502,8 +4027,8 @@ module["cmd_archive"](SimpleNamespace())
                 "or remove references",
             ),
         ]
-        runtime = project / ".attention-relay"
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_memory_error_probe")
+        runtime = project / ".baton"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_memory_error_probe")
         entries = module["memory_index_entries"]((runtime / "memory.md").read_text())
         task_cases = []
         for title, context, message in cases:
@@ -3518,20 +4043,77 @@ module["cmd_archive"](SimpleNamespace())
                 module["compile_context_capsule"](
                     self.state(project, task_id), spec_path.read_text(), entries,
                 )
-            preview = self.relay(project, "task", "capsule", task_id)
-            launch = self.relay(project, "run", task_id)
+            preview = self.baton(project, "task", "capsule", task_id)
+            launch = self.baton(project, "run", task_id)
             self.assertNotEqual(preview.returncode, 0)
             self.assertNotEqual(launch.returncode, 0)
             self.assertIn(message, preview.stderr)
             self.assertIn(message, launch.stderr)
 
-        validation = self.relay(project, "validate")
+        validation = self.baton(project, "validate")
         self.assertNotEqual(validation.returncode, 0)
         for _task_id, _spec_path, message in task_cases:
             self.assertIn(message, validation.stdout)
 
+    def test_memory_add_rejects_structural_values_and_show_requires_indexed_id(self):
+        invalid_values = (
+            ("   ", "body", "summary"),
+            ("line one\nline two", "body", "summary"),
+            (
+                "valid summary",
+                "real body\n### M999 [W] injected heading\nsynthetic body",
+                "entry heading",
+            ),
+        )
+        for index, (summary, body, message) in enumerate(invalid_values):
+            with self.subTest(summary=summary, body=body):
+                project = self.make_project(f"invalid-memory-add-{index}")
+                memory = project / ".baton" / "memory.md"
+                before = memory.read_bytes()
+                rejected = self.baton(
+                    project, "memory", "add", "--for", "worker", summary, body,
+                )
+                self.assertEqual(rejected.returncode, 1)
+                self.assertIn(message, rejected.stderr)
+                self.assertEqual(memory.read_bytes(), before)
+
+        project = self.make_project("unindexed-memory-heading")
+        self.write_memory(project, [
+            (
+                "M001", "W", "Real memory", "real body\n"
+                "### M999 [W] injected heading\nsynthetic body",
+            ),
+        ])
+        shown = self.baton(project, "memory", "show", "M999")
+        self.assertEqual(shown.returncode, 1)
+        self.assertIn("no memory entry M999", shown.stderr)
+
+    def test_memory_add_rejects_unicode_line_separators_without_mutation(self):
+        for separator in ("\u2028", "\u2029"):
+            for variant, summary in (
+                    ("embedded", f"safe{separator}unsafe"),
+                    ("trailing", f"trailing{separator}")):
+                with self.subTest(separator=hex(ord(separator)), variant=variant):
+                    project = self.make_project(
+                        f"unicode-memory-{ord(separator):x}-{variant}"
+                    )
+                    memory = project / ".baton" / "memory.md"
+                    before = memory.read_bytes()
+                    rejected = self.baton(
+                        project, "memory", "add", "--for", "worker",
+                        summary, "body",
+                    )
+                    self.assertEqual(rejected.returncode, 1)
+                    self.assertIn("single-line", rejected.stderr)
+                    self.assertNotIn("Traceback", rejected.stderr)
+                    self.assertEqual(memory.read_bytes(), before)
+                    indexed = self.baton(project, "memory", "index")
+                    self.assertEqual(
+                        indexed.returncode, 0, indexed.stdout + indexed.stderr,
+                    )
+
     def test_memory_index_parser_is_strict_and_preserves_four_digit_ids(self):
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_memory_parser_probe")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_memory_parser_probe")
         parse = module["memory_index_entries"]
         valid = (
             "# Memory\n\n## Index\n"
@@ -3549,9 +4131,9 @@ module["cmd_archive"](SimpleNamespace())
             parse(valid.replace("M001 [W] Worker fact", "M1000 [W] Worker fact"))
 
         project = self.make_project()
-        memory = project / ".attention-relay" / "memory.md"
+        memory = project / ".baton" / "memory.md"
         memory.write_text(valid.replace("M001 [W] Worker fact", "M1000 [W] Worker fact"))
-        validation = self.relay(project, "validate")
+        validation = self.baton(project, "validate")
         self.assertNotEqual(validation.returncode, 0)
         self.assertIn("memory index has duplicate id M1000", validation.stdout)
 
@@ -3561,8 +4143,8 @@ module["cmd_archive"](SimpleNamespace())
             ("M001", "W", "A deliberately long summary for capsule budgeting", "body"),
         ])
         task_id = self.create_task(project, "format stability", ["stable/**"])
-        runtime = project / ".attention-relay"
-        module = runpy.run_path(str(SOURCE_RELAY), run_name="relay_memory_budget_probe")
+        runtime = project / ".baton"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_memory_budget_probe")
         task = self.state(project, task_id)
         spec_path = runtime / "tasks" / f"{task_id}.md"
         spec = spec_path.read_text().replace(
@@ -3600,7 +4182,7 @@ module["cmd_archive"](SimpleNamespace())
             project, self.write_worker(NO_CHANGE_WORKER),
             capsule_max_chars=baseline["chars"],
         )
-        preview = self.relay(project, "task", "capsule", task_id)
+        preview = self.baton(project, "task", "capsule", task_id)
         self.assertNotEqual(preview.returncode, 0)
         self.assertIn("- Referenced memory: ", preview.stdout)
         self.assertIn("capsule_max_chars=", preview.stderr)
@@ -3612,13 +4194,13 @@ module["cmd_archive"](SimpleNamespace())
             ("M001", "W", "Original launch summary", "body"),
         ])
         task_id = self.create_task(project, "review memory drift", ["review/**"])
-        runtime = project / ".attention-relay"
+        runtime = project / ".baton"
         spec = runtime / "tasks" / f"{task_id}.md"
         spec.write_text(spec.read_text().replace(
             "List the paths and facts the worker needs. Reference memory ids when useful.",
             "Use M001.",
         ))
-        self.relay(project, "run", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
         _digest, stored_capsule = (
             runtime / "work" / task_id / "attempt-1.brief.md"
         ).read_text().split("\n\n", 1)
@@ -3639,13 +4221,13 @@ module["cmd_archive"](SimpleNamespace())
 
     def test_memory_archive_and_prompt_spec_alignment(self):
         project = self.make_project()
-        self.relay(project, "memory", "add", "--for", "worker",
+        self.baton(project, "memory", "add", "--for", "worker",
                    "Use the local environment", "Do not install global packages.", check=True)
-        index = self.relay(project, "memory", "index", "--for", "worker", check=True)
+        index = self.baton(project, "memory", "index", "--for", "worker", check=True)
         self.assertIn("M001", index.stdout)
-        shown = self.relay(project, "memory", "show", "M001", check=True)
+        shown = self.baton(project, "memory", "show", "M001", check=True)
         self.assertIn("Do not install global packages.", shown.stdout)
-        self.assertEqual(self.relay(project, "validate").returncode, 0)
+        self.assertEqual(self.baton(project, "validate").returncode, 0)
 
         spec = (ROOT / "SPEC.md").read_text()
         prompt = (ROOT / "prompts" / "create-framework.md").read_text()
@@ -3653,6 +4235,17 @@ module["cmd_archive"](SimpleNamespace())
             "\n<!-- END SPEC -->", 1
         )[0]
         self.assertEqual(embedded, spec.rstrip())
+
+        orchestrator = (ROOT / "framework" / "orchestrator.md").read_text()
+        example_text = (ROOT / "framework" / "config.example.toml").read_text()
+        for text in (spec, prompt, orchestrator, example_text):
+            normalized = " ".join(text.split())
+            self.assertIn("GPT 5.6 Sol", normalized)
+            self.assertIn("Claude Code Opus 4.8", normalized)
+            self.assertIn("GPT 5.6 Terra/high", normalized)
+        self.assertIn("Never omit `--tier`", orchestrator)
+        self.assertIn('engineering_role = "elite senior"', example_text)
+        self.assertIn('engineering_role = "senior"', example_text)
 
         with (ROOT / "framework" / "config.example.toml").open("rb") as source:
             config = tomllib.load(source)

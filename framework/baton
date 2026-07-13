@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Attention Relay: scoped coding-agent tasks with review before approval.
+"""Baton: scoped coding-agent tasks with review before approval.
 
 Requires Python 3.11+, Git, and macOS or Linux.
-Run `relay <command> --help` for command details.
+Run `baton <command> --help` for command details.
 """
 
 import argparse
@@ -24,7 +24,7 @@ import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from datetime import datetime, timezone
 
-RELAY_DIRNAME = ".attention-relay"
+BATON_DIRNAME = ".baton"
 STATUSES = (
     "queued", "running", "needs_review", "needs_decision",
     "blocked", "failed", "done", "cancelled",
@@ -33,23 +33,26 @@ WORKER_FINAL = ("needs_review", "needs_decision", "blocked", "failed")
 TASK_ID_RE = re.compile(r"T\d{3,}-[a-z0-9]+(?:-[a-z0-9]+)*")
 PRINT_LOCK = threading.Lock()
 MANAGED_FILES = (
-    "relay", "orchestrator.md", "worker.md", "memory.md", "config.toml",
+    "baton", "orchestrator.md", "worker.md", "memory.md", "config.toml",
     "orchestrator-handoff.md",
 )
 MANAGED_DIRS = ("tasks", "work", "archive", ".locks")
 HOOK_OUTPUT_MAX_CHARS = 9000
 HANDOFF_MAX_CHARS = 4000
 CLAUDE_COMPACT_NOTICE = (
-    "attention-relay: context was compacted; state re-injected below."
+    "Baton: context was compacted; state re-injected below."
 )
 CONVENTIONAL_LEVELS = ("hard", "medium", "easy")
+DISPLAY_FIELDS = ("model", "harness", "effort", "engineering_role", "fallback")
+DISPLAY_VALUE_MAX_CHARS = 80
+WORKER_LABEL_MAX_CHARS = 240
 CLAUDE_HOOK_COMMANDS = {
-    "SessionStart": '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event session-start',
-    "UserPromptSubmit": '"$CLAUDE_PROJECT_DIR"/.attention-relay/relay hook-event user-prompt-submit',
+    "SessionStart": '"$CLAUDE_PROJECT_DIR"/.baton/baton hook-event session-start',
+    "UserPromptSubmit": '"$CLAUDE_PROJECT_DIR"/.baton/baton hook-event user-prompt-submit',
 }
 
 if sys.version_info < (3, 11):
-    raise SystemExit("error: Attention Relay requires Python 3.11 or newer")
+    raise SystemExit("error: Baton requires Python 3.11 or newer")
 
 
 class RunInterrupted(Exception):
@@ -82,77 +85,106 @@ def script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def find_relay_dir():
-    env = os.environ.get("RELAY_DIR")
+def find_baton_dir():
+    env = os.environ.get("BATON_DIR")
     if env and os.path.isdir(env):
         return os.path.abspath(env)
     current = os.getcwd()
     while True:
-        candidate = os.path.join(current, RELAY_DIRNAME)
+        candidate = os.path.join(current, BATON_DIRNAME)
         if os.path.isdir(candidate):
             return candidate
         parent = os.path.dirname(current)
         if parent == current:
             break
         current = parent
-    if os.path.basename(script_dir()) == RELAY_DIRNAME:
+    if os.path.basename(script_dir()) == BATON_DIRNAME:
         return script_dir()
     return None
 
 
-def runtime_paths_are_safe(relay_dir):
-    root = os.path.realpath(os.path.dirname(relay_dir))
-    if os.path.lexists(relay_dir):
-        if os.path.islink(relay_dir) or not os.path.isdir(relay_dir):
-            die(".attention-relay must be a real directory inside the project")
-        if os.path.commonpath((root, os.path.realpath(relay_dir))) != root:
-            die(".attention-relay resolves outside the project")
+def runtime_paths_are_safe(baton_dir):
+    root = os.path.realpath(os.path.dirname(baton_dir))
+    try:
+        baton_stat = os.lstat(baton_dir)
+    except OSError:
+        baton_stat = None
+    if baton_stat is not None:
+        if stat.S_ISLNK(baton_stat.st_mode) or not stat.S_ISDIR(baton_stat.st_mode):
+            die(".baton must be a real directory inside the project")
+        if os.path.commonpath((root, os.path.realpath(baton_dir))) != root:
+            die(".baton resolves outside the project")
     for name in MANAGED_FILES:
-        path = os.path.join(relay_dir, name)
-        if os.path.lexists(path) and (os.path.islink(path) or not os.path.isfile(path)):
+        path = os.path.join(baton_dir, name)
+        try:
+            path_stat = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(path_stat.st_mode):
             die("managed runtime file is not a regular file: {}".format(path))
     for name in MANAGED_DIRS:
-        path = os.path.join(relay_dir, name)
-        if os.path.lexists(path) and (os.path.islink(path) or not os.path.isdir(path)):
+        path = os.path.join(baton_dir, name)
+        try:
+            path_stat = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(path_stat.st_mode):
             die("managed runtime path is not a real directory: {}".format(path))
-        if os.path.isdir(path):
-            for current, directories, files in os.walk(path, followlinks=False):
-                for entry in directories + files:
-                    nested = os.path.join(current, entry)
-                    if os.path.islink(nested):
-                        die("managed runtime paths cannot be symlinks: {}".format(nested))
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            try:
+                with os.scandir(current) as entries:
+                    directories = []
+                    files = []
+                    for entry in entries:
+                        try:
+                            target = directories if entry.is_dir() else files
+                        except OSError:
+                            target = files
+                        target.append(entry)
+            except OSError:
+                continue
+            for entry in directories + files:
+                try:
+                    is_link = entry.is_symlink()
+                except OSError:
+                    is_link = False
+                if is_link:
+                    die("managed runtime paths cannot be symlinks: {}".format(entry.path))
+            pending.extend(entry.path for entry in reversed(directories))
 
 
-def require_relay_dir():
-    relay_dir = find_relay_dir()
-    if not relay_dir:
-        die("no .attention-relay directory found; run: relay init [project-path]")
-    runtime_paths_are_safe(relay_dir)
-    return relay_dir
+def require_baton_dir():
+    baton_dir = find_baton_dir()
+    if not baton_dir:
+        die("no .baton directory found; run: framework/baton init [project-path]")
+    runtime_paths_are_safe(baton_dir)
+    return baton_dir
 
 
-def project_root(relay_dir):
-    return os.path.dirname(relay_dir)
+def project_root(baton_dir):
+    return os.path.dirname(baton_dir)
 
 
-def tasks_dir(relay_dir):
-    return os.path.join(relay_dir, "tasks")
+def tasks_dir(baton_dir):
+    return os.path.join(baton_dir, "tasks")
 
 
-def work_dir(relay_dir, task_id=""):
-    base = os.path.join(relay_dir, "work")
+def work_dir(baton_dir, task_id=""):
+    base = os.path.join(baton_dir, "work")
     if task_id:
         validate_task_id(task_id)
         return os.path.join(base, task_id)
     return base
 
 
-def archive_dir(relay_dir):
-    return os.path.join(relay_dir, "archive")
+def archive_dir(baton_dir):
+    return os.path.join(baton_dir, "archive")
 
 
-def lock_path(relay_dir, name):
-    return os.path.join(relay_dir, ".locks", name + ".lock")
+def lock_path(baton_dir, name):
+    return os.path.join(baton_dir, ".locks", name + ".lock")
 
 
 @contextmanager
@@ -169,15 +201,15 @@ def file_lock(path):
 
 
 @contextmanager
-def task_lock(relay_dir, task_id):
+def task_lock(baton_dir, task_id):
     validate_task_id(task_id)
-    with file_lock(lock_path(relay_dir, "task-" + task_id)):
+    with file_lock(lock_path(baton_dir, "task-" + task_id)):
         yield
 
 
 def atomic_write(path, content, mode=0o644):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".relay-write-", dir=os.path.dirname(path))
+    fd, temp_path = tempfile.mkstemp(prefix=".baton-write-", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
             output.write(content)
@@ -196,16 +228,16 @@ def atomic_json(path, value):
 
 
 def require_orchestrator():
-    if os.environ.get("RELAY_TASK_ID"):
+    if os.environ.get("BATON_TASK_ID"):
         die("worker processes cannot run orchestrator commands")
 
 
 # Config
 
-def load_config(relay_dir):
+def load_config(baton_dir):
     import tomllib
 
-    path = os.path.join(relay_dir, "config.toml")
+    path = os.path.join(baton_dir, "config.toml")
     if not os.path.exists(path):
         die("missing config.toml")
     try:
@@ -292,6 +324,47 @@ def configured_tier_names(config):
     return ["default", *sorted(tiers)]
 
 
+def validated_display_metadata(value):
+    """Validate and sanitize bounded operator-authored worker display metadata."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("tier display metadata must be a table")
+    unknown = sorted(set(value) - set(DISPLAY_FIELDS))
+    if unknown:
+        raise ValueError("unknown tier display metadata: " + ", ".join(unknown))
+    metadata = {}
+    for name in DISPLAY_FIELDS:
+        if name not in value:
+            continue
+        item = value[name]
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("tier display {} must be non-blank text".format(name))
+        if len(item) > DISPLAY_VALUE_MAX_CHARS:
+            raise ValueError(
+                "tier display {} exceeds {} characters".format(
+                    name, DISPLAY_VALUE_MAX_CHARS,
+                )
+            )
+        if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in item):
+            raise ValueError("tier display {} must not contain control characters".format(name))
+        if re.search(r"(?<![A-Za-z0-9])--?[A-Za-z0-9]", item):
+            raise ValueError("tier display {} must not contain command flags".format(name))
+        metadata[name] = " ".join(sanitize_log_text(item).split())
+    return metadata
+
+
+def worker_display_label(tier):
+    metadata = tier.get("display", {})
+    if not metadata:
+        return "unlabeled worker"
+    label = "; ".join(
+        "{}={}".format(name, metadata[name])
+        for name in DISPLAY_FIELDS if metadata.get(name)
+    )
+    return flatten_bounded_text(label, WORKER_LABEL_MAX_CHARS) or "unlabeled worker"
+
+
 def conventional_level_names(config):
     configured = [
         name for name in CONVENTIONAL_LEVELS
@@ -311,17 +384,22 @@ def difficulty_levels_lines(config):
         "- Configured conventional levels: {}; missing: {}.".format(
             configured_text, ", ".join(missing),
         ),
-        "- In your first response, ask the USER which model (and optionally provider) each missing level should use.",
-        "- Copy-ready TOML for only the missing levels (strip `# `; replace MODEL and optional PROVIDER, or remove `--provider PROVIDER`); per-level worker_timeout_minutes/capsule_max_chars are optional:",
+        "- Ask the USER to configure the requested routes: hard=GPT 5.6 Sol/high/elite senior; medium=GPT 5.6 Sol/medium/elite senior; easy=Claude Code Opus 4.8/xhigh/senior with GPT 5.6 Terra/high only when Claude usage is exhausted.",
+        "- Copy-ready routing skeleton for only the missing levels (strip `# `; use local wrappers/profiles that match framework/config.example.toml); per-level worker_timeout_minutes/capsule_max_chars are optional:",
     ]
     for name in missing:
+        command = {
+            "hard": "hermes chat -Q -t terminal,file --source tool --ignore-rules -m GPT-5.6-Sol -q {prompt}",
+            "medium": "hermes-medium-worker {prompt_file}",
+            "easy": "baton-easy-worker {prompt_file}",
+        }[name]
         lines.extend((
             "# [tiers.{}]".format(name),
-            '# command = "hermes chat -Q -t terminal,file --source tool --ignore-rules -m MODEL --provider PROVIDER -q {prompt}"',
+            "# command = {}".format(json.dumps(command)),
         ))
     lines.extend((
         "- Hermes exposes no per-invocation reasoning override; reasoning follows the harness's own config.",
-        "- These levels are optional conventions; Relay never configures or selects them automatically.",
+        "- Baton never configures or selects a level automatically; task creation requires an explicit validated --tier.",
     ))
     return lines
 
@@ -377,23 +455,55 @@ def configured_tier(config, name):
     capsule_max_chars = validated_capsule_max_chars(section.get(
         "capsule_max_chars", cfg_get(config, "limits.capsule_max_chars", 4000),
     ))
+    display = validated_display_metadata(section.get("display"))
     return {
         "name": name,
         "command": template,
         "command_source": command_source,
         "worker_timeout_minutes": timeout,
         "capsule_max_chars": capsule_max_chars,
+        "display": display,
     }
 
 
+def configured_task_tier(config, task, cache=None):
+    """Resolve a task tier, optionally reusing validation within one command."""
+    name = task.get("tier")
+    if cache is None or not isinstance(name, str) or not name.strip():
+        return configured_tier(config, name)
+    if name not in cache:
+        try:
+            cache[name] = (configured_tier(config, name), None)
+        except ValueError as error:
+            cache[name] = (None, str(error))
+    tier, problem = cache[name]
+    if problem is not None:
+        raise ValueError(problem)
+    return tier
+
+
 def command_template(config, task):
-    return configured_tier(config, task.get("tier", "default"))["command"]
+    return configured_tier(config, task.get("tier"))["command"]
 
 
-def resolved_task_label(config, task):
-    tier = configured_tier(config, task.get("tier", "default"))["name"]
-    suffix = " [tier={}]".format(tier) if tier != "default" else ""
-    return task["id"] + suffix
+def resolved_task_label(config, task, tier_cache=None):
+    tier = configured_task_tier(config, task, tier_cache)
+    title = flatten_bounded_text(task.get("title"), 120)
+    return "{} | title={} | difficulty={} | worker={}".format(
+        task["id"], title or "(untitled)", tier["name"], worker_display_label(tier),
+    )
+
+
+def displayed_task(config, task, tier_cache=None):
+    """Return task state enriched only with safe, effective routing metadata."""
+    tier = configured_task_tier(config, task, tier_cache)
+    displayed = dict(task)
+    displayed["difficulty"] = tier["name"]
+    displayed["worker_label"] = worker_display_label(tier)
+    displayed["routing"] = "difficulty={} | worker={}".format(
+        tier["name"], displayed["worker_label"],
+    )
+    return displayed
 
 
 def worker_argv(config, task, prompt, prompt_file, root):
@@ -415,26 +525,26 @@ def worker_argv(config, task, prompt, prompt_file, root):
 
 # Tasks
 
-def task_json_path(relay_dir, task_id):
+def task_json_path(baton_dir, task_id):
     validate_task_id(task_id)
-    return os.path.join(tasks_dir(relay_dir), task_id + ".json")
+    return os.path.join(tasks_dir(baton_dir), task_id + ".json")
 
 
-def task_md_path(relay_dir, task_id):
+def task_md_path(baton_dir, task_id):
     validate_task_id(task_id)
-    return os.path.join(tasks_dir(relay_dir), task_id + ".md")
+    return os.path.join(tasks_dir(baton_dir), task_id + ".md")
 
 
-def report_path(relay_dir, task_id, attempt):
-    return os.path.join(work_dir(relay_dir, task_id), "attempt-%d.report.md" % attempt)
+def report_path(baton_dir, task_id, attempt):
+    return os.path.join(work_dir(baton_dir, task_id), "attempt-%d.report.md" % attempt)
 
 
-def result_path(relay_dir, task_id, attempt):
-    return os.path.join(work_dir(relay_dir, task_id), "attempt-%d.result.json" % attempt)
+def result_path(baton_dir, task_id, attempt):
+    return os.path.join(work_dir(baton_dir, task_id), "attempt-%d.result.json" % attempt)
 
 
-def diff_path(relay_dir, task_id, attempt):
-    return os.path.join(work_dir(relay_dir, task_id), "attempt-%d.diff" % attempt)
+def diff_path(baton_dir, task_id, attempt):
+    return os.path.join(work_dir(baton_dir, task_id), "attempt-%d.diff" % attempt)
 
 
 def git_diff_header_path(line):
@@ -624,6 +734,11 @@ def flatten_bounded_text(value, limit):
     return text
 
 
+def is_single_line_text(value):
+    """Return whether text has exactly one Python-recognized, unterminated line."""
+    return isinstance(value, str) and value.splitlines() == [value]
+
+
 def bounded_log_tail(path, byte_limit=64 * 1024, line_limit=15):
     """Read and sanitize only a bounded final-byte window from an attempt log."""
     descriptor = None
@@ -663,15 +778,15 @@ def untrusted_log_tail_block(path, maximum=1500):
     return block[:maximum]
 
 
-def brief_token_path(relay_dir, task_id):
-    return os.path.join(work_dir(relay_dir, task_id), "finish-brief-token.json")
+def brief_token_path(baton_dir, task_id):
+    return os.path.join(work_dir(baton_dir, task_id), "finish-brief-token.json")
 
 
-def phase_receipts_path(relay_dir, task_id, attempt, archived=False):
+def phase_receipts_path(baton_dir, task_id, attempt, archived=False):
     if archived:
-        directory = os.path.join(archive_dir(relay_dir), task_id + ".work")
+        directory = os.path.join(archive_dir(baton_dir), task_id + ".work")
     else:
-        directory = work_dir(relay_dir, task_id)
+        directory = work_dir(baton_dir, task_id)
     return os.path.join(directory, "attempt-%d.briefs.json" % attempt)
 
 
@@ -721,8 +836,8 @@ def read_phase_receipts(path, task_id=None, attempt=None, lease=None, capsule_di
     return value
 
 
-def review_token_path(relay_dir, task_id):
-    return os.path.join(work_dir(relay_dir, task_id), "review-brief-token.json")
+def review_token_path(baton_dir, task_id):
+    return os.path.join(work_dir(baton_dir, task_id), "review-brief-token.json")
 
 
 def sha256_regular_file(path):
@@ -748,12 +863,12 @@ def sha256_regular_file(path):
             os.close(descriptor)
 
 
-def build_review_evidence_manifest(relay_dir, task, capsule):
+def build_review_evidence_manifest(baton_dir, task, capsule):
     """Build the immutable evidence description used by the review accept gate."""
     attempt = task.get("attempt", 1)
-    report = report_path(relay_dir, task["id"], attempt)
-    result_file = result_path(relay_dir, task["id"], attempt)
-    diff = diff_path(relay_dir, task["id"], attempt)
+    report = report_path(baton_dir, task["id"], attempt)
+    result_file = result_path(baton_dir, task["id"], attempt)
+    diff = diff_path(baton_dir, task["id"], attempt)
     hashes = {
         "report": sha256_regular_file(report),
         "result": sha256_regular_file(result_file),
@@ -783,13 +898,13 @@ def build_review_evidence_manifest(relay_dir, task, capsule):
     }
 
 
-def orchestrator_handoff_path(relay_dir):
-    return os.path.join(relay_dir, "orchestrator-handoff.md")
+def orchestrator_handoff_path(baton_dir):
+    return os.path.join(baton_dir, "orchestrator-handoff.md")
 
 
-def invalidate_review_token(relay_dir, task_id):
+def invalidate_review_token(baton_dir, task_id):
     with suppress(FileNotFoundError):
-        os.unlink(review_token_path(relay_dir, task_id))
+        os.unlink(review_token_path(baton_dir, task_id))
 
 
 def report_is_ready(path):
@@ -814,6 +929,7 @@ def report_section_problems(text, expected_status):
         if fence_character is None and fence:
             fence_character = fence.group(1)[0]
             fence_length = len(fence.group(1))
+            continue
         elif fence_character is not None:
             closing = re.fullmatch(r" {0,3}([`~]+)[ \t]*", line)
             if (
@@ -823,6 +939,7 @@ def report_section_problems(text, expected_status):
                     and len(closing.group(1)) >= fence_length):
                 fence_character = None
                 fence_length = 0
+                continue
         elif line == "##" or line.startswith("## "):
             name = line[3:] if line.startswith("## ") else ""
             if name in sections:
@@ -882,6 +999,16 @@ def read_report_for_section_gate(path):
         return None, "report file is not valid UTF-8"
 
 
+def report_gate_problems(path, expected_status, requires_sections):
+    """Return enabled report-gate problems for one final report artifact."""
+    if not requires_sections:
+        return [] if report_is_ready(path) else ["report file is missing or invalid"]
+    report_text, read_problem = read_report_for_section_gate(path)
+    if read_problem:
+        return [read_problem]
+    return report_section_problems(report_text, expected_status)
+
+
 def read_json(path):
     if os.path.islink(path) or not os.path.isfile(path):
         raise OSError("not a regular JSON file: {}".format(path))
@@ -895,21 +1022,61 @@ def read_json(path):
         raise json.JSONDecodeError(str(error), text, 0) from error
 
 
-def load_task(relay_dir, task_id, include_archive=False):
-    path = task_json_path(relay_dir, task_id)
+def task_history_problems(task, prefix=""):
+    """Return structural history problems without invoking lifecycle consumers."""
+    history = task.get("history")
+    if not isinstance(history, list):
+        return [prefix + "history must be a list"]
+    problems = []
+    for index, entry in enumerate(history):
+        entry_prefix = "{}history entry {} ".format(prefix, index)
+        if not isinstance(entry, dict):
+            problems.append(entry_prefix + "must be an object")
+            continue
+        for field in ("at", "event"):
+            if not isinstance(entry.get(field), str) or not entry[field]:
+                problems.append(entry_prefix + "{} must be non-empty text".format(field))
+    return problems
+
+
+def require_loaded_task_shape(task, path, validate_history_fields=False):
+    """Reject task shapes that ordinary lifecycle consumers cannot safely read."""
+    if not isinstance(task, dict):
+        raise ValueError("task state {} must contain a JSON object".format(path))
+    history = task.get("history")
+    if not isinstance(history, list):
+        raise ValueError("task state {} history must be a list".format(path))
+    for index, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "task state {} history entry {} must be an object".format(path, index)
+            )
+    if validate_history_fields:
+        problems = task_history_problems(task)
+        if problems:
+            raise ValueError("task state {} {}".format(path, problems[0]))
+    return task
+
+
+def load_task(baton_dir, task_id, include_archive=False):
+    path = task_json_path(baton_dir, task_id)
     if not os.path.exists(path) and include_archive:
-        path = os.path.join(archive_dir(relay_dir), task_id + ".json")
+        path = os.path.join(archive_dir(baton_dir), task_id + ".json")
     if not os.path.exists(path):
         die("no such task: {}".format(task_id))
     try:
-        return read_json(path)
+        task = read_json(path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        die("cannot read task {}: {}".format(task_id, error))
+    try:
+        return require_loaded_task_shape(task, path)
+    except ValueError as error:
         die("cannot read task {}: {}".format(task_id, error))
 
 
-def save_task(relay_dir, task):
+def save_task(baton_dir, task):
     task["updated_at"] = now()
-    atomic_json(task_json_path(relay_dir, task["id"]), task)
+    atomic_json(task_json_path(baton_dir, task["id"]), task)
 
 
 def record(task, event, **details):
@@ -918,7 +1085,7 @@ def record(task, event, **details):
     task.setdefault("history", []).append(entry)
 
 
-def load_tasks_from(directory):
+def load_tasks_from(directory, validate_history=True):
     tasks: list[dict] = []
     if not os.path.isdir(directory):
         return tasks
@@ -926,7 +1093,14 @@ def load_tasks_from(directory):
         if name.endswith(".json"):
             path = os.path.join(directory, name)
             try:
-                tasks.append(read_json(path))
+                task = read_json(path)
+                if not isinstance(task, dict):
+                    raise ValueError(
+                        "task state {} must contain a JSON object".format(path)
+                    )
+                if validate_history:
+                    require_loaded_task_shape(task, path)
+                tasks.append(task)
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError(
                     "cannot read task state {}: {}".format(path, error)
@@ -934,12 +1108,12 @@ def load_tasks_from(directory):
     return tasks
 
 
-def load_all_tasks(relay_dir):
-    return load_tasks_from(tasks_dir(relay_dir))
+def load_all_tasks(baton_dir, validate_history=True):
+    return load_tasks_from(tasks_dir(baton_dir), validate_history)
 
 
-def load_archived_tasks(relay_dir):
-    return load_tasks_from(archive_dir(relay_dir))
+def load_archived_tasks(baton_dir, validate_history=True):
+    return load_tasks_from(archive_dir(baton_dir), validate_history)
 
 
 def slugify(title):
@@ -1049,13 +1223,26 @@ def scope_pattern_matches(path, pattern):
     return match(0, 0)
 
 
+def normalize_changed_path(path):
+    """Validate one literal canonical project-relative path without glob parsing."""
+    if not isinstance(path, str):
+        raise ValueError("changed paths must be text")
+    if not path:
+        raise ValueError("changed paths cannot be empty")
+    if "\0" in path:
+        raise ValueError("changed paths cannot contain NUL")
+    if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
+        raise ValueError("changed paths must be relative to the project")
+    if any(part in ("", ".", "..") for part in path.split("/")):
+        raise ValueError("changed paths must be canonical project-relative paths")
+    return path
+
+
 def normalize_changed_paths(paths):
     normalized = []
     keys = set()
     for path in paths:
-        value = normalize_scope(path)
-        if value is None or "*" in value or "?" in value:
-            raise ValueError("changed paths must be exact project-relative paths")
+        value = normalize_changed_path(path)
         key = value.casefold()
         if key not in keys:
             normalized.append(value)
@@ -1080,9 +1267,9 @@ def path_in_scopes(path, scopes):
     return False
 
 
-def next_task_id(relay_dir, title):
+def next_task_id(baton_dir, title):
     numbers = [0]
-    for task in load_all_tasks(relay_dir) + load_archived_tasks(relay_dir):
+    for task in load_all_tasks(baton_dir) + load_archived_tasks(baton_dir):
         match = re.match(r"T(\d+)", task.get("id", ""))
         if match:
             numbers.append(int(match.group(1)))
@@ -1134,7 +1321,7 @@ def task_spec_sections(spec):
 
 
 def latest_task_spec_entry(text):
-    """Return the newest list entry (Relay prepends feedback and decisions)."""
+    """Return the newest list entry (Baton prepends feedback and decisions)."""
     for line in text.splitlines():
         if line.strip():
             return line.strip()
@@ -1240,7 +1427,7 @@ def context_capsule_components(task, spec, memory_entries, capsule_max_chars=400
     if referenced_memory:
         lines = [
             "Load full entries as needed with "
-            "`python3 .attention-relay/relay memory show ID`.",
+            "`python3 .baton/baton memory show ID`.",
         ]
         lines.extend("- {}: {}".format(*entry) for entry in referenced_memory)
         parts.append((
@@ -1321,28 +1508,34 @@ def cmd_task_create(args):
     require_orchestrator()
     if not args.title.strip():
         die("task title cannot be empty")
-    relay_dir = require_relay_dir()
-    tier_name = args.tier if args.tier is not None else "default"
+    if (
+            not is_single_line_text(args.title)
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159
+                   for character in args.title)):
+        die("task title must be single-line text without control characters")
+    baton_dir = require_baton_dir()
+    tier_name = args.tier
     try:
-        configured_tier(load_config(relay_dir), tier_name)
+        config = load_config(baton_dir)
+        configured_tier(config, tier_name)
     except ValueError as error:
         die(str(error))
-    with file_lock(lock_path(relay_dir, "scheduler")):
-        task_id = next_task_id(relay_dir, args.title)
+    with file_lock(lock_path(baton_dir, "scheduler")):
+        task_id = next_task_id(baton_dir, args.title)
         try:
             validate_task_id(task_id)
             scopes = normalize_scopes(args.scope)
         except ValueError as error:
             die(str(error))
         if any(task.get("id") == task_id for task in (
-                load_all_tasks(relay_dir) + load_archived_tasks(relay_dir))):
+                load_all_tasks(baton_dir) + load_archived_tasks(baton_dir))):
             die("task already exists: {}".format(task_id))
         dependencies = args.depends_on or []
         if len(dependencies) != len(set(dependencies)):
             die("dependencies cannot be repeated")
         if task_id in dependencies:
             die("a task cannot depend on itself")
-        known = {task["id"]: task for task in load_all_tasks(relay_dir) + load_archived_tasks(relay_dir)}
+        known = {task["id"]: task for task in load_all_tasks(baton_dir) + load_archived_tasks(baton_dir)}
         for dependency in dependencies:
             if dependency not in known:
                 die("unknown dependency: {}".format(dependency))
@@ -1361,31 +1554,40 @@ def cmd_task_create(args):
             "history": [],
         }
         record(task, "created")
-        os.makedirs(tasks_dir(relay_dir), exist_ok=True)
-        save_task(relay_dir, task)
-        atomic_write(task_md_path(relay_dir, task_id), TASK_MD_TEMPLATE.format(
+        os.makedirs(tasks_dir(baton_dir), exist_ok=True)
+        save_task(baton_dir, task)
+        atomic_write(task_md_path(baton_dir, task_id), TASK_MD_TEMPLATE.format(
             id=task_id, title=args.title,
         ))
-    say("created {}".format(task_id))
-    say("edit {}".format(os.path.relpath(task_md_path(relay_dir, task_id))))
+    say("created " + resolved_task_label(config, task))
+    say("edit {}".format(os.path.relpath(task_md_path(baton_dir, task_id))))
 
 
 def cmd_task_list(args):
-    relay_dir = require_relay_dir()
-    tasks = load_all_tasks(relay_dir)
+    baton_dir = require_baton_dir()
+    tasks = load_all_tasks(baton_dir)
+    config = load_config(baton_dir)
+    tier_cache = {}
     if args.json:
-        say(json.dumps(tasks, indent=2))
+        try:
+            say(json.dumps([
+                displayed_task(config, task, tier_cache) for task in tasks
+            ], indent=2))
+        except ValueError as error:
+            die(str(error))
         return
     if not tasks:
         say("no tasks")
         return
-    layout = "%-28s %-14s %-3s %-24s %s"
-    say(layout % ("ID", "STATUS", "ATT", "SCOPE", "TITLE"))
+    say("TASK ROUTING | STATUS | ATTEMPT | SCOPE")
     for task in tasks:
         scope = ",".join(task.get("scope", [])) or "*"
-        say(layout % (
-            task["id"], task["status"], task.get("attempt", 1),
-            scope[:24], task.get("title", ""),
+        try:
+            label = resolved_task_label(config, task, tier_cache)
+        except ValueError as error:
+            die(str(error))
+        say("{} | status={} | attempt={} | scope={}".format(
+            label, task["status"], task.get("attempt", 1), scope[:24],
         ))
 
 
@@ -1409,8 +1611,9 @@ def decision_question(task):
     return ""
 
 
-def render_next_actions(relay_dir):
-    tasks = load_all_tasks(relay_dir)
+def render_next_actions(baton_dir, tasks=None):
+    if tasks is None:
+        tasks = load_all_tasks(baton_dir)
     reviews = [task for task in tasks if task.get("status") == "needs_review"]
     decisions = [task for task in tasks if task.get("status") == "needs_decision"]
     lines = ["Next actions:"]
@@ -1438,9 +1641,9 @@ def render_next_actions(relay_dir):
         break
 
     for task in reviews[:review_shown]:
-        path = report_path(relay_dir, task["id"], task.get("attempt", 1))
+        path = report_path(baton_dir, task["id"], task.get("attempt", 1))
         lines.append("- review {}: {}".format(
-            task["id"], os.path.relpath(path, project_root(relay_dir)),
+            task["id"], os.path.relpath(path, project_root(baton_dir)),
         ))
     if review_shown < review_count:
         lines.append("- review: +{} more".format(review_count - review_shown))
@@ -1454,47 +1657,51 @@ def render_next_actions(relay_dir):
         lines.append("- decide: +{} more".format(decision_count - decision_shown))
     if not reviews and not decisions:
         if any(task.get("status") == "queued" for task in tasks):
-            lines.append("- run: relay orchestrator brief --phase run")
-            lines.append("- then: relay run")
+            lines.append("- run: .baton/baton orchestrator brief --phase run")
+            lines.append("- then: .baton/baton run")
         elif not tasks:
-            lines.append("- create: relay orchestrator brief --phase plan")
-            lines.append("- then: relay task create --title TITLE")
+            lines.append("- create: .baton/baton orchestrator brief --phase plan")
+            lines.append("- then: .baton/baton task create --title TITLE --tier DIFFICULTY")
         else:
             lines.append("- no queued, needs_review, or needs_decision tasks")
     return "\n".join(lines)
 
 
-def say_next_actions(relay_dir):
-    say(render_next_actions(relay_dir))
+def say_next_actions(baton_dir, tasks=None):
+    say(render_next_actions(baton_dir, tasks))
 
 
 def cmd_task_show(args):
-    relay_dir = require_relay_dir()
-    task = load_task(relay_dir, args.id, include_archive=True)
+    baton_dir = require_baton_dir()
+    task = load_task(baton_dir, args.id, include_archive=True)
+    try:
+        task = displayed_task(load_config(baton_dir), task)
+    except ValueError as error:
+        die(str(error))
     say(json.dumps(task, indent=2))
-    say_next_actions(relay_dir)
+    say_next_actions(baton_dir)
 
 
 def cmd_task_capsule(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    active_path = task_json_path(relay_dir, args.id)
+    baton_dir = require_baton_dir()
+    active_path = task_json_path(baton_dir, args.id)
     if not os.path.exists(active_path):
-        archived_path = os.path.join(archive_dir(relay_dir), args.id + ".json")
+        archived_path = os.path.join(archive_dir(baton_dir), args.id + ".json")
         if os.path.exists(archived_path):
             die("{} is archived; capsule preview is available only for active tasks".format(
                 args.id,
             ))
-    task = load_task(relay_dir, args.id)
+    task = load_task(baton_dir, args.id)
     try:
         maximum = configured_tier(
-            load_config(relay_dir), task.get("tier", "default"),
+            load_config(baton_dir), task.get("tier"),
         )["capsule_max_chars"]
     except ValueError as error:
         die(str(error))
     attempt = task.get("attempt", 1)
     if task.get("status") == "running":
-        path = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt)
+        path = os.path.join(work_dir(baton_dir, task["id"]), "attempt-%d.brief.md" % attempt)
         with open(path, encoding="utf-8") as source:
             stored_brief = source.read()
         _digest, separator, capsule = stored_brief.partition("\n\n")
@@ -1506,9 +1713,9 @@ def cmd_task_capsule(args):
             die("current attempt capsule is missing or invalid; rerun the task")
         source_label = "launch (attempt {})".format(attempt)
     else:
-        _, memory_text = read_memory(relay_dir)
+        _, memory_text = read_memory(baton_dir)
         memory_entries = memory_index_entries(memory_text)
-        with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+        with open(task_md_path(baton_dir, task["id"]), encoding="utf-8") as source:
             result = context_capsule_components(
                 task, source.read(), memory_entries, maximum,
             )
@@ -1544,8 +1751,8 @@ def cmd_task_capsule(args):
         raise SystemExit(1)
 
 
-def append_md_section(relay_dir, task_id, section, text):
-    path = task_md_path(relay_dir, task_id)
+def append_md_section(baton_dir, task_id, section, text):
+    path = task_md_path(baton_dir, task_id)
     if not os.path.exists(path):
         return
     with open(path, encoding="utf-8") as source:
@@ -1572,16 +1779,24 @@ def ensure_not_live(task):
 
 def cmd_task_accept(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    accept_requires_brief = configured_accept_requires_brief(load_config(relay_dir))
-    with task_lock(relay_dir, args.id):
-        task = load_task(relay_dir, args.id)
+    baton_dir = require_baton_dir()
+    config = load_config(baton_dir)
+    accept_requires_brief = configured_accept_requires_brief(config)
+    report_requires_sections = configured_report_requires_sections(config)
+    with task_lock(baton_dir, args.id):
+        task = load_task(baton_dir, args.id)
         ensure_not_live(task)
         if task.get("scope_violations"):
             die("{} has unresolved scope violations".format(task["id"]))
         if task["status"] != "needs_review":
             die("{} is {}, not needs_review".format(task["id"], task["status"]))
-        token_path = review_token_path(relay_dir, task["id"])
+        report_problems = report_gate_problems(
+            report_path(baton_dir, task["id"], task.get("attempt", 1)),
+            "needs_review", report_requires_sections,
+        )
+        if report_problems:
+            die("report rejected: " + "; ".join(report_problems))
+        token_path = review_token_path(baton_dir, task["id"])
         if accept_requires_brief:
             stored = None
             if os.path.isfile(token_path):
@@ -1596,15 +1811,15 @@ def cmd_task_accept(args):
                     or stored.get("attempt") != task.get("attempt", 1)
                     or stored.get("token") != args.brief):
                 die(
-                    "a fresh review-phase brief token is required; run `relay "
+                    "a fresh review-phase brief token is required; run `baton "
                     "orchestrator brief --phase review {}`, then pass its token as "
                     "`--brief TOKEN`".format(task["id"])
                 )
             try:
                 capsule, _capsule_drifted, _compile_warning = displayed_review_capsule(
-                    relay_dir, task,
+                    baton_dir, task,
                 )
-                current_manifest = build_review_evidence_manifest(relay_dir, task, capsule)
+                current_manifest = build_review_evidence_manifest(baton_dir, task, capsule)
             except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                 die("review evidence changed; run a fresh review brief")
             stored_manifest = dict(stored)
@@ -1613,7 +1828,7 @@ def cmd_task_accept(args):
                 die("review evidence changed; run a fresh review brief")
         task["status"] = "done"
         record(task, "accepted", note=args.note or "")
-        save_task(relay_dir, task)
+        save_task(baton_dir, task)
         if accept_requires_brief:
             os.unlink(token_path)
     say("{} accepted".format(task["id"]))
@@ -1621,9 +1836,9 @@ def cmd_task_accept(args):
 
 def cmd_task_return(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    with task_lock(relay_dir, args.id):
-        task = load_task(relay_dir, args.id)
+    baton_dir = require_baton_dir()
+    with task_lock(baton_dir, args.id):
+        task = load_task(baton_dir, args.id)
         ensure_not_live(task)
         if task["status"] not in WORKER_FINAL:
             die("{} is {}; it cannot be returned".format(task["id"], task["status"]))
@@ -1631,8 +1846,8 @@ def cmd_task_return(args):
         if violations:
             baseline = task.get("scope_baseline")
             if not baseline:
-                die("scope violation baseline is missing; run relay validate")
-            root = project_root(relay_dir)
+                die("scope violation baseline is missing; run .baton/baton validate")
+            root = project_root(baton_dir)
             require_git_root(root)
             current_tree = git_snapshot(root)
             changed = set(git_changed_paths(root, baseline, current_tree))
@@ -1647,10 +1862,10 @@ def cmd_task_return(args):
         task.pop("scope_baseline", None)
         task.pop("last_note", None)
         record(task, "returned", reason=args.reason)
-        save_task(relay_dir, task)
-        invalidate_review_token(relay_dir, task["id"])
+        save_task(baton_dir, task)
+        invalidate_review_token(baton_dir, task["id"])
         append_md_section(
-            relay_dir, task["id"], "Review feedback",
+            baton_dir, task["id"], "Review feedback",
             "- attempt %d: %s" % (previous_attempt, args.reason),
         )
     say("%s returned for attempt %d" % (task["id"], task["attempt"]))
@@ -1658,9 +1873,9 @@ def cmd_task_return(args):
 
 def cmd_task_decide(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    with task_lock(relay_dir, args.id):
-        task = load_task(relay_dir, args.id)
+    baton_dir = require_baton_dir()
+    with task_lock(baton_dir, args.id):
+        task = load_task(baton_dir, args.id)
         ensure_not_live(task)
         if task["status"] != "needs_decision":
             die("{} is {}, not needs_decision".format(task["id"], task["status"]))
@@ -1668,44 +1883,44 @@ def cmd_task_decide(args):
         task["attempt"] = task.get("attempt", 1) + 1
         task.pop("last_note", None)
         record(task, "decided", answer=args.answer)
-        save_task(relay_dir, task)
-        invalidate_review_token(relay_dir, task["id"])
-        append_md_section(relay_dir, task["id"], "Decisions", "- " + args.answer)
+        save_task(baton_dir, task)
+        invalidate_review_token(baton_dir, task["id"])
+        append_md_section(baton_dir, task["id"], "Decisions", "- " + args.answer)
     say("{} answered and re-queued".format(task["id"]))
 
 
 def cmd_task_cancel(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    with file_lock(lock_path(relay_dir, "scheduler")):
-        with task_lock(relay_dir, args.id):
-            task = load_task(relay_dir, args.id)
+    baton_dir = require_baton_dir()
+    with file_lock(lock_path(baton_dir, "scheduler")):
+        with task_lock(baton_dir, args.id):
+            task = load_task(baton_dir, args.id)
             ensure_not_live(task)
             if task["status"] == "running":
-                die("{} is running; wait for it or stop the relay process".format(task["id"]))
+                die("{} is running; wait for it or stop the Baton process".format(task["id"]))
             if task["status"] == "done":
                 die("{} is already done".format(task["id"]))
             task["status"] = "cancelled"
             record(task, "cancelled", reason=args.reason or "")
-            save_task(relay_dir, task)
-            invalidate_review_token(relay_dir, task["id"])
+            save_task(baton_dir, task)
+            invalidate_review_token(baton_dir, task["id"])
     say("{} cancelled".format(task["id"]))
 
 
 def cmd_task_finish(args):
-    relay_dir = require_relay_dir()
-    worker_id = os.environ.get("RELAY_TASK_ID")
-    worker_attempt = os.environ.get("RELAY_ATTEMPT")
-    worker_lease = os.environ.get("RELAY_LEASE")
+    baton_dir = require_baton_dir()
+    worker_id = os.environ.get("BATON_TASK_ID")
+    worker_attempt = os.environ.get("BATON_ATTEMPT")
+    worker_lease = os.environ.get("BATON_LEASE")
     if not worker_id or not worker_lease:
         die("task finish is available only inside a leased worker process")
     if worker_id != args.id:
         die("a worker may finish only its assigned task: {}".format(worker_id))
-    config = load_config(relay_dir)
+    config = load_config(baton_dir)
     finish_requires_brief = configured_finish_requires_brief(config)
     report_requires_sections = configured_report_requires_sections(config)
-    with task_lock(relay_dir, args.id):
-        task = load_task(relay_dir, args.id)
+    with task_lock(baton_dir, args.id):
+        task = load_task(baton_dir, args.id)
         attempt = task.get("attempt", 1)
         if worker_attempt != str(attempt):
             die("worker attempt does not match current task attempt")
@@ -1713,7 +1928,7 @@ def cmd_task_finish(args):
             die("worker lease does not match current task lease")
         if task["status"] != "running":
             die("{} is {}, not running".format(task["id"], task["status"]))
-        token_path = brief_token_path(relay_dir, task["id"])
+        token_path = brief_token_path(baton_dir, task["id"])
         if finish_requires_brief:
             stored = None
             if os.path.isfile(token_path):
@@ -1729,29 +1944,26 @@ def cmd_task_finish(args):
                     or stored.get("lease") != worker_lease
                     or stored.get("token") != args.brief):
                 die(
-                    "a fresh report-phase brief token is required; run `relay task brief {} "
+                    "a fresh report-phase brief token is required; run `.baton/baton task brief {} "
                     "--phase report`, then pass its token as `--brief TOKEN`".format(
                         task["id"],
                     )
                 )
-        report = report_path(relay_dir, task["id"], attempt)
+        report = report_path(baton_dir, task["id"], attempt)
         if args.status == "needs_review":
-            if report_requires_sections:
-                report_text, read_problem = read_report_for_section_gate(report)
-                problems = (
-                    [read_problem] if read_problem
-                    else report_section_problems(report_text, args.status)
-                )
-                if problems:
-                    die(
-                        "report rejected: {}; fix the report to match the worker.md template, "
-                        "then rerun `task finish` with the same `--brief` token".format(
-                            "; ".join(problems),
-                        )
+            problems = report_gate_problems(
+                report, args.status, report_requires_sections,
+            )
+            if problems:
+                if not report_requires_sections:
+                    die("write a non-empty regular report before requesting review")
+                die(
+                    "report rejected: {}; fix the report to match the worker.md template, "
+                    "then rerun `task finish` with the same `--brief` token".format(
+                        "; ".join(problems),
                     )
-            elif not report_is_ready(report):
-                die("write a non-empty regular report before requesting review")
-        path = result_path(relay_dir, task["id"], attempt)
+                )
+        path = result_path(baton_dir, task["id"], attempt)
         if os.path.exists(path):
             die("final status was already submitted for this attempt")
         try:
@@ -1791,20 +2003,20 @@ PHASE_CHECKLISTS = {
 
 
 def cmd_task_brief(args):
-    relay_dir = require_relay_dir()
-    worker_id = os.environ.get("RELAY_TASK_ID")
-    worker_attempt = os.environ.get("RELAY_ATTEMPT")
-    worker_lease = os.environ.get("RELAY_LEASE")
+    baton_dir = require_baton_dir()
+    worker_id = os.environ.get("BATON_TASK_ID")
+    worker_attempt = os.environ.get("BATON_ATTEMPT")
+    worker_lease = os.environ.get("BATON_LEASE")
     if not worker_id or not worker_lease:
         die("task brief is available only inside a leased worker process")
     if worker_id != args.id:
         die("a worker may brief only its assigned task: {}".format(worker_id))
     phase_sequence_requires_briefs = configured_phase_sequence_requires_briefs(
-        load_config(relay_dir),
+        load_config(baton_dir),
     )
     token = None
-    with task_lock(relay_dir, args.id):
-        task = load_task(relay_dir, args.id)
+    with task_lock(baton_dir, args.id):
+        task = load_task(baton_dir, args.id)
         attempt = task.get("attempt", 1)
         if worker_attempt != str(attempt):
             die("worker attempt does not match current task attempt")
@@ -1812,14 +2024,14 @@ def cmd_task_brief(args):
             die("worker lease does not match current task lease")
         if task["status"] != "running":
             die("{} is {}, not running".format(task["id"], task["status"]))
-        path = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt)
+        path = os.path.join(work_dir(baton_dir, task["id"]), "attempt-%d.brief.md" % attempt)
         with open(path, encoding="utf-8") as source:
             stored_brief = source.read()
         _digest, separator, capsule = stored_brief.partition("\n\n")
         if not separator or not capsule.startswith("# Critical Context Capsule"):
             die("current attempt capsule is missing or invalid; rerun the task")
         capsule_digest = "sha256:" + hashlib.sha256(capsule.encode("utf-8")).hexdigest()
-        receipts_file = phase_receipts_path(relay_dir, task["id"], attempt)
+        receipts_file = phase_receipts_path(baton_dir, task["id"], attempt)
         receipts = read_phase_receipts(
             receipts_file, task["id"], attempt, worker_lease, capsule_digest,
         )
@@ -1840,7 +2052,7 @@ def cmd_task_brief(args):
             for missing_phase in required_phases:
                 if missing_phase not in phases:
                     die(
-                        "phase sequence requires {} {} brief; run `relay task brief {} "
+                        "phase sequence requires {} {} brief; run `.baton/baton task brief {} "
                         "--phase {}`".format(
                             "an" if missing_phase == "edit" else "a",
                             missing_phase, task["id"], missing_phase,
@@ -1856,12 +2068,12 @@ def cmd_task_brief(args):
         atomic_json(receipts_file, receipts)
         if phase_sequence_requires_briefs and args.phase == "edit":
             with suppress(FileNotFoundError):
-                os.unlink(brief_token_path(relay_dir, task["id"]))
+                os.unlink(brief_token_path(baton_dir, task["id"]))
         if args.phase == "report":
             import secrets
 
             token = secrets.token_hex(32)
-            atomic_json(brief_token_path(relay_dir, task["id"]), {
+            atomic_json(brief_token_path(baton_dir, task["id"]), {
                 "task_id": task["id"],
                 "attempt": attempt,
                 "lease": worker_lease,
@@ -1874,8 +2086,8 @@ def cmd_task_brief(args):
         say("Brief token: " + token)
 
 
-def read_handoff(relay_dir):
-    path = orchestrator_handoff_path(relay_dir)
+def read_handoff(baton_dir):
+    path = orchestrator_handoff_path(baton_dir)
     if not os.path.exists(path):
         return ""
     if os.path.islink(path) or not os.path.isfile(path):
@@ -1979,7 +2191,7 @@ def render_handoff(
 
 
 def orchestrator_start_brief(
-        relay_dir, tasks, consume_handoff=True, include_levels_ask=True):
+        baton_dir, tasks, consume_handoff=True, include_levels_ask=True):
     say("Orchestrator role:")
     say("- Translate the user goal into small, observable tasks.")
     say("- Run only non-conflicting work and resolve worker decisions.")
@@ -1994,14 +2206,14 @@ def orchestrator_start_brief(
     say("- `hermes memory reset` is destructive.")
     say("- Workers launched by this framework are already clean by default via the config worker command.")
     if include_levels_ask:
-        level_lines = difficulty_levels_lines(load_config(relay_dir))
+        level_lines = difficulty_levels_lines(load_config(baton_dir))
         if level_lines:
             say("\n" + level_lines[0])
             for line in level_lines[1:]:
                 say(line)
     if consume_handoff:
-        with file_lock(lock_path(relay_dir, "orchestrator-handoff")):
-            handoff = read_handoff(relay_dir)
+        with file_lock(lock_path(baton_dir, "orchestrator-handoff")):
+            handoff = read_handoff(baton_dir)
             if handoff:
                 consumed = now()
                 if re.search(r"^consumed_at:.*$", handoff, re.MULTILINE):
@@ -2011,9 +2223,9 @@ def orchestrator_start_brief(
                     )
                 else:
                     handoff = handoff.rstrip() + "\nconsumed_at: " + consumed + "\n"
-                atomic_write(orchestrator_handoff_path(relay_dir), handoff)
+                atomic_write(orchestrator_handoff_path(baton_dir), handoff)
     else:
-        handoff = read_handoff(relay_dir)
+        handoff = read_handoff(baton_dir)
     if handoff:
         say("\nCurrent handoff:")
         say(handoff.rstrip())
@@ -2037,18 +2249,19 @@ def orchestrator_start_brief(
                 break
     say("Needs review: " + (", ".join(reviews) or "none"))
     if decision_tasks:
-        command = "relay task decide {} --answer ANSWER".format(decision_tasks[0]["id"])
+        command = ".baton/baton task decide {} --answer ANSWER".format(decision_tasks[0]["id"])
     elif reviews:
-        command = "relay orchestrator brief --phase review {}".format(reviews[0])
+        command = ".baton/baton orchestrator brief --phase review {}".format(reviews[0])
     elif any(task.get("status") == "queued" for task in tasks):
-        command = "relay orchestrator brief --phase run"
+        command = ".baton/baton orchestrator brief --phase run"
     else:
-        command = "relay orchestrator brief --phase plan"
+        command = ".baton/baton orchestrator brief --phase plan"
     say("Recommended next command: " + command)
 
 
 def orchestrator_plan_brief(tasks):
     say("Task-spec quality checklist:")
+    say("- Choose and announce one explicit configured difficulty before creation.")
     say("- One clear outcome.")
     say("- Observable acceptance criteria.")
     say("- Only needed paths and context.")
@@ -2074,22 +2287,22 @@ def latest_worker_exit(task):
     return {}
 
 
-def compile_current_task_capsule(relay_dir, task):
-    config = load_config(relay_dir)
-    _, memory_text = read_memory(relay_dir)
+def compile_current_task_capsule(baton_dir, task):
+    config = load_config(baton_dir)
+    _, memory_text = read_memory(baton_dir)
     memory_entries = memory_index_entries(memory_text)
-    with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+    with open(task_md_path(baton_dir, task["id"]), encoding="utf-8") as source:
         return compile_context_capsule(
             task, source.read(), memory_entries,
-            configured_tier(config, task.get("tier", "default"))["capsule_max_chars"],
+            configured_tier(config, task.get("tier"))["capsule_max_chars"],
         )
 
 
-def displayed_review_capsule(relay_dir, task, check_fresh=False):
+def displayed_review_capsule(baton_dir, task, check_fresh=False):
     """Select the capsule review displays, optionally checking current-input drift."""
     attempt = task.get("attempt", 1)
     brief_file = os.path.join(
-        work_dir(relay_dir, task["id"]), "attempt-%d.brief.md" % attempt,
+        work_dir(baton_dir, task["id"]), "attempt-%d.brief.md" % attempt,
     )
     if os.path.lexists(brief_file):
         if os.path.islink(brief_file) or not os.path.isfile(brief_file):
@@ -2102,7 +2315,7 @@ def displayed_review_capsule(relay_dir, task, check_fresh=False):
         if not check_fresh:
             return stored_capsule, False, None
         try:
-            fresh_capsule = compile_current_task_capsule(relay_dir, task)
+            fresh_capsule = compile_current_task_capsule(baton_dir, task)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
             error_text = " ".join(str(error).split())[:400]
             warning = (
@@ -2111,24 +2324,30 @@ def displayed_review_capsule(relay_dir, task, check_fresh=False):
             )
             return stored_capsule, False, warning
         return stored_capsule, fresh_capsule != stored_capsule, None
-    return compile_current_task_capsule(relay_dir, task), False, None
+    return compile_current_task_capsule(baton_dir, task), False, None
 
 
-def orchestrator_review_brief(relay_dir, task_id, include_log_tail=False):
+def orchestrator_review_brief(baton_dir, task_id, include_log_tail=False):
     import secrets
 
-    with task_lock(relay_dir, task_id):
-        task = load_task(relay_dir, task_id)
+    with task_lock(baton_dir, task_id):
+        task = load_task(baton_dir, task_id)
         if task.get("status") != "needs_review":
             die("{} is {}, not needs_review".format(task["id"], task.get("status")))
         attempt = task.get("attempt", 1)
         capsule, capsule_drifted, compile_warning = displayed_review_capsule(
-            relay_dir, task, check_fresh=True,
+            baton_dir, task, check_fresh=True,
         )
-        manifest = build_review_evidence_manifest(relay_dir, task, capsule)
+        report_problems = report_gate_problems(
+            report_path(baton_dir, task["id"], attempt), "needs_review",
+            configured_report_requires_sections(load_config(baton_dir)),
+        )
+        if report_problems:
+            die("report rejected: " + "; ".join(report_problems))
+        manifest = build_review_evidence_manifest(baton_dir, task, capsule)
         worker_exit = latest_worker_exit(task)
         diff_summary = attempt_diff_summary(
-            diff_path(relay_dir, task["id"], attempt),
+            diff_path(baton_dir, task["id"], attempt),
             manifest["evidence"]["observed"],
         )
         prior_artifacts = []
@@ -2136,8 +2355,8 @@ def orchestrator_review_brief(relay_dir, task_id, include_log_tail=False):
         for prior_attempt in range(attempt - 1, 0, -1):
             paths = []
             for name, artifact in (
-                    ("report", report_path(relay_dir, task["id"], prior_attempt)),
-                    ("diff", diff_path(relay_dir, task["id"], prior_attempt))):
+                    ("report", report_path(baton_dir, task["id"], prior_attempt)),
+                    ("diff", diff_path(baton_dir, task["id"], prior_attempt))):
                 if os.path.isfile(artifact) and not os.path.islink(artifact):
                     paths.append((name, artifact))
             if paths:
@@ -2145,20 +2364,20 @@ def orchestrator_review_brief(relay_dir, task_id, include_log_tail=False):
                     prior_artifacts.append((prior_attempt, paths))
                 else:
                     omitted_prior_attempts += 1
-        log = os.path.join(work_dir(relay_dir, task["id"]), "attempt-%d.log" % attempt)
+        log = os.path.join(work_dir(baton_dir, task["id"]), "attempt-%d.log" % attempt)
         log_tail = untrusted_log_tail_block(log) if include_log_tail else None
         receipts = read_phase_receipts(
-            phase_receipts_path(relay_dir, task["id"], attempt),
+            phase_receipts_path(baton_dir, task["id"], attempt),
             task["id"], attempt,
         )
         token = secrets.token_hex(32)
         token_record = dict(manifest)
         token_record["token"] = token
-        atomic_json(review_token_path(relay_dir, task["id"]), token_record)
-    root = project_root(relay_dir)
-    report = report_path(relay_dir, task["id"], attempt)
-    result_file = result_path(relay_dir, task["id"], attempt)
-    diff = diff_path(relay_dir, task["id"], attempt)
+        atomic_json(review_token_path(baton_dir, task["id"]), token_record)
+    root = project_root(baton_dir)
+    report = report_path(baton_dir, task["id"], attempt)
+    result_file = result_path(baton_dir, task["id"], attempt)
+    diff = diff_path(baton_dir, task["id"], attempt)
     evidence = manifest["evidence"]
     say(capsule)
     if compile_warning:
@@ -2233,10 +2452,10 @@ def orchestrator_review_brief(relay_dir, task_id, include_log_tail=False):
     say("Review token: " + token)
 
 
-def orchestrator_run_brief(relay_dir, tasks):
-    config = load_config(relay_dir)
+def orchestrator_run_brief(baton_dir, tasks):
+    config = load_config(baton_dir)
     max_parallel, _timeout = configured_limits(config)
-    archived = load_archived_tasks(relay_dir)
+    archived = load_archived_tasks(baton_dir)
     busy_scopes = [task.get("scope", []) for task in tasks
                    if task.get("status") == "running"]
     wave, skipped = pick_wave(tasks, archived, [], max_parallel, busy_scopes)
@@ -2277,7 +2496,7 @@ def working_tree_state(root):
 
 
 def orchestrator_close_brief(
-        relay_dir, tasks, archived_tasks, goal, avoid_notes, notes, working_tree):
+        baton_dir, tasks, archived_tasks, goal, avoid_notes, notes, working_tree):
     done_candidates = []
     decisions = []
     for task in tasks + archived_tasks:
@@ -2296,8 +2515,8 @@ def orchestrator_close_brief(
                 if task.get("status") in {"queued", "needs_review"}]
     unresolved = [task["id"] for task in tasks
                   if task.get("status") == "needs_decision"]
-    with file_lock(lock_path(relay_dir, "orchestrator-handoff")):
-        previous = read_handoff(relay_dir)
+    with file_lock(lock_path(baton_dir, "orchestrator-handoff")):
+        previous = read_handoff(baton_dir)
         previous_at = handoff_field(previous, "generated_at")
         previous_done = handoff_done_ids(previous)
         done = {}
@@ -2310,15 +2529,15 @@ def orchestrator_close_brief(
             now(), goal, working_tree, sorted(done.values()), decisions,
             next_ids, unresolved, notes, avoid_notes,
         )
-        atomic_write(orchestrator_handoff_path(relay_dir), content)
+        atomic_write(orchestrator_handoff_path(baton_dir), content)
     say(content.rstrip())
-    say("Start a fresh session, then run: relay orchestrator brief --phase start")
+    say("Start a fresh session, then run: .baton/baton orchestrator brief --phase start")
 
 
 def cmd_orchestrator_brief(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    tasks = load_all_tasks(relay_dir)
+    baton_dir = require_baton_dir()
+    tasks = load_all_tasks(baton_dir)
     if args.include_log_tail and args.phase != "review":
         die("--include-log-tail is valid only for the review phase")
     if args.goal is not None and args.phase != "close":
@@ -2349,18 +2568,18 @@ def cmd_orchestrator_brief(args):
             if note and note not in notes:
                 notes.append(note)
     if args.phase == "review":
-        orchestrator_review_brief(relay_dir, args.id, args.include_log_tail)
+        orchestrator_review_brief(baton_dir, args.id, args.include_log_tail)
     elif args.phase == "start":
-        orchestrator_start_brief(relay_dir, tasks)
+        orchestrator_start_brief(baton_dir, tasks)
     elif args.phase == "plan":
         orchestrator_plan_brief(tasks)
     elif args.phase == "run":
-        orchestrator_run_brief(relay_dir, tasks)
+        orchestrator_run_brief(baton_dir, tasks)
     else:
-        archived_tasks = load_archived_tasks(relay_dir)
-        tree_state = working_tree_state(project_root(relay_dir))
+        archived_tasks = load_archived_tasks(baton_dir)
+        tree_state = working_tree_state(project_root(baton_dir))
         orchestrator_close_brief(
-            relay_dir, tasks, archived_tasks, goal, avoid_notes, notes, tree_state,
+            baton_dir, tasks, archived_tasks, goal, avoid_notes, notes, tree_state,
         )
 
 
@@ -2387,14 +2606,14 @@ def claude_hook_command_is_registered(entries, command):
 
 def cmd_hooks_claude_code(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
+    baton_dir = require_baton_dir()
     fragment = claude_code_hook_fragment()
     if not args.write:
         say(json.dumps(fragment, indent=2))
         say("Merge this fragment into .claude/settings.json, or rerun with --write.")
         return
 
-    root = project_root(relay_dir)
+    root = project_root(baton_dir)
     claude_dir = os.path.join(root, ".claude")
     settings_path = os.path.join(claude_dir, "settings.json")
     if os.path.lexists(claude_dir) and (
@@ -2495,24 +2714,24 @@ def cmd_hook_event(args):
         captured_out = io.StringIO()
         captured_error = io.StringIO()
         with redirect_stdout(captured_out), redirect_stderr(captured_error):
-            relay_dir = find_relay_dir()
-            if not relay_dir:
+            baton_dir = find_baton_dir()
+            if not baton_dir:
                 return
-            runtime_paths_are_safe(relay_dir)
-            required_files = ("relay", "orchestrator.md", "config.toml")
-            if any(not os.path.isfile(os.path.join(relay_dir, name))
+            runtime_paths_are_safe(baton_dir)
+            required_files = ("baton", "orchestrator.md", "config.toml")
+            if any(not os.path.isfile(os.path.join(baton_dir, name))
                    for name in required_files):
                 return
-            if not os.path.isdir(tasks_dir(relay_dir)):
+            if not os.path.isdir(tasks_dir(baton_dir)):
                 return
-            tasks = load_all_tasks(relay_dir)
+            tasks = load_all_tasks(baton_dir)
             if args.name == "session-start":
                 orchestrator_start_brief(
-                    relay_dir, tasks, consume_handoff=False,
+                    baton_dir, tasks, consume_handoff=False,
                     include_levels_ask=hook_input.get("source") != "compact",
                 )
             else:
-                context = "attention-relay state:\n" + render_next_actions(relay_dir)
+                context = "Baton state:\n" + render_next_actions(baton_dir)
         if args.name == "session-start":
             output = captured_out.getvalue()
             if hook_input.get("source") == "compact":
@@ -2528,10 +2747,10 @@ def cmd_hook_event(args):
 
 def cmd_task_unlock(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    with file_lock(lock_path(relay_dir, "execution")):
-        with task_lock(relay_dir, args.id):
-            task = load_task(relay_dir, args.id)
+    baton_dir = require_baton_dir()
+    with file_lock(lock_path(baton_dir, "execution")):
+        with task_lock(baton_dir, args.id):
+            task = load_task(baton_dir, args.id)
             if task["status"] != "running":
                 die("{} is not running".format(task["id"]))
             pid = task.get("runner", {}).get("pid")
@@ -2541,7 +2760,7 @@ def cmd_task_unlock(args):
             task.pop("runner", None)
             task["last_note"] = "stale_runner"
             record(task, "unlocked", reason="stale_runner")
-            save_task(relay_dir, task)
+            save_task(baton_dir, task)
     say("{} marked failed; return it to retry".format(task["id"]))
 
 
@@ -2583,10 +2802,10 @@ def git_submodule_paths(root):
 
 def require_git_root(root):
     if not is_git_repo(root):
-        die("Attention Relay requires a Git repository")
+        die("Baton requires a Git repository")
     top_level = git_checked(root, "rev-parse", "--show-toplevel").strip()
     if os.path.realpath(root) != os.path.realpath(top_level):
-        die("Attention Relay must run from the Git worktree root: {}".format(top_level))
+        die("Baton must run from the Git worktree root: {}".format(top_level))
     submodules = git_submodule_paths(root)
     if submodules:
         die("tracked Git submodules are unsupported: " + ", ".join(submodules))
@@ -2601,7 +2820,7 @@ def git_checked(root, *arguments, env=None, text=True):
 
 
 def git_snapshot(root):
-    fd, index_path = tempfile.mkstemp(prefix="attention-relay-index-")
+    fd, index_path = tempfile.mkstemp(prefix="baton-index-")
     os.close(fd)
     os.unlink(index_path)
     env = dict(os.environ, GIT_INDEX_FILE=index_path)
@@ -2687,43 +2906,47 @@ def terminate_process_group(pid, grace=0.5):
     terminate_process_groups([pid], grace)
 
 
-WORKER_PROMPT = """Attention Relay worker: {id}, attempt {attempt}
+WORKER_PROMPT = """Baton worker: {id}, attempt {attempt}
 Project: {root}
 Scope: {scope}
+Difficulty: {difficulty}
+Worker: {worker_label}
 
 Read and follow:
-- {relay_dir}/worker.md
-- {relay_dir}/tasks/{id}.md{previous}
+- {baton_dir}/worker.md
+- {baton_dir}/tasks/{id}.md{previous}
 
 Immediately before writing the report, run:
-python3 {relay_dir}/relay task brief {id} --phase report
+python3 {baton_dir}/baton task brief {id} --phase report
 Write the report to {report}, then finish with its Brief token and every exact changed path:
-python3 {relay_dir}/relay task finish {id} --status needs_review --brief TOKEN [--changed PATH ...]
+python3 {baton_dir}/baton task finish {id} --status needs_review --brief TOKEN [--changed PATH ...]
 Use needs_decision, blocked, or failed instead when needed.
 Other workers may be active. Run only the targeted checks in the task spec.
 """
 
 
 def build_prompt(
-        relay_dir, task, memory_entries, capsule_max_chars=4000, capsule=None):
-    root = project_root(relay_dir)
-    relative_relay = os.path.relpath(relay_dir, root)
+        baton_dir, task, memory_entries, capsule_max_chars=4000, capsule=None,
+        difficulty="default", worker_label="unlabeled worker"):
+    root = project_root(baton_dir)
+    relative_baton = os.path.relpath(baton_dir, root)
     attempt = task.get("attempt", 1)
     previous = ""
     if attempt > 1:
         previous = "\n- %s/work/%s/attempt-%d.report.md" % (
-            relative_relay, task["id"], attempt - 1,
+            relative_baton, task["id"], attempt - 1,
         )
     if capsule is None:
-        with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+        with open(task_md_path(baton_dir, task["id"]), encoding="utf-8") as source:
             capsule = compile_context_capsule(
                 task, source.read(), memory_entries, capsule_max_chars,
             )
     mechanics = WORKER_PROMPT.format(
         id=task["id"], attempt=attempt, root=root,
         scope=", ".join(task.get("scope", [])) or "whole project",
-        relay_dir=relative_relay, previous=previous,
-        report=os.path.relpath(report_path(relay_dir, task["id"], attempt), root),
+        difficulty=difficulty, worker_label=worker_label,
+        baton_dir=relative_baton, previous=previous,
+        report=os.path.relpath(report_path(baton_dir, task["id"], attempt), root),
     ).strip()
     return (
         capsule + "\n\n" + mechanics
@@ -2732,26 +2955,27 @@ def build_prompt(
     )
 
 
-def prepare_worker(relay_dir, config, task, memory_entries):
-    root = project_root(relay_dir)
+def prepare_worker(baton_dir, config, task, memory_entries):
+    root = project_root(baton_dir)
     attempt = task.get("attempt", 1)
-    tier = configured_tier(config, task.get("tier", "default"))
+    tier = configured_tier(config, task.get("tier"))
     capsule_max_chars = tier["capsule_max_chars"]
-    with open(task_md_path(relay_dir, task["id"]), encoding="utf-8") as source:
+    with open(task_md_path(baton_dir, task["id"]), encoding="utf-8") as source:
         capsule = compile_context_capsule(
             task, source.read(), memory_entries, capsule_max_chars,
         )
     prompt = build_prompt(
-        relay_dir, task, memory_entries, capsule_max_chars, capsule=capsule,
+        baton_dir, task, memory_entries, capsule_max_chars, capsule=capsule,
+        difficulty=tier["name"], worker_label=worker_display_label(tier),
     )
-    directory = work_dir(relay_dir, task["id"])
+    directory = work_dir(baton_dir, task["id"])
     os.makedirs(directory, exist_ok=True)
     prompt_file = os.path.join(directory, "attempt-%d.prompt.md" % attempt)
     atomic_write(prompt_file, prompt)
     digest = hashlib.sha256(capsule.encode("utf-8")).hexdigest()
     brief_file = os.path.join(directory, "attempt-%d.brief.md" % attempt)
     atomic_write(brief_file, "Content digest: sha256:{}\n\n{}".format(digest, capsule))
-    result = result_path(relay_dir, task["id"], attempt)
+    result = result_path(baton_dir, task["id"], attempt)
     if os.path.exists(result):
         raise ValueError("result already exists for %s attempt %d" % (task["id"], attempt))
     argv = worker_argv(config, task, prompt, prompt_file, root)
@@ -2763,24 +2987,23 @@ def prepare_worker(relay_dir, config, task, memory_entries):
         "capsule_chars": len(capsule),
         "capsule_digest": digest,
         "timeout_minutes": tier["worker_timeout_minutes"],
+        "routing_label": resolved_task_label(config, task),
     }
 
 
-def run_one_worker(relay_dir, prepared, timeout_minutes, stop_event):
+def run_one_worker(baton_dir, prepared, timeout_minutes, stop_event):
     task = prepared["task"]
-    root = project_root(relay_dir)
+    root = project_root(baton_dir)
     attempt = task.get("attempt", 1)
     environment = dict(
         os.environ,
-        RELAY_TASK_ID=task["id"],
-        RELAY_ATTEMPT=str(attempt),
-        RELAY_LEASE=prepared["lease"],
-        RELAY_DIR=relay_dir,
-        RELAY_ROOT=root,
+        BATON_TASK_ID=task["id"],
+        BATON_ATTEMPT=str(attempt),
+        BATON_LEASE=prepared["lease"],
+        BATON_DIR=baton_dir,
+        BATON_ROOT=root,
     )
-    say("[%s] start attempt %d (%s)" % (
-        task["id"], attempt, task.get("tier", "default"),
-    ))
+    say("[start] {} | attempt={}".format(prepared["routing_label"], attempt))
     process = None
     try:
         if stop_event.is_set():
@@ -2795,8 +3018,8 @@ def run_one_worker(relay_dir, prepared, timeout_minutes, stop_event):
                 terminate_process_group(process.pid)
                 process.wait()
                 return {"interrupted": True, "returncode": None}
-            with task_lock(relay_dir, task["id"]):
-                current = load_task(relay_dir, task["id"])
+            with task_lock(baton_dir, task["id"]):
+                current = load_task(baton_dir, task["id"])
                 runner = current.get("runner", {})
                 if (
                         current["status"] != "running"
@@ -2808,7 +3031,7 @@ def run_one_worker(relay_dir, prepared, timeout_minutes, stop_event):
                 runner["pid"] = process.pid
                 runner["started_at"] = now()
                 current["runner"] = runner
-                save_task(relay_dir, current)
+                save_task(baton_dir, current)
             try:
                 returncode = process.wait(
                     timeout=timeout_minutes * 60 if timeout_minutes else None,
@@ -2872,18 +3095,19 @@ def worker_changed_paths(value):
 
 
 def finalize_task(
-        relay_dir, task, outcome, violations, observed_paths, baseline_tree, lease):
+        baton_dir, task, outcome, violations, observed_paths, baseline_tree, lease,
+        report_requires_sections):
     attempt = task.get("attempt", 1)
     submitted = None
-    path = result_path(relay_dir, task["id"], attempt)
+    path = result_path(baton_dir, task["id"], attempt)
     result_exists = os.path.exists(path)
     if result_exists:
         try:
             submitted = read_json(path)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             submitted = None
-    with task_lock(relay_dir, task["id"]):
-        current = load_task(relay_dir, task["id"])
+    with task_lock(baton_dir, task["id"]):
+        current = load_task(baton_dir, task["id"])
         runner = current.get("runner", {})
         if (
                 current.get("status") != "running"
@@ -2915,8 +3139,15 @@ def finalize_task(
                 or declared_paths is None):
             status, note = "failed", "invalid_worker_output"
         elif submitted["status"] == "needs_review" and not report_is_ready(
-                report_path(relay_dir, task["id"], attempt)):
+                report_path(baton_dir, task["id"], attempt)):
             status, note = "failed", "missing_review_report"
+        elif (
+                submitted["status"] == "needs_review"
+                and report_gate_problems(
+                    report_path(baton_dir, task["id"], attempt),
+                    "needs_review", report_requires_sections,
+                )):
+            status, note = "failed", "invalid_review_report"
         elif violations:
             status, note = "blocked", "scope_violation"
         elif (
@@ -2957,25 +3188,25 @@ def finalize_task(
                 exit_code=outcome.get("returncode"), note=note,
                 declared_paths=declared_paths, observed_paths=list(observed_paths),
             )
-        save_task(relay_dir, current)
+        save_task(baton_dir, current)
     say("[{}] {}{}".format(
         task["id"], status, " ({})".format(note) if note else "",
     ))
     return True
 
 
-def abort_claimed_tasks(relay_dir, context):
+def abort_claimed_tasks(baton_dir, context):
     context["stop_event"].set()
     pids = []
     for task_id in context["task_ids"]:
-        task = load_task(relay_dir, task_id)
+        task = load_task(baton_dir, task_id)
         runner = task.get("runner", {})
         if runner.get("lease") == context["lease"]:
             pids.append(runner.get("pid"))
     terminate_process_groups(pids)
     for task_id in context["task_ids"]:
-        with task_lock(relay_dir, task_id):
-            task = load_task(relay_dir, task_id)
+        with task_lock(baton_dir, task_id):
+            task = load_task(baton_dir, task_id)
             runner = task.get("runner", {})
             if task.get("status") != "running" or runner.get("lease") != context["lease"]:
                 continue
@@ -2984,12 +3215,12 @@ def abort_claimed_tasks(relay_dir, context):
             task["last_note"] = "orchestrator_interrupted"
             record(task, "worker_exited", status="failed",
                    exit_code=None, note="orchestrator_interrupted")
-            save_task(relay_dir, task)
+            save_task(baton_dir, task)
 
 
 def cmd_run(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
+    baton_dir = require_baton_dir()
     import secrets
 
     context = {
@@ -3005,39 +3236,40 @@ def cmd_run(args):
         signal.signal(item, handle_run_signal)
     try:
         if args.dry_run:
-            run_wave(args, relay_dir, context)
+            run_wave(args, baton_dir, context)
         else:
-            with file_lock(lock_path(relay_dir, "execution")):
-                run_wave(args, relay_dir, context)
+            with file_lock(lock_path(baton_dir, "execution")):
+                run_wave(args, baton_dir, context)
     except KeyboardInterrupt:
-        abort_claimed_tasks(relay_dir, context)
+        abort_claimed_tasks(baton_dir, context)
         raise SystemExit(130) from None
     except RunInterrupted as error:
-        abort_claimed_tasks(relay_dir, context)
+        abort_claimed_tasks(baton_dir, context)
         raise SystemExit(128 + error.signum) from None
     finally:
         for item, handler in previous.items():
             signal.signal(item, handler)
         if not args.dry_run:
-            say_next_actions(relay_dir)
+            say_next_actions(baton_dir)
 
 
-def run_wave(args, relay_dir, context):
+def run_wave(args, baton_dir, context):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    root = project_root(relay_dir)
+    root = project_root(baton_dir)
     require_git_root(root)
-    config = load_config(relay_dir)
+    config = load_config(baton_dir)
     try:
         max_parallel, _timeout_minutes = configured_limits(config, args.max_parallel)
-        _, memory_text = read_memory(relay_dir)
+        report_requires_sections = configured_report_requires_sections(config)
+        _, memory_text = read_memory(baton_dir)
         memory_entries = memory_index_entries(memory_text)
     except ValueError as error:
         die(str(error))
 
-    with file_lock(lock_path(relay_dir, "scheduler")):
-        tasks = load_all_tasks(relay_dir)
-        archived = load_archived_tasks(relay_dir)
+    with file_lock(lock_path(baton_dir, "scheduler")):
+        tasks = load_all_tasks(baton_dir)
+        archived = load_archived_tasks(baton_dir)
         busy_scopes = [task.get("scope", []) for task in tasks
                        if task.get("status") == "running"]
         wave, skipped = pick_wave(tasks, archived, args.ids, max_parallel, busy_scopes)
@@ -3057,7 +3289,7 @@ def run_wave(args, relay_dir, context):
             raise SystemExit(0 if not skipped else 1)
         try:
             prepared = [
-                prepare_worker(relay_dir, config, task, memory_entries)
+                prepare_worker(baton_dir, config, task, memory_entries)
                 for task in wave
             ]
             for item in prepared:
@@ -3068,8 +3300,8 @@ def run_wave(args, relay_dir, context):
         context["task_ids"] = [task["id"] for task in wave]
         prepared_by_id = {item["task"]["id"]: item for item in prepared}
         for task in wave:
-            with task_lock(relay_dir, task["id"]):
-                current = load_task(relay_dir, task["id"])
+            with task_lock(baton_dir, task["id"]):
+                current = load_task(baton_dir, task["id"])
                 if current["status"] != "queued":
                     die("{} is no longer queued".format(task["id"]))
                 current["status"] = "running"
@@ -3079,7 +3311,7 @@ def run_wave(args, relay_dir, context):
                 record(current, "launched", attempt=current.get("attempt", 1),
                        lease=context["lease"],
                        capsule_chars=prepared_by_id[task["id"]]["capsule_chars"])
-                save_task(relay_dir, current)
+                save_task(baton_dir, current)
 
     outcomes = {}
     interrupted = False
@@ -3091,7 +3323,7 @@ def run_wave(args, relay_dir, context):
         executor = ThreadPoolExecutor(max_workers=len(wave))
         futures = {
             executor.submit(
-                run_one_worker, relay_dir, item, item["timeout_minutes"], stop_event,
+                run_one_worker, baton_dir, item, item["timeout_minutes"], stop_event,
             ): item["task"]
             for item in prepared
         }
@@ -3103,14 +3335,14 @@ def run_wave(args, relay_dir, context):
             interrupted_code = 128 + error.signum
         stop_event.set()
         terminate_process_groups([
-            load_task(relay_dir, task["id"]).get("runner", {}).get("pid")
+            load_task(baton_dir, task["id"]).get("runner", {}).get("pid")
             for task in wave
         ])
     except Exception as error:
         stop_event.set()
         pids = []
         for task in wave:
-            current = load_task(relay_dir, task["id"])
+            current = load_task(baton_dir, task["id"])
             pids.append(current.get("runner", {}).get("pid"))
             outcomes[task["id"]] = {
                 "error": "executor_error: {}".format(error),
@@ -3144,8 +3376,8 @@ def run_wave(args, relay_dir, context):
         diff = git_tree_diff(
             root, before_tree, after_tree, task.get("scope", []), changed,
         )
-        directory = work_dir(relay_dir, task["id"])
-        atomic_write(diff_path(relay_dir, task["id"], attempt), diff)
+        directory = work_dir(baton_dir, task["id"])
+        atomic_write(diff_path(baton_dir, task["id"], attempt), diff)
         if violations:
             atomic_write(
                 os.path.join(directory, "attempt-%d.violations.diff" % attempt),
@@ -3159,8 +3391,8 @@ def run_wave(args, relay_dir, context):
             if path_in_scopes(path, task.get("scope", []))
         ]
         finalize_task(
-            relay_dir, task, outcomes[task["id"]], violations, observed,
-            before_tree, context["lease"],
+            baton_dir, task, outcomes[task["id"]], violations, observed,
+            before_tree, context["lease"], report_requires_sections,
         )
     if interrupted:
         raise SystemExit(interrupted_code)
@@ -3169,13 +3401,21 @@ def run_wave(args, relay_dir, context):
 # Status, validation, and archive
 
 def cmd_status(args):
-    relay_dir = require_relay_dir()
-    tasks = load_all_tasks(relay_dir)
+    baton_dir = require_baton_dir()
+    tasks = load_all_tasks(baton_dir)
+    config = load_config(baton_dir)
+    tier_cache = {}
     counts: dict[str, int] = {}
     for task in tasks:
         counts[task["status"]] = counts.get(task["status"], 0) + 1
     say("tasks: " + (", ".join("%s=%d" % item for item in sorted(counts.items())) or "none"))
     for task in tasks:
+        try:
+            say("  task: {} | status={}".format(
+                resolved_task_label(config, task, tier_cache), task["status"],
+            ))
+        except ValueError as error:
+            die(str(error))
         if task["status"] == "running":
             pid = task.get("runner", {}).get("pid")
             state = "alive" if pid_alive(pid) else "STALE"
@@ -3192,7 +3432,7 @@ def cmd_status(args):
             say("  attention: {} ({}){}{}{}".format(
                 task["id"], task["status"], note, question, warning,
             ))
-    say_next_actions(relay_dir)
+    say_next_actions(baton_dir, tasks)
 
 
 REASON_CODE_RE = re.compile(r"^[a-z_]+(_\d+)?$")
@@ -3218,8 +3458,8 @@ def formatted_number(value):
 def cmd_tiers(args):
     """Print effective tier settings without exposing worker command flags."""
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    config = load_config(relay_dir)
+    baton_dir = require_baton_dir()
+    config = load_config(baton_dir)
     try:
         names = configured_tier_names(config)
         blocks = []
@@ -3228,6 +3468,9 @@ def cmd_tiers(args):
             executable = validate_worker_template(tier["command"])[0]
             blocks.append("\n".join((
                 "Tier: " + name,
+                "Routing: difficulty={} | worker={}".format(
+                    name, worker_display_label(tier),
+                ),
                 "Executable: " + executable,
                 "Command source: " + tier["command_source"],
                 "Worker timeout: {} minutes".format(formatted_number(
@@ -3246,9 +3489,9 @@ def cmd_tiers(args):
 def cmd_stats(args):
     """Print bounded aggregate runtime evidence without write-capable locks."""
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    active = load_all_tasks(relay_dir)
-    archived = load_archived_tasks(relay_dir)
+    baton_dir = require_baton_dir()
+    active = load_all_tasks(baton_dir)
+    archived = load_archived_tasks(baton_dir)
     located_tasks = [(task, False) for task in active] + [
         (task, True) for task in archived
     ]
@@ -3319,8 +3562,8 @@ def cmd_stats(args):
         if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
             continue
         directory = (
-            os.path.join(archive_dir(relay_dir), task_id + ".work")
-            if archived_task else work_dir(relay_dir, task_id)
+            os.path.join(archive_dir(baton_dir), task_id + ".work")
+            if archived_task else work_dir(baton_dir, task_id)
         )
         try:
             names = sorted(os.listdir(directory))
@@ -3392,58 +3635,104 @@ def dependency_cycles(tasks):
     return cycles
 
 
-def task_problems(relay_dir, task, known_tasks, memory_entries, config=None):
-    problems = []
+def task_validation_shape(task):
+    """Validate task fields before any map, routing, or lifecycle consumer uses them."""
     task_id = task.get("id")
-    prefix = str(task_id or "unknown") + ": "
-    valid_id = True
+    prefix = (task_id + ": ") if isinstance(task_id, str) else "task state: "
+    problems = []
+    valid = {}
+
     try:
         validate_task_id(task_id)
-    except (TypeError, ValueError) as error:
-        valid_id = False
+        valid["id"] = True
+    except ValueError as error:
+        valid["id"] = False
         problems.append(prefix + str(error))
-    if task.get("status") not in STATUSES:
-        problems.append(prefix + "invalid status {!r}".format(task.get("status")))
+
+    status = task.get("status")
+    valid["status"] = isinstance(status, str) and status in STATUSES
+    if not valid["status"]:
+        problems.append(prefix + "invalid status {!r}".format(status))
+
     for field in ("title", "tier", "created_at", "updated_at"):
-        if not isinstance(task.get(field), str) or not task[field]:
+        value = task.get(field)
+        valid[field] = isinstance(value, str) and bool(value)
+        if not valid[field]:
             problems.append(prefix + "{} must be non-empty text".format(field))
-    tier = None
-    if config is not None and isinstance(task.get("tier"), str) and task.get("tier"):
-        try:
-            tier = configured_tier(config, task["tier"])
-        except ValueError as error:
-            problems.append(prefix + str(error))
-    if not isinstance(task.get("history"), list):
-        problems.append(prefix + "history must be a list")
-    if valid_id and not os.path.exists(task_json_path(relay_dir, task_id)):
-        problems.append(prefix + "state filename does not match its id")
+    if valid["title"] and (
+            not is_single_line_text(task["title"])
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159
+                   for character in task["title"])):
+        valid["title"] = False
+        problems.append(prefix + "title must be single-line text without control characters")
+
     attempt = task.get("attempt")
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+    valid["attempt"] = (
+        not isinstance(attempt, bool) and isinstance(attempt, int) and attempt >= 1
+    )
+    if not valid["attempt"]:
         problems.append(prefix + "attempt must be a positive integer")
+
+    history_problems = task_history_problems(task, prefix)
+    valid["history"] = not history_problems
+    problems.extend(history_problems)
+
     scopes = task.get("scope")
-    if not isinstance(scopes, list):
-        problems.append(prefix + "scope must be a list")
+    valid["scope"] = isinstance(scopes, list) and all(
+        isinstance(scope, str) for scope in scopes
+    )
+    if not valid["scope"]:
+        problems.append(prefix + "scope must be a list of text")
     else:
         try:
             if normalize_scopes(scopes) != scopes:
+                valid["scope"] = False
                 problems.append(prefix + "scope is not canonical")
         except ValueError as error:
+            valid["scope"] = False
             problems.append(prefix + str(error))
+
     dependencies = task.get("depends_on")
-    if not isinstance(dependencies, list) or not all(isinstance(item, str) for item in dependencies):
+    valid["depends_on"] = isinstance(dependencies, list) and all(
+        isinstance(dependency, str) for dependency in dependencies
+    )
+    if not valid["depends_on"]:
         problems.append(prefix + "depends_on must be a list of task ids")
-    else:
+
+    valid["problems"] = problems
+    return valid
+
+
+def task_problems(
+        baton_dir, task, shape, known_tasks, known_shapes, memory_entries,
+        config=None, tier_cache=None, archived=False):
+    problems = list(shape["problems"])
+    task_id = task.get("id")
+    prefix = (task_id + ": ") if shape["id"] else "task state: "
+    tier = None
+    if config is not None and shape["tier"]:
+        try:
+            tier = configured_task_tier(config, task, tier_cache)
+        except ValueError as error:
+            problems.append(prefix + str(error))
+    state_directory = archive_dir(baton_dir) if archived else tasks_dir(baton_dir)
+    if shape["id"] and not os.path.exists(os.path.join(state_directory, task_id + ".json")):
+        problems.append(prefix + "state filename does not match its id")
+    dependencies = task.get("depends_on")
+    if shape["depends_on"]:
         if len(dependencies) != len(set(dependencies)):
             problems.append(prefix + "duplicate dependencies")
-        if task_id in dependencies:
+        if shape["id"] and task_id in dependencies:
             problems.append(prefix + "self dependency")
         for dependency in dependencies:
             if dependency not in known_tasks:
                 problems.append(prefix + "unknown dependency {}".format(dependency))
-            elif known_tasks[dependency].get("status") == "cancelled":
+            elif not known_shapes[dependency]["status"]:
+                problems.append(prefix + "dependency {} has invalid status".format(dependency))
+            elif known_tasks[dependency]["status"] == "cancelled":
                 problems.append(prefix + "cancelled dependency {}".format(dependency))
     runner = task.get("runner")
-    if task.get("status") == "running":
+    if shape["status"] and task["status"] == "running":
         if not isinstance(runner, dict):
             problems.append(prefix + "running task needs runner metadata")
         else:
@@ -3451,23 +3740,23 @@ def task_problems(relay_dir, task, known_tasks, memory_entries, config=None):
                 problems.append(prefix + "running task lease is missing")
             if not pid_alive(runner.get("pid")):
                 problems.append(prefix + "running worker is stale")
-    elif runner:
+    elif shape["status"] and runner:
         problems.append(prefix + "runner exists while task is not running")
-    if (valid_id and task.get("status") == "needs_review"
-            and not report_is_ready(report_path(
-                relay_dir, task_id, task.get("attempt", 1),
-            ))):
+    if (not archived and shape["id"] and shape["status"] and shape["attempt"]
+            and task["status"] == "needs_review"
+            and not report_is_ready(report_path(baton_dir, task_id, task["attempt"]))):
         problems.append(prefix + "review report is missing or invalid")
     violations = task.get("scope_violations")
     if violations:
-        if task.get("status") not in ("blocked", "failed"):
+        if shape["status"] and task["status"] not in ("blocked", "failed"):
             problems.append(prefix + "scope violations require blocked or failed status")
         if not task.get("scope_baseline"):
             problems.append(prefix + "scope violation baseline is missing")
     elif task.get("scope_baseline"):
         problems.append(prefix + "scope baseline exists without violations")
-    if valid_id and task.get("status") == "queued" and tier is not None:
-        spec_path = task_md_path(relay_dir, task_id)
+    if (not archived and shape["id"] and shape["status"] and shape["title"]
+            and shape["scope"] and task["status"] == "queued" and tier is not None):
+        spec_path = task_md_path(baton_dir, task_id)
         if os.path.exists(spec_path):
             try:
                 with open(spec_path, encoding="utf-8") as source:
@@ -3480,16 +3769,16 @@ def task_problems(relay_dir, task, known_tasks, memory_entries, config=None):
 
 
 def cmd_validate(args):
-    relay_dir = require_relay_dir()
+    baton_dir = require_baton_dir()
     problems = []
-    root = project_root(relay_dir)
+    root = project_root(baton_dir)
     if not is_git_repo(root):
         problems.append("repository: not a Git worktree")
     else:
         try:
             top_level = git_checked(root, "rev-parse", "--show-toplevel").strip()
             if os.path.realpath(root) != os.path.realpath(top_level):
-                problems.append("repository: Relay is not at the worktree root")
+                problems.append("repository: Baton is not at the worktree root")
             submodules = git_submodule_paths(root)
             if submodules:
                 problems.append(
@@ -3501,7 +3790,7 @@ def cmd_validate(args):
     config = None
     memory_entries = ()
     try:
-        config = load_config(relay_dir)
+        config = load_config(baton_dir)
     except SystemExit as error:
         problems.append("config: {}".format(error))
     if config is not None:
@@ -3537,7 +3826,8 @@ def cmd_validate(args):
                 for key, validator in (
                         ("command", validate_worker_template),
                         ("worker_timeout_minutes", configured_worker_timeout_minutes),
-                        ("capsule_max_chars", validated_capsule_max_chars)):
+                        ("capsule_max_chars", validated_capsule_max_chars),
+                        ("display", validated_display_metadata)):
                     if key not in section:
                         continue
                     try:
@@ -3550,59 +3840,74 @@ def cmd_validate(args):
                     except ValueError as error:
                         problems.append(prefix + str(error))
     try:
-        _, memory_text = read_memory(relay_dir)
+        _, memory_text = read_memory(baton_dir)
         memory_entries = memory_index_entries(memory_text)
     except (OSError, UnicodeDecodeError, ValueError) as error:
         problems.append("memory: {}".format(error))
     try:
-        active = load_all_tasks(relay_dir)
-        archived = load_archived_tasks(relay_dir)
+        active = load_all_tasks(baton_dir, validate_history=False)
+        archived = load_archived_tasks(baton_dir, validate_history=False)
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
         say("PROBLEM: cannot read task state: {}".format(error))
         raise SystemExit(1) from error
     all_tasks = active + archived
-    known = {task.get("id"): task for task in all_tasks}
+    shapes = [task_validation_shape(task) for task in all_tasks]
+    active_pairs = list(zip(active, shapes[:len(active)]))
+    archived_pairs = list(zip(archived, shapes[len(active):]))
+    known = {
+        task["id"]: task for task, shape in zip(all_tasks, shapes) if shape["id"]
+    }
+    known_shapes = {
+        task["id"]: shape for task, shape in zip(all_tasks, shapes) if shape["id"]
+    }
+    task_tier_cache = {}
     seen_ids = set()
     seen_numbers: dict[int, str] = {}
-    for task in all_tasks:
-        task_id = task.get("id")
-        if not isinstance(task_id, str):
-            problems.append("task state has a non-string id")
+    for task, shape in zip(all_tasks, shapes):
+        if not shape["id"]:
             continue
-        try:
-            validate_task_id(task_id)
-        except ValueError as error:
-            problems.append("{}: {}".format(task_id, error))
-            continue
+        task_id = task["id"]
         if task_id in seen_ids:
             problems.append("duplicate task id: {}".format(task_id))
         seen_ids.add(task_id)
-        if TASK_ID_RE.fullmatch(task_id):
-            number = int(task_id[1:task_id.index("-")])
-            previous_id = seen_numbers.get(number)
-            if previous_id and previous_id != task_id:
-                problems.append(
-                    "task number {} is reused by {} and {}".format(
-                        number, previous_id, task_id,
-                    )
+        number = int(task_id[1:task_id.index("-")])
+        previous_id = seen_numbers.get(number)
+        if previous_id and previous_id != task_id:
+            problems.append(
+                "task number {} is reused by {} and {}".format(
+                    number, previous_id, task_id,
                 )
-            seen_numbers[number] = task_id
-    for task in active:
+            )
+        seen_numbers[number] = task_id
+    for task, shape in active_pairs:
         problems.extend(task_problems(
-            relay_dir, task, known, memory_entries, config=config,
+            baton_dir, task, shape, known, known_shapes, memory_entries,
+            config=config, tier_cache=task_tier_cache,
         ))
-        task_id = task.get("id")
-        if isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id):
-            if not os.path.exists(task_md_path(relay_dir, task_id)):
+        if shape["id"]:
+            task_id = task["id"]
+            if not os.path.exists(task_md_path(baton_dir, task_id)):
                 problems.append("{}: task spec is missing".format(task_id))
-    running = [task for task in active if task.get("status") == "running"]
+    for task, shape in archived_pairs:
+        problems.extend(task_problems(
+            baton_dir, task, shape, known, known_shapes, memory_entries,
+            config=config, tier_cache=task_tier_cache, archived=True,
+        ))
+    running = [
+        task for task, shape in active_pairs
+        if shape["id"] and shape["status"] and shape["scope"]
+        and task["status"] == "running"
+    ]
     for index, first in enumerate(running):
         for second in running[index + 1:]:
-            if scopes_overlap(first.get("scope", []), second.get("scope", [])):
+            if scopes_overlap(first["scope"], second["scope"]):
                 problems.append("running tasks {} and {} have overlapping scopes".format(
                     first["id"], second["id"],
                 ))
-    for cycle in dependency_cycles(active):
+    cycle_tasks = [
+        task for task, shape in active_pairs if shape["id"] and shape["depends_on"]
+    ]
+    for cycle in dependency_cycles(cycle_tasks):
         problems.append("dependency cycle: " + " -> ".join(cycle))
     if problems:
         for problem in problems:
@@ -3613,23 +3918,23 @@ def cmd_validate(args):
 
 def cmd_archive(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    destination = archive_dir(relay_dir)
+    baton_dir = require_baton_dir()
+    destination = archive_dir(baton_dir)
     os.makedirs(destination, exist_ok=True)
-    with file_lock(lock_path(relay_dir, "scheduler")):
+    with file_lock(lock_path(baton_dir, "scheduler")):
         eligible = [
-            task for task in load_all_tasks(relay_dir)
+            task for task in load_all_tasks(baton_dir)
             if task["status"] in ("done", "cancelled")
         ]
         plan = []
         for task in eligible:
             task_id = task["id"]
             for source in (
-                    task_json_path(relay_dir, task_id),
-                    task_md_path(relay_dir, task_id)):
+                    task_json_path(baton_dir, task_id),
+                    task_md_path(baton_dir, task_id)):
                 if os.path.exists(source):
                     plan.append((source, os.path.join(destination, os.path.basename(source))))
-            source_work = work_dir(relay_dir, task_id)
+            source_work = work_dir(baton_dir, task_id)
             if os.path.isdir(source_work):
                 plan.append((source_work, os.path.join(destination, task_id + ".work")))
         for _source, target in plan:
@@ -3656,12 +3961,12 @@ def cmd_archive(args):
 
 # Memory
 
-def memory_path(relay_dir):
-    return os.path.join(relay_dir, "memory.md")
+def memory_path(baton_dir):
+    return os.path.join(baton_dir, "memory.md")
 
 
-def read_memory(relay_dir):
-    path = memory_path(relay_dir)
+def read_memory(baton_dir):
+    path = memory_path(baton_dir)
     if not os.path.exists(path):
         die("missing memory.md")
     with open(path, encoding="utf-8") as source:
@@ -3702,8 +4007,8 @@ def memory_index_entries(text):
 
 
 def cmd_memory_index(args):
-    relay_dir = require_relay_dir()
-    _, text = read_memory(relay_dir)
+    baton_dir = require_baton_dir()
+    _, text = read_memory(baton_dir)
     audience = {"worker": "W", "orchestrator": "O"}.get(args.audience)
     for entry in memory_index_entries(text):
         if audience is None or entry[1] in (audience, "B"):
@@ -3711,23 +4016,42 @@ def cmd_memory_index(args):
 
 
 def cmd_memory_show(args):
-    relay_dir = require_relay_dir()
-    _, text = read_memory(relay_dir)
-    match = re.search(
-        r"^### {} .*?(?=^### M|\Z)".format(re.escape(args.id)),
-        text, re.MULTILINE | re.DOTALL,
+    baton_dir = require_baton_dir()
+    _, text = read_memory(baton_dir)
+    indexed = next(
+        (entry for entry in memory_index_entries(text) if entry[0] == args.id),
+        None,
     )
-    if not match:
+    if indexed is None:
         die("no memory entry {}".format(args.id))
-        return
-    say(match.group(0).strip())
+    memory_id, audience, summary = indexed
+    heading = re.search(
+        r"^### {} \[{}\] {}[ \t]*$".format(
+            re.escape(memory_id), audience, re.escape(summary),
+        ),
+        text, re.MULTILINE,
+    )
+    if heading is None:
+        die("indexed memory entry {} is missing or invalid".format(args.id))
+    following = re.search(r"^### M", text[heading.end():], re.MULTILINE)
+    end = heading.end() + following.start() if following else len(text)
+    say(text[heading.start():end].strip())
 
 
 def cmd_memory_add(args):
     require_orchestrator()
-    relay_dir = require_relay_dir()
-    with file_lock(lock_path(relay_dir, "memory")):
-        path, text = read_memory(relay_dir)
+    baton_dir = require_baton_dir()
+    if (
+            not args.summary.strip()
+            or args.summary != args.summary.strip()
+            or not is_single_line_text(args.summary)
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159
+                   for character in args.summary)):
+        die("memory summary must be nonblank single-line text without control characters")
+    if re.search(r"^### M", args.body, re.MULTILINE):
+        die("memory body must not contain an entry heading beginning with `### M`")
+    with file_lock(lock_path(baton_dir, "memory")):
+        path, text = read_memory(baton_dir)
         entries = memory_index_entries(text)
         tag = {"worker": "W", "orchestrator": "O", "both": "B"}[args.audience]
         numbers = [int(memory_id[1:]) for memory_id, _audience, _summary in entries] or [0]
@@ -3757,9 +4081,9 @@ def cmd_init(args):
         die("no such directory: {}".format(target))
     require_git_root(target)
     source = script_dir()
-    relay_dir = os.path.join(target, RELAY_DIRNAME)
-    runtime_paths_are_safe(relay_dir)
-    static_files = ("relay", "orchestrator.md", "worker.md")
+    baton_dir = os.path.join(target, BATON_DIRNAME)
+    runtime_paths_are_safe(baton_dir)
+    static_files = ("baton", "orchestrator.md", "worker.md")
     missing = [name for name in static_files if not os.path.exists(os.path.join(source, name))]
     memory_source = os.path.join(source, "memory.md")
     config_source = os.path.join(source, "config.example.toml")
@@ -3770,46 +4094,46 @@ def cmd_init(args):
     if not os.path.exists(config_source):
         missing.append("config.example.toml or config.toml")
     if missing:
-        die("framework files missing beside relay: {}".format(", ".join(missing)))
-    os.makedirs(relay_dir, exist_ok=True)
+        die("framework files missing beside baton: {}".format(", ".join(missing)))
+    os.makedirs(baton_dir, exist_ok=True)
     for name in static_files:
-        destination = os.path.join(relay_dir, name)
+        destination = os.path.join(baton_dir, name)
         if os.path.exists(destination) and not args.force:
             continue
         if os.path.abspath(os.path.join(source, name)) != os.path.abspath(destination):
             shutil.copy2(os.path.join(source, name), destination)
-    os.chmod(os.path.join(relay_dir, "relay"), 0o700)
-    destination_memory = os.path.join(relay_dir, "memory.md")
+    os.chmod(os.path.join(baton_dir, "baton"), 0o700)
+    destination_memory = os.path.join(baton_dir, "memory.md")
     if not os.path.exists(destination_memory):
         shutil.copy2(memory_source, destination_memory)
-    destination_config = os.path.join(relay_dir, "config.toml")
+    destination_config = os.path.join(baton_dir, "config.toml")
     if not os.path.exists(destination_config):
         shutil.copy2(config_source, destination_config)
     for subdirectory in ("tasks", "work", "archive", ".locks"):
-        os.makedirs(os.path.join(relay_dir, subdirectory), exist_ok=True)
+        os.makedirs(os.path.join(baton_dir, subdirectory), exist_ok=True)
     gitignore = os.path.join(target, ".gitignore")
     existing = ""
     if os.path.exists(gitignore):
         with open(gitignore, encoding="utf-8") as source_file:
             existing = source_file.read()
-    if RELAY_DIRNAME + "/" not in existing.splitlines():
+    if BATON_DIRNAME + "/" not in existing.splitlines():
         updated = existing
         if updated and not updated.endswith("\n"):
             updated += "\n"
-        updated += RELAY_DIRNAME + "/\n"
+        updated += BATON_DIRNAME + "/\n"
         atomic_write(gitignore, updated)
-        say("added .attention-relay/ to .gitignore")
-    say("initialized {}".format(relay_dir))
-    say("next: have your agent read .attention-relay/orchestrator.md and run .attention-relay/relay orchestrator brief --phase start")
+        say("added .baton/ to .gitignore")
+    say("initialized {}".format(baton_dir))
+    say("next: have your agent read .baton/orchestrator.md and run .baton/baton orchestrator brief --phase start")
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="relay", description=__doc__)
+    parser = argparse.ArgumentParser(prog="baton", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    command = commands.add_parser("init", help="install Attention Relay in a Git project")
+    command = commands.add_parser("init", help="install Baton in a Git project")
     command.add_argument("path", nargs="?", help="project directory (default: .)")
-    command.add_argument("--force", action="store_true", help="refresh relay and its manuals")
+    command.add_argument("--force", action="store_true", help="refresh baton and its manuals")
     command.set_defaults(function=cmd_init)
 
     task = commands.add_parser("task", help="manage tasks")
@@ -3819,7 +4143,7 @@ def build_parser():
     command.add_argument("--title", required=True)
     command.add_argument("--scope", action="append")
     command.add_argument("--depends-on", action="append", dest="depends_on")
-    command.add_argument("--tier")
+    command.add_argument("--tier", required=True, help="explicit task difficulty/tier")
     command.set_defaults(function=cmd_task_create)
 
     command = task_commands.add_parser("list", help="list active tasks")

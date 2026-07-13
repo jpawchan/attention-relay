@@ -1,14 +1,14 @@
-# Review and improve Attention Relay
+# Review and improve Baton
 
-You have write access to an Attention Relay implementation. Test it, fix confirmed
+You have write access to a Baton implementation. Test it, fix confirmed
 bugs, remove unnecessary code, and leave it ready for use. Do not stop at a
 review report.
 
-Attention Relay is a Python 3.11+ CLI for Git projects on macOS and Linux. It uses no
-third-party Python packages and creates `.attention-relay/` with:
+Baton is a Python 3.11+ CLI for Git projects on macOS and Linux. It uses no
+third-party Python packages and creates `.baton/` with:
 
 ```text
-relay
+baton
 orchestrator.md
 worker.md
 memory.md
@@ -55,7 +55,7 @@ Check these behaviors with temporary Git repositories and stub workers:
 16. Orchestrator handoff writes and start-phase consumption are atomic. Start
     marks the handoff consumed without deleting it.
 17. Claude Code hook adapters cap their output and fail open without stdout or
-    stderr when Relay state is missing or broken.
+    stderr when Baton state is missing or broken.
 18. Claude Code settings merges are idempotent and do not clobber existing
     settings or hook arrays.
 

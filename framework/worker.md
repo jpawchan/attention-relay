@@ -1,6 +1,6 @@
 # Worker contract
 
-You are a worker for one Attention Relay task. Other workers may be active in the
+You are a worker for one Baton task. Other workers may be active in the
 same repository.
 
 A fresh worker process does not imply a clean harness. The default worker command
@@ -14,24 +14,24 @@ Do not re-enable memory injection unless the task spec says so.
    before finishing so its requirements are fresh.
 2. The capsule includes summaries for memory ids referenced in the spec's
    Context section. A summary is not the full entry; load each needed entry with
-   `.attention-relay/relay memory show M001`.
+   `.baton/baton memory show M001`.
 3. Immediately before the first write, run
-   `python3 .attention-relay/relay task brief ID --phase edit`, then make the
+   `python3 .baton/baton task brief ID --phase edit`, then make the
    smallest change that meets the acceptance criteria.
 4. Immediately before verification, run
-   `python3 .attention-relay/relay task brief ID --phase verify`, then run the
+   `python3 .baton/baton task brief ID --phase verify`, then run the
    targeted verification commands from the spec.
 5. Immediately before writing the report, run
-   `python3 .attention-relay/relay task brief ID --phase report`. Write the
+   `python3 .baton/baton task brief ID --phase report`. Write the
    report to the path in the launch prompt and list every exact changed
    project-relative path.
 6. Submit the result with the
-   `python3 .attention-relay/relay task finish --brief TOKEN` command in the
+   `python3 .baton/baton task finish --brief TOKEN` command in the
    prompt, using the token from the report-phase brief and repeating
    `--changed PATH` for every path in the report. Omit `--changed` only for
    no-change results.
 
-Relay always records one bounded, attempt-local receipt for every phase brief.
+Baton always records one bounded, attempt-local receipt for every phase brief.
 The normal sequence remains edit, verify, then report. Configuration may make
 that order a strict gate; by default it is guidance only and no brief is blocked.
 When the gate is enabled, running a new edit brief after report invalidates the
@@ -51,15 +51,15 @@ finish token, so run the report brief again before finishing.
 - Do not run orchestrator commands such as `accept`, `return`, or `run`.
 - Report failed checks and risks. Never include secrets.
 
-Relay keeps the task running until your process exits. Calling `task finish`
+Baton keeps the task running until your process exits. Calling `task finish`
 submits your result; it does not approve the task. If the process then exits
-nonzero, Relay preserves the submitted status only when the result passes every
+nonzero, Baton preserves the submitted status only when the result passes every
 normal validation check, and records a post-submission warning for the reviewer.
 Timeout, interruption, and runner or launch errors still fail the attempt.
 
 ## Report
 
-Keep the report short. For `needs_review`, Relay requires all four exact level-2
+Keep the report short. For `needs_review`, Baton requires all four exact level-2
 headings below, nonblank Result, Changes, and Verification bodies, and a Result
 body whose first nonblank line exactly matches the submitted status:
 
