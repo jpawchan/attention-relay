@@ -1200,6 +1200,47 @@ def scopes_overlap(first, second):
     return False
 
 
+class ScopeOverlapIndex:
+    """Index leased literal prefixes using the same rule as scopes_overlap."""
+
+    def __init__(self, scopes=()):
+        self.root = [0, False, {}]
+        self.lease_count = 0
+        for scope in scopes:
+            self.add(scope)
+
+    def add(self, scopes):
+        self.lease_count += 1
+        prefixes = [fixed_scope_prefix(scope) for scope in scopes] if scopes else [()]
+        for prefix in prefixes:
+            node = self.root
+            node[0] += 1
+            for part in prefix:
+                node = node[2].setdefault(part, [0, False, {}])
+                node[0] += 1
+            node[1] = True
+
+    def overlaps(self, scopes):
+        if not self.lease_count:
+            return False
+        if not scopes:
+            return True
+        for scope in scopes:
+            node = self.root
+            if node[1]:
+                return True
+            for part in fixed_scope_prefix(scope):
+                node = node[2].get(part)
+                if node is None:
+                    break
+                if node[1]:
+                    return True
+            else:
+                if node[0]:
+                    return True
+        return False
+
+
 def scope_pattern_matches(path, pattern):
     import fnmatch
 
@@ -1273,9 +1314,11 @@ def path_in_scopes(path, scopes):
     return False
 
 
-def next_task_id(baton_dir, title):
+def next_task_id(baton_dir, title, tasks=None):
     numbers = [0]
-    for task in load_all_tasks(baton_dir) + load_archived_tasks(baton_dir):
+    if tasks is None:
+        tasks = load_all_tasks(baton_dir) + load_archived_tasks(baton_dir)
+    for task in tasks:
         match = re.match(r"T(\d+)", task.get("id", ""))
         if match:
             numbers.append(int(match.group(1)))
@@ -1527,21 +1570,23 @@ def cmd_task_create(args):
     except ValueError as error:
         die(str(error))
     with file_lock(lock_path(baton_dir, "scheduler")):
-        task_id = next_task_id(baton_dir, args.title)
+        active_tasks = load_all_tasks(baton_dir)
+        archived_tasks = load_archived_tasks(baton_dir)
+        all_tasks = active_tasks + archived_tasks
+        task_id = next_task_id(baton_dir, args.title, all_tasks)
         try:
             validate_task_id(task_id)
             scopes = normalize_scopes(args.scope)
         except ValueError as error:
             die(str(error))
-        if any(task.get("id") == task_id for task in (
-                load_all_tasks(baton_dir) + load_archived_tasks(baton_dir))):
+        if any(task.get("id") == task_id for task in all_tasks):
             die("task already exists: {}".format(task_id))
         dependencies = args.depends_on or []
         if len(dependencies) != len(set(dependencies)):
             die("dependencies cannot be repeated")
         if task_id in dependencies:
             die("a task cannot depend on itself")
-        known = {task["id"]: task for task in load_all_tasks(baton_dir) + load_archived_tasks(baton_dir)}
+        known = {task["id"]: task for task in all_tasks}
         for dependency in dependencies:
             if dependency not in known:
                 die("unknown dependency: {}".format(dependency))
@@ -3112,7 +3157,7 @@ def pick_wave(tasks, archived_tasks, requested_ids, max_parallel, busy_scopes):
         candidates = [task for task in tasks if task.get("status") == "queued"]
     wave: list[dict] = []
     skipped = []
-    leased = list(busy_scopes)
+    leased = ScopeOverlapIndex(busy_scopes)
     for task in candidates:
         if task.get("status") != "queued":
             skipped.append((task["id"], "status is {}".format(task.get("status"))))
@@ -3121,14 +3166,14 @@ def pick_wave(tasks, archived_tasks, requested_ids, max_parallel, busy_scopes):
         if missing:
             skipped.append((task["id"], "waiting on {}".format(",".join(missing))))
             continue
-        if any(scopes_overlap(task.get("scope", []), scope) for scope in leased):
+        if leased.overlaps(task.get("scope", [])):
             skipped.append((task["id"], "scope conflicts with another lease"))
             continue
         if len(wave) >= max_parallel:
             skipped.append((task["id"], "max_parallel reached"))
             continue
         wave.append(task)
-        leased.append(task.get("scope", []))
+        leased.add(task.get("scope", []))
     return wave, skipped
 
 

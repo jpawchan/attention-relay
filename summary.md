@@ -12,8 +12,8 @@ Baton coordinates external worker CLIs. It is not an agent model, package manage
 
 - The release-candidate implementation and documentation use Baton as the canonical name and target `https://github.com/jpawchan/baton`; the GitHub rename is intentionally deferred until local verification is complete.
 - The current CLI includes generated dual-edge capsules, phase receipts and one-use gates, bounded cross-session handoffs, strict difficulty tiers, read-only statistics, and optional compaction-aware Claude Code hooks.
-- The seven malformed-input and report-integrity defects documented in `docs/bug-audit.md` are fixed with regression coverage. The performance changes and their measured limits are recorded in `docs/performance.md`.
-- The end-to-end suite contains 125 tests; run it rather than relying on this count after later edits. A framework-owned `baton orchestrate` process remains deliberately out of scope.
+- Malformed-input and report-integrity behavior has regression coverage. The performance changes and their measured limits are recorded in `docs/performance.md`.
+- Run the end-to-end suite rather than relying on a point-in-time test count. A framework-owned `baton orchestrate` process remains deliberately out of scope.
 - The repository's live, Git-ignored `.baton/` directory is dogfooding state and audit history, not project source; do not edit or delete it casually.
 
 ## Run and verify
@@ -28,7 +28,7 @@ python3 tests/test_baton.py
 python3 tests/test_context_footprint.py
 ```
 
-Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; the primary suite runs 125 tests and the focused context-footprint suite runs four tests, with both unittest summaries ending in `OK`. The expected `[T001-lease-guard] stale finalizer ignored` probe diagnostic may follow the primary suite (temp Git repos and stub workers, no network or live agent calls).
+Expected: the help usage line includes `stats` and `tiers`; py_compile is silent; both unittest summaries end in `OK`. The expected `[T001-lease-guard] stale finalizer ignored` probe diagnostic may follow the primary suite (temp Git repos and stub workers, no network or live agent calls).
 
 If you run the suite from inside a Baton-leased worker process, unset the inherited worker env first or fixtures will reject orchestrator commands:
 
@@ -82,7 +82,7 @@ the only connections to agent CLIs.
 | `framework/worker.md` | Worker contract: capsule re-reads, phase briefs, scope rules, report shape, token-gated finish. |
 | `framework/config.example.toml` | Unconfigured worker-routing template plus limits and gates; copied to runtime `config.toml` on init. |
 | `framework/memory.md` | Empty indexed-memory template copied on first initialization. |
-| `tests/test_baton.py` | Canonical 125-test end-to-end suite and all stub worker fixtures. |
+| `tests/test_baton.py` | Canonical end-to-end suite and all stub worker fixtures. |
 | `SPEC.md` | Normative behavioral contract; embedded byte-identically in `prompts/create-framework.md`. |
 | `prompts/create-framework.md` | Standalone generation prompt with the embedded exact SPEC copy (BEGIN SPEC / END SPEC markers). |
 | `prompts/improve-framework.md` | Review prompt naming required v1 safety and v2 capsule/token/handoff/hook checks. |
@@ -91,7 +91,6 @@ the only connections to agent CLIs.
 | `docs/context-placement.md` | Research rationale, linked sources, rejected alternatives, limits, and experiment requirements for capsule edge placement. |
 | `docs/research-synthesis.md` | Primary-source-grounded long-context synthesis, claim mapping, and limits. |
 | `docs/context-footprint.md` | Reproducible activation footprint, provider differentials, and break-even guidance. |
-| `docs/bug-audit.md` | Correctness audit with reproductions and fix dispositions. |
 | `docs/performance.md` | Profiling method, benchmark evidence, and rejected optimizations. |
 | `docs/github-description.txt` | Short public repository description. |
 | `tools/` | Context-measurement and performance-benchmark scripts plus retired historical provider evidence. |
@@ -220,4 +219,4 @@ Every task creation requires an explicit configured tier; `default` is rejected.
 | Change the default capsule budget | `configured_capsule_max_chars` in `framework/baton`; `framework/config.example.toml`; SPEC.md + embedded copy; budget tests in `tests/test_baton.py`. |
 | Add a field to `.baton/baton stats` output | `cmd_stats` + `stats_count_lines` in `framework/baton` (receipts via `read_phase_receipts`); SPEC.md stats sentences + embedded copy; stats fixture tests in `tests/test_baton.py`. |
 
-Last updated 2026-07-13 — Documentation rewrite against the release-candidate implementation, research synthesis, activation measurement, correctness audit, and performance report.
+Last updated 2026-07-15 — Documentation rewrite against the release-candidate implementation, research synthesis, activation measurement, and performance report.

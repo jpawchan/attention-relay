@@ -70,6 +70,30 @@ The measured wall-time gains claimed here are start brief (11.9%), large status 
 
 No gain is claimed for startup/help, init, snapshot/diff, or the full suite. Their deltas are small relative to process-level and suite-level variation or represent a changed suite workload. In particular, the post-change suite includes two new focused tests, so its 2.6% increase is reported rather than interpreted as a production-path regression. RSS moved in both directions between process runs; none of those changes are attributed to the implementation.
 
+## Scheduler and task-create hot paths
+
+T004 added a focused `--hot-paths-only` mode. It imports the runtime once, uses one warm-up and seven recorded `perf_counter` samples, and excludes interpreter startup and disposable-fixture construction from the timed regions. The scheduler workload gives every queued task a distinct `src/TNNNN-scheduler/**` scope and sets `max_parallel` to the task count. The state fixture contains 500 active and 500 archived tasks. The task-create workload instruments `load_tasks_from` while creating a real task in a disposable copy and validating an archived dependency.
+
+These measurements were taken on 2026-07-15 under WSL2 (Linux 6.18.33.2, x86_64), Python 3.11.4, and Git 2.50.1. Because this host's default `python3` is older than 3.11 and the runtime uses an `env python3` shebang, the exact focused command was:
+
+```console
+tmp=$(mktemp -d)
+ln -s "$(command -v python3.11)" "$tmp/python3"
+PATH="$tmp:$PATH" python3.11 tools/benchmark_performance.py \
+  --hot-paths-only --samples 7 --output /tmp/baton-hot-paths.json
+rm -rf "$tmp"
+```
+
+The before scheduler values are the captured pre-T004 baseline on this host. The speedup ratios are approximate because those baseline values were rounded. The after values are medians from the command above.
+
+| Distinct queued tasks | Before | After | Approximate speedup |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 0.71 s | 0.003941 s | 180x |
+| 2,000 | 2.85 s | 0.008240 s | 346x |
+| 4,000 | 10.72 s | 0.016666 s | 643x |
+
+The active+archive load itself remained comparable: the captured baseline for one 1,000-task pass was about 0.058 s, and the post-change median was 0.060821 s. The optimization removes redundant passes rather than claiming faster JSON parsing. Before T004, task creation made three complete passes (six directory loads), measured at about 0.177 s for state loading alone. After T004, instrumentation records exactly one active and one archive directory load per creation; the complete focused task-create timed region, including validation, ID allocation, locking, and writes, had a 0.071383 s median. Those last two timings have different boundaries, so they demonstrate the eliminated I/O and its practical effect rather than a precise end-to-end percentage.
+
 ## Profiling evidence
 
 A 500-active/500-archived fixture was generated with `prepare_fixture`. The following commands were run against the installed baseline and post-change scripts:

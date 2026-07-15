@@ -6,12 +6,15 @@ import ast
 import json
 import os
 import platform
+import runpy
 import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 TASKS = 500
 ARCHIVED = 500
@@ -211,6 +214,106 @@ def benchmark(name, make_command, samples, warmups=1):
     return summarize(values)
 
 
+def benchmark_seconds(name, action, samples, warmups=1):
+    for _ in range(warmups):
+        action()
+    values = []
+    for _ in range(samples):
+        started = time.perf_counter()
+        action()
+        values.append(time.perf_counter() - started)
+    print("completed {}".format(name), file=sys.stderr)
+    return {
+        "samples": len(values),
+        "wall_median_s": statistics.median(values),
+        "wall_min_s": min(values),
+        "wall_max_s": max(values),
+        "wall_pstdev_s": statistics.pstdev(values),
+    }
+
+
+def hot_path_benchmarks(source, project, base, samples):
+    module = runpy.run_path(str(source), run_name="baton_performance_hot_paths")
+    results = {"scheduler_distinct_scopes": {}}
+    for count in (1000, 2000, 4000):
+        tasks = [
+            task_value("T{:04d}-scheduler".format(number))
+            for number in range(1, count + 1)
+        ]
+
+        def pick(tasks=tasks, count=count):
+            wave, skipped = module["pick_wave"](tasks, [], [], count, [])
+            if len(wave) != count or skipped:
+                raise RuntimeError("scheduler benchmark did not select every task")
+
+        results["scheduler_distinct_scopes"][str(count)] = benchmark_seconds(
+            "scheduler_distinct_scopes_{}".format(count), pick, samples,
+        )
+
+    def load_state():
+        active = module["load_all_tasks"](str(project / ".baton"))
+        archived = module["load_archived_tasks"](str(project / ".baton"))
+        if len(active) != TASKS or len(archived) != ARCHIVED:
+            raise RuntimeError("task-state benchmark fixture changed unexpectedly")
+
+    results["task_state_active_archive_pass"] = benchmark_seconds(
+        "task_state_active_archive_pass", load_state, samples,
+    )
+
+    create_project = base / "task-create-project"
+    shutil.copytree(project, create_project)
+    runtime = create_project / ".baton"
+    with (runtime / "config.toml").open("a", encoding="utf-8") as config:
+        config.write(
+            '\n[tiers.benchmark]\ncommand = "/usr/bin/true {prompt_file}"\n'
+        )
+    globals_dict = module["cmd_task_create"].__globals__
+    original_load = globals_dict["load_tasks_from"]
+    original_require_orchestrator = globals_dict["require_orchestrator"]
+    original_require_baton_dir = globals_dict["require_baton_dir"]
+    original_say = globals_dict["say"]
+    calls = []
+    creation_number = 0
+
+    def counted_load(directory, validate_history=True):
+        calls[-1].append(Path(directory).name)
+        return original_load(directory, validate_history)
+
+    def create_task():
+        nonlocal creation_number
+        creation_number += 1
+        calls.append([])
+        module["cmd_task_create"](SimpleNamespace(
+            title="benchmark creation {}".format(creation_number),
+            scope=["created/{}/**".format(creation_number)],
+            depends_on=["T1000-benchmark"], tier="benchmark",
+        ))
+        if calls[-1] != ["tasks", "archive"]:
+            raise RuntimeError(
+                "task create loaded task directories {}".format(calls[-1])
+            )
+
+    globals_dict["load_tasks_from"] = counted_load
+    globals_dict["require_orchestrator"] = lambda: None
+    globals_dict["require_baton_dir"] = lambda: str(runtime)
+    globals_dict["say"] = lambda _message: None
+    try:
+        results["task_create_snapshot"] = benchmark_seconds(
+            "task_create_snapshot", create_task, samples,
+        )
+    finally:
+        globals_dict["load_tasks_from"] = original_load
+        globals_dict["require_orchestrator"] = original_require_orchestrator
+        globals_dict["require_baton_dir"] = original_require_baton_dir
+        globals_dict["say"] = original_say
+    results["task_create_snapshot"]["directory_loads_per_call"] = {
+        "active": 1,
+        "archive": 1,
+        "total": 2,
+    }
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=Path("framework/baton"))
@@ -219,6 +322,7 @@ def main():
     parser.add_argument("--suite-samples", type=int, default=3)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--skip-suite", action="store_true")
+    parser.add_argument("--hot-paths-only", action="store_true")
     args = parser.parse_args()
     source = args.source.resolve()
     repo = args.repo.resolve()
@@ -235,6 +339,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix="baton-performance-") as temporary:
         base = Path(temporary)
         project = prepare_fixture(source, base)
+        results["hot_paths"] = hot_path_benchmarks(
+            source, project, base, args.samples,
+        )
+        if args.hot_paths_only:
+            encoded = json.dumps(results, indent=2, sort_keys=True) + "\n"
+            if args.output:
+                args.output.write_text(encoded)
+            print(encoded, end="")
+            return
         installed = project / ".baton" / "baton"
         env = dict(os.environ, BATON_DIR=str(project / ".baton"))
         suite_repo = base / "suite"

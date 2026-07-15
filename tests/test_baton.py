@@ -614,6 +614,111 @@ class BatonTests(unittest.TestCase):
                 os.environ["BATON_DIR"] = previous_baton_dir
         self.assertEqual(len(calls), 1)
 
+    def test_scope_overlap_index_matches_conservative_overlap_rules(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_scope_index_probe")
+        overlap = module["scopes_overlap"]
+        index_type = module["ScopeOverlapIndex"]
+        scope_sets = [
+            [],
+            ["*"],
+            ["**"],
+            ["?ase/**"],
+            ["src"],
+            ["Src/Feature/**"],
+            ["src/feature/file?.py"],
+            ["src/features/**"],
+            ["docs/**", "tests/unit/?ase.py"],
+            ["other/place/**"],
+        ]
+        lease_cases = [
+            [],
+            [["src/Feature/**"]],
+            [["docs/**"], ["other/place/**"]],
+            [["?"]],
+            [["**"]],
+            [[]],
+            [["src/feature/file?.py"], ["tests/unit/**"]],
+        ]
+        for leased in lease_cases:
+            index = index_type(leased)
+            for candidate in scope_sets:
+                with self.subTest(leased=leased, candidate=candidate):
+                    expected = any(overlap(candidate, item) for item in leased)
+                    self.assertEqual(index.overlaps(candidate), expected)
+
+        index = index_type([["src/Feature/file?.py"]])
+        self.assertTrue(index.overlaps(["SRC"]))
+        self.assertTrue(index.overlaps(["src/feature/deeper/**"]))
+        self.assertFalse(index.overlaps(["src/features/**"]))
+
+    def test_pick_wave_preserves_order_dependencies_and_skip_reasons(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_wave_index_probe")
+
+        def task(task_id, scope, status="queued", dependencies=None):
+            return {
+                "id": task_id, "scope": scope, "status": status,
+                "depends_on": dependencies or [],
+            }
+
+        tasks = [
+            task("T001-status", ["status/**"], "running"),
+            task("T002-waiting", ["waiting/**"], dependencies=["T900-missing"]),
+            task("T003-busy", ["BUSY/root/child/**"]),
+            task("T004-first", ["src/one/**"], dependencies=["T800-done"]),
+            task("T005-conflict", ["SRC/one/deeper/*.py"]),
+            task("T006-second", ["docs/**"]),
+            task("T007-capacity", ["other/**"]),
+            task("T008-late-conflict", ["src/**"]),
+        ]
+        requested = [task["id"] for task in tasks]
+        archived = [task("T800-done", ["old/**"], "done")]
+        wave, skipped = module["pick_wave"](
+            tasks, archived, requested, 2, [["busy/root/**"]],
+        )
+        self.assertEqual([task["id"] for task in wave], [
+            "T004-first", "T006-second",
+        ])
+        self.assertEqual(skipped, [
+            ("T001-status", "status is running"),
+            ("T002-waiting", "waiting on T900-missing"),
+            ("T003-busy", "scope conflicts with another lease"),
+            ("T005-conflict", "scope conflicts with another lease"),
+            ("T007-capacity", "max_parallel reached"),
+            ("T008-late-conflict", "scope conflicts with another lease"),
+        ])
+
+    def test_task_create_loads_active_and_archive_once(self):
+        project = self.make_project("task-create-load-count")
+        dependency = self.create_task(project, "archived dependency", ["old/**"])
+        runtime = project / ".baton"
+        (runtime / "tasks" / f"{dependency}.json").replace(
+            runtime / "archive" / f"{dependency}.json"
+        )
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_create_load_probe")
+        globals_dict = module["cmd_task_create"].__globals__
+        original_load = globals_dict["load_tasks_from"]
+        calls = []
+
+        def counted_load(directory, validate_history=True):
+            calls.append((Path(directory).name, validate_history))
+            return original_load(directory, validate_history)
+
+        globals_dict["load_tasks_from"] = counted_load
+        globals_dict["require_orchestrator"] = lambda: None
+        globals_dict["require_baton_dir"] = lambda: str(runtime)
+        try:
+            with redirect_stdout(io.StringIO()):
+                module["cmd_task_create"](SimpleNamespace(
+                    title="snapshot creation", scope=["new/**"],
+                    depends_on=[dependency], tier="test",
+                ))
+        finally:
+            globals_dict["load_tasks_from"] = original_load
+
+        self.assertEqual(calls, [("tasks", True), ("archive", True)])
+        created = self.state(project, "T002-snapshot-creation")
+        self.assertEqual(created["depends_on"], [dependency])
+
     def test_scope_normalization_and_input_validation(self):
         project = self.make_project()
         first = self.create_task(project, "plain scope", ["src/**"])
