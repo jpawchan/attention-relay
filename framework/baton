@@ -6,6 +6,8 @@ Run `baton <command> --help` for command details.
 """
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -34,11 +36,20 @@ TASK_ID_RE = re.compile(r"T\d{3,}-[a-z0-9]+(?:-[a-z0-9]+)*")
 PRINT_LOCK = threading.Lock()
 MANAGED_FILES = (
     "baton", "orchestrator.md", "worker.md", "memory.md", "config.toml",
-    "orchestrator-handoff.md",
+    "orchestrator-handoff.md", "orchestrator-handoff-cursor.json",
+    "archive-transaction.json",
 )
 MANAGED_DIRS = ("tasks", "work", "archive", ".locks")
 HOOK_OUTPUT_MAX_CHARS = 9000
 HANDOFF_MAX_CHARS = 4000
+HANDOFF_CONSUMED_AT_PLACEHOLDER = "(not yet)"
+# A canonical UTC timestamp is always 20 characters. Reserve its full growth at
+# close so every readable handoff copy (Markdown or cursor, before or after
+# consumption) remains within HANDOFF_MAX_CHARS.
+HANDOFF_CONSUMPTION_RESERVE = (
+    len("9999-12-31T23:59:59Z") - len(HANDOFF_CONSUMED_AT_PLACEHOLDER)
+)
+HANDOFF_UNCONSUMED_MAX_CHARS = HANDOFF_MAX_CHARS - HANDOFF_CONSUMPTION_RESERVE
 CLAUDE_COMPACT_NOTICE = (
     "Baton: context was compacted; state re-injected below."
 )
@@ -77,6 +88,20 @@ def die(message):
 
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+
+def is_utc_timestamp(value):
+    """Return whether value is a real, canonical second-resolution UTC time."""
+    if not isinstance(value, str) or not UTC_TIMESTAMP_RE.fullmatch(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 # Paths and durable writes
@@ -183,6 +208,10 @@ def archive_dir(baton_dir):
     return os.path.join(baton_dir, "archive")
 
 
+def archive_transaction_path(baton_dir):
+    return os.path.join(baton_dir, "archive-transaction.json")
+
+
 def lock_path(baton_dir, name):
     return os.path.join(baton_dir, ".locks", name + ".lock")
 
@@ -208,8 +237,9 @@ def task_lock(baton_dir, task_id):
 
 
 def atomic_write(path, content, mode=0o644):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".baton-write-", dir=os.path.dirname(path))
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".baton-write-", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
             output.write(content)
@@ -217,6 +247,11 @@ def atomic_write(path, content, mode=0o644):
             os.fsync(output.fileno())
         os.chmod(temp_path, mode)
         os.replace(temp_path, path)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         with suppress(FileNotFoundError):
             os.unlink(temp_path)
@@ -225,6 +260,25 @@ def atomic_write(path, content, mode=0o644):
 
 def atomic_json(path, value):
     atomic_write(path, json.dumps(value, indent=2) + "\n")
+
+
+def sync_directory(path):
+    """Durably record directory-entry changes where directory fsync is supported."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EINVAL, errno.ENOTSUP):
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def require_orchestrator():
@@ -869,43 +923,231 @@ def sha256_regular_file(path):
             os.close(descriptor)
 
 
+def review_result_schema_problems(result):
+    """Return strict worker-result schema problems without trusting its values."""
+    required = {"status", "note", "at", "lease", "changed_paths"}
+    if not isinstance(result, dict):
+        return ["review result must contain a JSON object"]
+    problems = []
+    if set(result) != required:
+        problems.append(
+            "review result must contain exactly these fields: "
+            "status, note, at, lease, changed_paths"
+        )
+    if not isinstance(result.get("status"), str) or result.get("status") not in WORKER_FINAL:
+        problems.append("review result status is invalid")
+    if not isinstance(result.get("note"), str):
+        problems.append("review result note must be text")
+    if not is_utc_timestamp(result.get("at")):
+        problems.append("review result at must be a valid UTC timestamp")
+    if not isinstance(result.get("lease"), str) or not result.get("lease"):
+        problems.append("review result lease must be non-empty text")
+    if worker_changed_paths(result.get("changed_paths")) is None:
+        problems.append("review result changed_paths are missing or invalid")
+    return problems
+
+
+def review_history_shape_problems(task):
+    """Return lifecycle history shape problems before entries are traversed."""
+    history = task.get("history")
+    if not isinstance(history, list):
+        return ["review lifecycle history must be a list"]
+    return [
+        "review lifecycle history entry {} must be an object".format(index)
+        for index, entry in enumerate(history) if not isinstance(entry, dict)
+    ]
+
+
+def review_lifecycle_details(task, result, result_hash):
+    """Bind a valid result object to one unambiguous current-attempt lifecycle."""
+    attempt = task.get("attempt", 1)
+    problems = review_history_shape_problems(task)
+    if problems:
+        return problems, {}, [], []
+    history = task["history"]
+    launches = [
+        (index, entry) for index, entry in enumerate(history)
+        if entry.get("event") == "launched" and entry.get("attempt") == attempt
+    ]
+    if len(launches) != 1:
+        problems.append(
+            "review lifecycle must contain exactly one launch for task attempt {}"
+            .format(attempt)
+        )
+        return problems, {}, [], []
+    launch_index, launch = launches[0]
+    all_launch_indices = [
+        index for index, entry in enumerate(history)
+        if entry.get("event") == "launched"
+    ]
+    if all_launch_indices and launch_index != all_launch_indices[-1]:
+        problems.append("review lifecycle current-attempt launch is not the latest launch")
+
+    exits = [
+        (index, entry) for index, entry in enumerate(history)
+        if index > launch_index and entry.get("event") == "worker_exited"
+    ]
+    if len(exits) != 1:
+        problems.append(
+            "review lifecycle must contain exactly one worker exit after its launch"
+        )
+        return problems, {}, [], []
+    exit_index, worker_exit = exits[0]
+    latest_exit_index = next(
+        (index for index in range(len(history) - 1, -1, -1)
+         if history[index].get("event") == "worker_exited"),
+        None,
+    )
+    if exit_index != latest_exit_index:
+        problems.append("review lifecycle current-attempt exit is not the latest worker exit")
+    if "attempt" in worker_exit and worker_exit.get("attempt") != attempt:
+        problems.append("review lifecycle worker exit attempt does not match task attempt")
+
+    lease = launch.get("lease")
+    if not isinstance(lease, str) or not lease:
+        problems.append("review lifecycle launch lease is missing or invalid")
+    elif result["lease"] != lease:
+        problems.append("review result lease does not match launch")
+    if result["status"] != worker_exit.get("status"):
+        problems.append("review result status does not match worker exit")
+    if not isinstance(worker_exit.get("note"), str):
+        problems.append("review lifecycle worker exit note is invalid")
+    elif result["note"] != worker_exit["note"]:
+        problems.append("review result note does not match worker exit")
+
+    declared = worker_changed_paths(worker_exit.get("declared_paths"))
+    if declared is None:
+        problems.append("review lifecycle worker exit declared_paths are invalid")
+        declared = []
+    elif result["changed_paths"] != declared:
+        problems.append(
+            "review result changed_paths do not match worker exit declared_paths"
+        )
+    if (
+            "observed_paths" not in worker_exit
+            and not declared
+    ):
+        # Early finalized no-change records omitted this redundant empty field.
+        observed = []
+    else:
+        observed = worker_changed_paths(worker_exit.get("observed_paths"))
+    if observed is None:
+        problems.append("review observed changed paths are invalid")
+        observed = []
+    elif (
+            len(declared) != len(observed)
+            or {path.casefold() for path in declared}
+            != {path.casefold() for path in observed}):
+        problems.append("review declared and observed changed paths do not match")
+
+    if not is_utc_timestamp(launch.get("at")):
+        problems.append("review lifecycle launch timestamp is invalid")
+    if not is_utc_timestamp(worker_exit.get("at")):
+        problems.append("review lifecycle worker exit timestamp is invalid")
+    if (
+            is_utc_timestamp(launch.get("at"))
+            and is_utc_timestamp(worker_exit.get("at"))
+            and not (launch["at"] <= result["at"] <= worker_exit["at"])
+    ):
+        problems.append("review result timestamp is outside its lifecycle")
+
+    finalized_digest = worker_exit.get("result_digest")
+    if finalized_digest is not None:
+        if not isinstance(finalized_digest, str) or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", finalized_digest):
+            problems.append("review lifecycle result digest is invalid")
+        elif finalized_digest != "sha256:" + result_hash:
+            problems.append("review result changed after finalization")
+    return problems, worker_exit, declared, observed
+
+
+def review_evidence_details(baton_dir, task, archived=False):
+    """Read and validate the immutable artifact details needed for review."""
+    attempt = task.get("attempt", 1)
+    if archived:
+        directory = os.path.join(archive_dir(baton_dir), task["id"] + ".work")
+        report = os.path.join(directory, "attempt-%d.report.md" % attempt)
+        result_file = os.path.join(directory, "attempt-%d.result.json" % attempt)
+        diff = os.path.join(directory, "attempt-%d.diff" % attempt)
+    else:
+        report = report_path(baton_dir, task["id"], attempt)
+        result_file = result_path(baton_dir, task["id"], attempt)
+        diff = diff_path(baton_dir, task["id"], attempt)
+    paths = {"report": report, "result": result_file, "diff": diff}
+    hashes = {}
+    problems = []
+    for name, path in paths.items():
+        try:
+            hashes[name] = sha256_regular_file(path)
+        except OSError as error:
+            problems.append("review {} is missing or invalid: {}".format(name, error))
+
+    result = None
+    if "result" in hashes:
+        try:
+            result = read_json(result_file)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            problems.append("review result JSON is invalid: {}".format(error))
+        else:
+            try:
+                if sha256_regular_file(result_file) != hashes["result"]:
+                    problems.append("review result changed while its manifest was built")
+            except OSError as error:
+                problems.append("review result is missing or invalid: {}".format(error))
+
+    declared = None
+    observed = None
+    history_problems = review_history_shape_problems(task)
+    problems.extend(history_problems)
+    if result is not None:
+        schema_problems = review_result_schema_problems(result)
+        problems.extend(schema_problems)
+        if not schema_problems and not history_problems:
+            lifecycle_problems, _worker_exit, declared, observed = (
+                review_lifecycle_details(task, result, hashes["result"])
+            )
+            problems.extend(lifecycle_problems)
+        elif not history_problems:
+            worker_exit = latest_worker_exit(task)
+            legacy_empty_observed = (
+                "observed_paths" not in worker_exit
+                and worker_exit.get("declared_paths") == []
+            )
+            if (
+                    not legacy_empty_observed
+                    and worker_changed_paths(worker_exit.get("observed_paths")) is None
+            ):
+                problems.append("review observed changed paths are invalid")
+    if problems:
+        raise ValueError("; ".join(problems))
+    return {
+        "report": "sha256:" + hashes["report"],
+        "result": "sha256:" + hashes["result"],
+        "diff": "sha256:" + hashes["diff"],
+        "declared": sorted(declared),
+        "observed": sorted(observed),
+    }
+
+
 def build_review_evidence_manifest(baton_dir, task, capsule):
     """Build the immutable evidence description used by the review accept gate."""
-    attempt = task.get("attempt", 1)
-    report = report_path(baton_dir, task["id"], attempt)
-    result_file = result_path(baton_dir, task["id"], attempt)
-    diff = diff_path(baton_dir, task["id"], attempt)
-    hashes = {
-        "report": sha256_regular_file(report),
-        "result": sha256_regular_file(result_file),
-        "diff": sha256_regular_file(diff),
-    }
-    result = read_json(result_file)
-    if sha256_regular_file(result_file) != hashes["result"]:
-        raise OSError("review result changed while its manifest was built")
-    declared = worker_changed_paths(result.get("changed_paths"))
-    if declared is None:
-        raise ValueError("review result changed_paths are missing or invalid")
-    worker_exit = latest_worker_exit(task)
-    observed = worker_exit.get("observed_paths", [])
-    if not isinstance(observed, list) or not all(isinstance(path, str) for path in observed):
-        raise ValueError("review observed changed paths are invalid")
+    evidence = review_evidence_details(baton_dir, task)
+    evidence["capsule"] = "sha256:" + hashlib.sha256(
+        capsule.encode("utf-8")
+    ).hexdigest()
     return {
         "task_id": task["id"],
-        "attempt": attempt,
-        "evidence": {
-            "capsule": "sha256:" + hashlib.sha256(capsule.encode("utf-8")).hexdigest(),
-            "report": "sha256:" + hashes["report"],
-            "result": "sha256:" + hashes["result"],
-            "diff": "sha256:" + hashes["diff"],
-            "declared": sorted(declared),
-            "observed": sorted(observed),
-        },
+        "attempt": task.get("attempt", 1),
+        "evidence": evidence,
     }
 
 
 def orchestrator_handoff_path(baton_dir):
     return os.path.join(baton_dir, "orchestrator-handoff.md")
+
+
+def orchestrator_handoff_cursor_path(baton_dir):
+    return os.path.join(baton_dir, "orchestrator-handoff-cursor.json")
 
 
 def invalidate_review_token(baton_dir, task_id):
@@ -924,27 +1166,37 @@ def report_is_ready(path):
 REPORT_SECTIONS = ("Result", "Changes", "Verification", "Decisions and risks")
 
 
+def commonmark_fence_state(line, state):
+    """Return fenced-code state after one line under CommonMark fence rules."""
+    indent = len(line) - len(line.lstrip(" "))
+    candidate = line[indent:] if indent <= 3 else ""
+    if state is not None:
+        character, length = state
+        run_length = len(candidate) - len(candidate.lstrip(character))
+        if (
+                run_length >= length
+                and candidate[run_length:].strip(" \t") == ""):
+            return None
+        return state
+    opening = re.fullmatch(r"(`{3,}|~{3,})(.*)", candidate)
+    if opening and not (
+            opening.group(1)[0] == "`" and "`" in opening.group(2)):
+        return opening.group(1)[0], len(opening.group(1))
+    return None
+
+
 def report_section_problems(text, expected_status):
     """Return problems with the worker report template, without changing state."""
     sections = {name: None for name in REPORT_SECTIONS}
     current = None
-    fence_character = None
-    fence_length = 0
+    fence_state = None
     for line in text.splitlines():
-        fence = re.match(r" {0,3}(`{3,}|~{3,})", line)
-        if fence_character is None and fence:
-            fence_character = fence.group(1)[0]
-            fence_length = len(fence.group(1))
+        previous_fence_state = fence_state
+        fence_state = commonmark_fence_state(line, fence_state)
+        if previous_fence_state is None and fence_state is not None:
             continue
-        elif fence_character is not None:
-            closing = re.fullmatch(r" {0,3}([`~]+)[ \t]*", line)
-            if (
-                    closing
-                    and closing.group(1)[0] == fence_character
-                    and set(closing.group(1)) == {fence_character}
-                    and len(closing.group(1)) >= fence_length):
-                fence_character = None
-                fence_length = 0
+        elif previous_fence_state is not None:
+            if fence_state is None:
                 continue
         elif line == "##" or line.startswith("## "):
             name = line[3:] if line.startswith("## ") else ""
@@ -1359,21 +1611,127 @@ CAPSULE_REQUIRED_PLACEHOLDERS = {
 }
 
 
+def task_spec_unfenced_lines(spec):
+    """Yield source lines outside fences, with None separating fenced blocks."""
+    fence_state = None
+    offset = 0
+    for line in spec.splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            body = line[:-2]
+        elif line.endswith(("\r", "\n")):
+            body = line[:-1]
+        else:
+            body = line
+        previous_fence_state = fence_state
+        fence_state = commonmark_fence_state(body, fence_state)
+        if previous_fence_state is not None or fence_state is not None:
+            yield None
+        else:
+            yield offset, body, line
+        offset += len(line)
+
+
+def task_spec_heading_lines(spec):
+    """Return level-2 headings and their source line ends outside fences."""
+    headings = []
+    for scanned in task_spec_unfenced_lines(spec):
+        if scanned is None:
+            continue
+        offset, body, line = scanned
+        heading = re.fullmatch(r"## (.+?)[ \t]*", body)
+        if heading:
+            headings.append((
+                heading.group(1).strip(), offset, offset + len(body),
+                offset + len(line),
+            ))
+    return headings
+
+
+def task_spec_headings(spec):
+    """Return level-2 task headings outside CommonMark fenced code blocks."""
+    return [heading[:3] for heading in task_spec_heading_lines(spec)]
+
+
+def task_spec_contains_unfenced_entry(spec, entry):
+    """Return whether an exact entry occurs outside fenced code blocks."""
+    for scanned in task_spec_unfenced_lines(spec):
+        if scanned is not None and scanned[1] == entry:
+            return True
+    return False
+
+
+def task_spec_section_bounds(spec, section):
+    """Return the body bounds for the first exact, unfenced task section."""
+    headings = task_spec_heading_lines(spec)
+    for index, (name, _heading_start, _heading_end, line_end) in enumerate(headings):
+        if name != section:
+            continue
+        body_start = line_end
+        body_end = headings[index + 1][1] if index + 1 < len(headings) else len(spec)
+        return body_start, body_end
+    return None
+
+
+def task_spec_unfenced_entry_offset(spec, section, entry):
+    """Return the offset of an exact single-line entry in one task section."""
+    in_section = False
+    for scanned in task_spec_unfenced_lines(spec):
+        if scanned is None:
+            continue
+        offset, body, _line = scanned
+        heading = re.fullmatch(r"## (.+?)[ \t]*", body)
+        if heading:
+            if in_section:
+                return None
+            in_section = heading.group(1).strip() == section
+            continue
+        if in_section and body == entry:
+            return offset
+    return None
+
+
+def task_spec_has_retry_publication(spec, section, marker, entry):
+    """Return whether one section contains an unfenced proof bound to its entry."""
+    in_section = False
+    for scanned in task_spec_unfenced_lines(spec):
+        if scanned is None:
+            continue
+        offset, body, line = scanned
+        heading = re.fullmatch(r"## (.+?)[ \t]*", body)
+        if heading:
+            if in_section:
+                return False
+            in_section = heading.group(1).strip() == section
+            continue
+        if not in_section or body != marker:
+            continue
+        entry_start = offset + len(line)
+        entry_end = entry_start + len(entry)
+        if spec[entry_start:entry_end] != entry:
+            continue
+        if entry.endswith(("\r", "\n")) or entry_end == len(spec):
+            return True
+        if spec.startswith(("\r\n", "\r", "\n"), entry_end):
+            return True
+    return False
+
+
 def task_spec_sections(spec):
     """Return top-level task sections without reading files or changing state."""
-    matches = list(re.finditer(r"^## ([^\n]+)[ \t]*$", spec, re.MULTILINE))
+    matches = task_spec_headings(spec)
     sections = {}
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(spec)
-        sections.setdefault(match.group(1).strip(), spec[match.end():end].strip())
+    for index, (name, _start, heading_end) in enumerate(matches):
+        end = matches[index + 1][1] if index + 1 < len(matches) else len(spec)
+        sections.setdefault(name, spec[heading_end:end].strip())
     return sections
 
 
 def latest_task_spec_entry(text):
     """Return the newest list entry (Baton prepends feedback and decisions)."""
     for line in text.splitlines():
-        if line.strip():
-            return line.strip()
+        entry = line.strip()
+        if entry and not entry.startswith("<!-- baton-retry-publication:v1 "):
+            return entry
     return ""
 
 
@@ -1765,7 +2123,7 @@ def cmd_task_capsule(args):
         source_label = "launch (attempt {})".format(attempt)
     else:
         _, memory_text = read_memory(baton_dir)
-        memory_entries = memory_index_entries(memory_text)
+        memory_entries, _memory_bodies = memory_records(memory_text)
         with open(task_md_path(baton_dir, task["id"]), encoding="utf-8") as source:
             result = context_capsule_components(
                 task, source.read(), memory_entries, maximum,
@@ -1806,20 +2164,77 @@ def append_md_section(baton_dir, task_id, section, text):
     path = task_md_path(baton_dir, task_id)
     if not os.path.exists(path):
         return
-    with open(path, encoding="utf-8") as source:
+    with open(path, encoding="utf-8", newline="") as source:
         content = source.read()
     marker = "## " + section
-    if marker in content:
-        index = content.index(marker) + len(marker)
-        newline = content.find("\n", index)
-        if newline == -1:
-            content += "\n" + text.rstrip() + "\n"
+    heading = next(
+        (item for item in task_spec_heading_lines(content) if item[0] == section), None,
+    )
+    if heading is not None:
+        heading_end = heading[2]
+        line_end = heading[3]
+        if line_end == heading_end:
+            content += "\n" + text
         else:
-            newline += 1
-            content = content[:newline] + text.rstrip() + "\n" + content[newline:]
+            content = content[:line_end] + text + content[line_end:]
     else:
-        content = content.rstrip() + "\n\n" + marker + "\n" + text.rstrip() + "\n"
+        content = content.rstrip() + "\n\n" + marker + "\n" + text
     atomic_write(path, content)
+
+
+def retry_publication_marker(task_id, transition, attempt, entry):
+    """Return the collision-resistant proof line for one retry publication."""
+    payload = json.dumps(
+        ["baton-retry-publication-v1", task_id, transition, attempt, entry],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return (
+        "<!-- baton-retry-publication:v1 transition={} attempt={} "
+        "digest=sha256:{} -->"
+    ).format(transition, attempt, digest)
+
+
+def publish_retry_context(
+        baton_dir, task_id, transition, attempt, section, text):
+    """Publish one retry entry with an adjacent, section-bound proof."""
+    path = task_md_path(baton_dir, task_id)
+    entry = text
+    marker = retry_publication_marker(task_id, transition, attempt, entry)
+
+    def published():
+        if not os.path.exists(path):
+            raise OSError(
+                "cannot publish retry context; task specification is missing: " + path
+            )
+        with open(path, encoding="utf-8", newline="") as source:
+            return task_spec_has_retry_publication(
+                source.read(), section, marker, entry,
+            )
+
+    if published():
+        return
+    legacy_entry_offset = None
+    if is_single_line_text(entry):
+        with open(path, encoding="utf-8", newline="") as source:
+            content = source.read()
+        legacy_entry_offset = task_spec_unfenced_entry_offset(
+            content, section, entry,
+        )
+    if legacy_entry_offset is not None:
+        atomic_write(
+            path,
+            content[:legacy_entry_offset] + marker + "\n"
+            + content[legacy_entry_offset:],
+        )
+    else:
+        append_md_section(
+            baton_dir, task_id, section, marker + "\n" + entry + "\n",
+        )
+    if not published():
+        raise OSError(
+            "cannot publish retry context in task specification section " + section
+        )
 
 
 def ensure_not_live(task):
@@ -1834,109 +2249,131 @@ def cmd_task_accept(args):
     config = load_config(baton_dir)
     accept_requires_brief = configured_accept_requires_brief(config)
     report_requires_sections = configured_report_requires_sections(config)
-    with task_lock(baton_dir, args.id):
-        task = load_task(baton_dir, args.id)
-        ensure_not_live(task)
-        if task.get("scope_violations"):
-            die("{} has unresolved scope violations".format(task["id"]))
-        if task["status"] != "needs_review":
-            die("{} is {}, not needs_review".format(task["id"], task["status"]))
-        report_problems = report_gate_problems(
-            report_path(baton_dir, task["id"], task.get("attempt", 1)),
-            "needs_review", report_requires_sections,
-        )
-        if report_problems:
-            die("report rejected: " + "; ".join(report_problems))
-        token_path = review_token_path(baton_dir, task["id"])
-        if accept_requires_brief:
-            stored = None
-            if os.path.isfile(token_path):
+    with file_lock(lock_path(baton_dir, "scheduler")):
+        with task_lock(baton_dir, args.id):
+            task = load_task(baton_dir, args.id)
+            ensure_not_live(task)
+            if task.get("scope_violations"):
+                die("{} has unresolved scope violations".format(task["id"]))
+            if task["status"] != "needs_review":
+                die("{} is {}, not needs_review".format(task["id"], task["status"]))
+            report_problems = report_gate_problems(
+                report_path(baton_dir, task["id"], task.get("attempt", 1)),
+                "needs_review", report_requires_sections,
+            )
+            if report_problems:
+                die("report rejected: " + "; ".join(report_problems))
+            token_path = review_token_path(baton_dir, task["id"])
+            if accept_requires_brief:
+                stored = None
+                if os.path.isfile(token_path):
+                    try:
+                        stored = read_json(token_path)
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        stored = None
+                if (
+                        not args.brief
+                        or not isinstance(stored, dict)
+                        or stored.get("task_id") != task["id"]
+                        or stored.get("attempt") != task.get("attempt", 1)
+                        or stored.get("token") != args.brief):
+                    die(
+                        "a fresh review-phase brief token is required; run `baton "
+                        "orchestrator brief --phase review {}`, then pass its token as "
+                        "`--brief TOKEN`".format(task["id"])
+                    )
                 try:
-                    stored = read_json(token_path)
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                    stored = None
-            if (
-                    not args.brief
-                    or not isinstance(stored, dict)
-                    or stored.get("task_id") != task["id"]
-                    or stored.get("attempt") != task.get("attempt", 1)
-                    or stored.get("token") != args.brief):
-                die(
-                    "a fresh review-phase brief token is required; run `baton "
-                    "orchestrator brief --phase review {}`, then pass its token as "
-                    "`--brief TOKEN`".format(task["id"])
-                )
-            try:
-                capsule, _capsule_drifted, _compile_warning = displayed_review_capsule(
-                    baton_dir, task,
-                )
-                current_manifest = build_review_evidence_manifest(baton_dir, task, capsule)
-            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-                die("review evidence changed; run a fresh review brief")
-            stored_manifest = dict(stored)
-            stored_manifest.pop("token", None)
-            if current_manifest != stored_manifest:
-                die("review evidence changed; run a fresh review brief")
-        task["status"] = "done"
-        record(task, "accepted", note=args.note or "")
-        save_task(baton_dir, task)
-        if accept_requires_brief:
-            os.unlink(token_path)
+                    capsule, _capsule_drifted, _compile_warning = displayed_review_capsule(
+                        baton_dir, task,
+                    )
+                    current_manifest = build_review_evidence_manifest(
+                        baton_dir, task, capsule,
+                    )
+                except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+                    die(
+                        "review evidence changed; run a fresh review brief: {}"
+                        .format(error)
+                    )
+                stored_manifest = dict(stored)
+                stored_manifest.pop("token", None)
+                if current_manifest != stored_manifest:
+                    die("review evidence changed; run a fresh review brief")
+            else:
+                try:
+                    review_evidence_details(baton_dir, task)
+                except (
+                        OSError, UnicodeDecodeError, ValueError,
+                        json.JSONDecodeError) as error:
+                    die("review evidence is inconsistent: {}".format(error))
+            task["status"] = "done"
+            record(task, "accepted", note=args.note or "")
+            save_task(baton_dir, task)
+            if accept_requires_brief:
+                os.unlink(token_path)
     say("{} accepted".format(task["id"]))
 
 
 def cmd_task_return(args):
     require_orchestrator()
     baton_dir = require_baton_dir()
-    with task_lock(baton_dir, args.id):
-        task = load_task(baton_dir, args.id)
-        ensure_not_live(task)
-        if task["status"] not in WORKER_FINAL:
-            die("{} is {}; it cannot be returned".format(task["id"], task["status"]))
-        violations = task.get("scope_violations", [])
-        if violations:
-            baseline = task.get("scope_baseline")
-            if not baseline:
-                die("scope violation baseline is missing; run .baton/baton validate")
-            root = project_root(baton_dir)
-            require_git_root(root)
-            current_tree = git_snapshot(root)
-            changed = set(git_changed_paths(root, baseline, current_tree))
-            unresolved = [path for path in violations if path in changed]
-            if unresolved:
-                die("restore scope-violating paths before returning: " + ", ".join(unresolved))
-        previous_attempt = task.get("attempt", 1)
-        task["status"] = "queued"
-        task["attempt"] = previous_attempt + 1
-        task.pop("runner", None)
-        task.pop("scope_violations", None)
-        task.pop("scope_baseline", None)
-        task.pop("last_note", None)
-        record(task, "returned", reason=args.reason)
-        save_task(baton_dir, task)
-        invalidate_review_token(baton_dir, task["id"])
-        append_md_section(
-            baton_dir, task["id"], "Review feedback",
-            "- attempt %d: %s" % (previous_attempt, args.reason),
-        )
+    with file_lock(lock_path(baton_dir, "scheduler")):
+        with task_lock(baton_dir, args.id):
+            task = load_task(baton_dir, args.id)
+            ensure_not_live(task)
+            if task["status"] not in WORKER_FINAL:
+                die("{} is {}; it cannot be returned".format(task["id"], task["status"]))
+            violations = task.get("scope_violations", [])
+            if violations:
+                baseline = task.get("scope_baseline")
+                if not baseline:
+                    die("scope violation baseline is missing; run .baton/baton validate")
+                root = project_root(baton_dir)
+                require_git_root(root)
+                current_tree = git_snapshot(root)
+                changed = set(git_changed_paths(root, baseline, current_tree))
+                unresolved = [path for path in violations if path in changed]
+                if unresolved:
+                    die(
+                        "restore scope-violating paths before returning: "
+                        + ", ".join(unresolved)
+                    )
+            previous_attempt = task.get("attempt", 1)
+            publish_retry_context(
+                baton_dir, task["id"], "return", previous_attempt, "Review feedback",
+                "- attempt %d: %s" % (previous_attempt, args.reason),
+            )
+            invalidate_review_token(baton_dir, task["id"])
+            task["status"] = "queued"
+            task["attempt"] = previous_attempt + 1
+            task.pop("runner", None)
+            task.pop("scope_violations", None)
+            task.pop("scope_baseline", None)
+            task.pop("last_note", None)
+            record(task, "returned", reason=args.reason)
+            save_task(baton_dir, task)
     say("%s returned for attempt %d" % (task["id"], task["attempt"]))
 
 
 def cmd_task_decide(args):
     require_orchestrator()
     baton_dir = require_baton_dir()
-    with task_lock(baton_dir, args.id):
-        task = load_task(baton_dir, args.id)
-        ensure_not_live(task)
-        if task["status"] != "needs_decision":
-            die("{} is {}, not needs_decision".format(task["id"], task["status"]))
-        task["status"] = "queued"
-        task["attempt"] = task.get("attempt", 1) + 1
-        task.pop("last_note", None)
-        record(task, "decided", answer=args.answer)
-        save_task(baton_dir, task)
-        invalidate_review_token(baton_dir, task["id"])
-        append_md_section(baton_dir, task["id"], "Decisions", "- " + args.answer)
+    with file_lock(lock_path(baton_dir, "scheduler")):
+        with task_lock(baton_dir, args.id):
+            task = load_task(baton_dir, args.id)
+            ensure_not_live(task)
+            if task["status"] != "needs_decision":
+                die("{} is {}, not needs_decision".format(task["id"], task["status"]))
+            previous_attempt = task.get("attempt", 1)
+            publish_retry_context(
+                baton_dir, task["id"], "decide", previous_attempt, "Decisions",
+                "- " + args.answer,
+            )
+            invalidate_review_token(baton_dir, task["id"])
+            task["status"] = "queued"
+            task["attempt"] = previous_attempt + 1
+            task.pop("last_note", None)
+            record(task, "decided", answer=args.answer)
+            save_task(baton_dir, task)
     say("{} answered and re-queued".format(task["id"]))
 
 
@@ -2147,9 +2584,187 @@ def read_handoff(baton_dir):
         return source.read()[:8000]
 
 
+def read_handoff_cursor(baton_dir):
+    """Read strict legacy or identity-based canonical handoff state."""
+    path = orchestrator_handoff_cursor_path(baton_dir)
+    if not os.path.exists(path):
+        return None
+    if os.path.islink(path) or not os.path.isfile(path):
+        die("orchestrator handoff cursor must be a regular file")
+    try:
+        with open(path, encoding="utf-8") as source:
+            cursor = json.load(source)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        die("cannot parse orchestrator handoff cursor: {}".format(error))
+    if not isinstance(cursor, dict):
+        die("orchestrator handoff cursor must contain a JSON object")
+    version = cursor.get("version")
+    if type(version) is not int:
+        die("orchestrator handoff cursor is invalid")
+    if version in (1, 2):
+        required = {"version", "accepted_at", "seen_ids"}
+        if version == 2:
+            required.add("handoff")
+        accepted_at = cursor.get("accepted_at")
+        seen_ids = cursor.get("seen_ids")
+        if (
+                set(cursor) != required
+                or not is_utc_timestamp(accepted_at)
+                or not isinstance(seen_ids, list)
+                or not all(isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id)
+                           for task_id in seen_ids)
+                or len(seen_ids) != len(set(seen_ids))):
+            die("orchestrator handoff cursor is invalid")
+        state = {
+            "version": version, "accepted_at": accepted_at,
+            "seen_ids": set(seen_ids),
+        }
+    elif version == 3:
+        reported_ids = cursor.get("reported_ids")
+        if (
+                set(cursor) != {"version", "reported_ids", "handoff"}
+                or not isinstance(reported_ids, list)
+                or not all(isinstance(task_id, str) and TASK_ID_RE.fullmatch(task_id)
+                           for task_id in reported_ids)
+                or len(reported_ids) != len(set(reported_ids))):
+            die("orchestrator handoff cursor is invalid")
+        state = {"version": version, "reported_ids": set(reported_ids)}
+    else:
+        die("orchestrator handoff cursor is invalid")
+    if version in (2, 3):
+        handoff = cursor.get("handoff")
+        if (
+                not isinstance(handoff, str)
+                or handoff_structure(handoff) is None
+                or (version == 2
+                    and handoff_field(handoff, "generated_at") != accepted_at)):
+            die("orchestrator handoff cursor is invalid")
+        state["handoff"] = handoff
+    return state
+
+
 def handoff_field(content, name, default=""):
     match = re.search(r"^{}:[ \t]*(.*)$".format(re.escape(name)), content, re.MULTILINE)
     return match.group(1).strip() if match else default
+
+
+HANDOFF_SECTION_NAMES = ("done", "decisions", "next", "unresolved", "notes", "avoid")
+
+
+def handoff_structure(content):
+    """Return section membership for one readable, budgeted handoff."""
+    if (
+            not isinstance(content, str)
+            or not content.endswith("\n")
+            or len(content) > HANDOFF_MAX_CHARS):
+        return None
+    lines = content.splitlines()
+    if (
+            len(lines) < 6
+            or lines[0] != "# Orchestrator handoff"
+            or not re.fullmatch(r"generated_at: (.+)", lines[1])
+            or not is_utc_timestamp(lines[1][len("generated_at: "):])
+            or not re.fullmatch(r"consumed_at: (.+)", lines[2])
+            or not (
+                lines[2][len("consumed_at: "):] == HANDOFF_CONSUMED_AT_PLACEHOLDER
+                or is_utc_timestamp(lines[2][len("consumed_at: "):])
+            )
+            or not re.fullmatch(r"goal: \S.*", lines[3])):
+        return None
+
+    section_indices = []
+    section_by_line = {}
+    current_section = None
+    previous_order = -1
+    for index, line in enumerate(lines[4:], 4):
+        if line.endswith(":") and line[:-1] in HANDOFF_SECTION_NAMES:
+            order = HANDOFF_SECTION_NAMES.index(line[:-1])
+            if order <= previous_order:
+                return None
+            previous_order = order
+            current_section = line[:-1]
+            section_indices.append((index, current_section))
+        elif current_section is None:
+            if index != 4 or not re.fullmatch(r"warning: \S.*", line):
+                return None
+        elif not line.startswith("- "):
+            return None
+        else:
+            section_by_line[index] = current_section
+    if not section_indices or section_indices[0][1] != "done":
+        return None
+    for position, (index, _name) in enumerate(section_indices):
+        end = (
+            section_indices[position + 1][0]
+            if position + 1 < len(section_indices) else len(lines)
+        )
+        if end == index + 1:
+            return None
+    return section_by_line
+
+
+def consume_handoff_content(content, consumed_at):
+    """Validate and consume a handoff, compacting legacy prose before publish.
+
+    Legacy handoffs could use all 4,000 characters before consumption. Their
+    trailing presentation prose may be shortened deterministically, but metadata,
+    headings, list syntax, and every task ID are retained byte-for-byte.
+    """
+    section_by_line = handoff_structure(content)
+    if section_by_line is None or not is_utc_timestamp(consumed_at):
+        raise ValueError("orchestrator handoff is invalid")
+    lines = content.splitlines()
+    lines[2] = "consumed_at: " + consumed_at
+    consumed = "\n".join(lines) + "\n"
+    overflow = len(consumed) - HANDOFF_MAX_CHARS
+    if overflow <= 0:
+        return consumed
+
+    prose_candidates = []
+    goal_candidates = []
+    identity_candidates = []
+    for index, line in enumerate(lines):
+        minimum = None
+        matches = list(TASK_ID_RE.finditer(line))
+        if index == 3:
+            minimum = len("goal: x")
+        elif line.startswith("warning: "):
+            minimum = len("warning: x")
+        elif index in section_by_line:
+            if line in ("- (none)", "- (fill in)") or re.fullmatch(
+                    r"- \+[1-9]\d* more", line):
+                continue
+            if matches:
+                minimum = max(match.end() for match in matches)
+                if section_by_line[index] == "done" and line[minimum:minimum + 1] == ":":
+                    minimum += 1
+            else:
+                minimum = len("- x")
+        if minimum is not None and matches:
+            minimum = max(minimum, max(match.end() for match in matches))
+        if minimum is None or len(line) <= minimum:
+            continue
+        candidate = (index, minimum)
+        if matches:
+            identity_candidates.append(candidate)
+        elif index == 3:
+            goal_candidates.append(candidate)
+        else:
+            prose_candidates.append(candidate)
+
+    for index, minimum in prose_candidates + goal_candidates + identity_candidates:
+        removable = len(lines[index]) - minimum
+        removed = min(overflow, removable)
+        lines[index] = lines[index][:-removed]
+        overflow -= removed
+        if not overflow:
+            break
+    if overflow:
+        raise ValueError("orchestrator handoff cannot be consumed within its budget")
+    consumed = "\n".join(lines) + "\n"
+    if handoff_structure(consumed) is None:
+        raise ValueError("compacted orchestrator handoff is invalid")
+    return consumed
 
 
 def handoff_done_ids(content):
@@ -2163,10 +2778,42 @@ def handoff_done_ids(content):
     }
 
 
-def limited_lines(values, limit=8):
+def handoff_done_presentation(content):
+    """Return rendered done task lines and their separate omitted-task count."""
+    match = re.search(r"^done:[ \t]*\n((?:^- .*(?:\n|$))*)", content, re.MULTILINE)
+    if not match:
+        return [], 0
+    lines = [
+        line[2:] for line in match.group(1).splitlines()
+        if line.startswith("- ") and line[2:] != "(none)"
+    ]
+    omitted = 0
+    if lines:
+        summary = re.fullmatch(r"\+([1-9]\d*) more", lines[-1])
+        if summary:
+            omitted = int(summary.group(1))
+            lines.pop()
+    return lines, omitted
+
+
+def handoff_presentations_match(canonical, presentation):
+    """Treat start-phase consumption as presentation-equivalent publication."""
+    def normalized(content):
+        return re.sub(
+            r"^consumed_at:.*$", "consumed_at: (normalized)", content,
+            count=1, flags=re.MULTILINE,
+        )
+
+    return normalized(canonical) == normalized(presentation)
+
+
+def limited_lines(values, limit=8, omitted=0):
     rendered = [str(value).replace("\n", " ")[:240] for value in values]
     if len(rendered) > limit:
-        rendered = rendered[:limit] + ["+{} more".format(len(rendered) - limit)]
+        omitted += len(rendered) - limit
+        rendered = rendered[:limit]
+    if omitted:
+        rendered.append("+{} more".format(omitted))
     return rendered or ["(none)"]
 
 
@@ -2183,7 +2830,7 @@ def handoff_task_line(task_id, title, outcome, include_outcome=True):
 
 def render_handoff(
         generated_at, goal, working_tree, done, decisions, next_ids, unresolved,
-        notes, avoid_notes):
+        notes, avoid_notes, carried_done=(), carried_done_omitted=0):
     """Render a handoff with deterministic section-aware budget degradation."""
     warning = {
         True: "warning: uncommitted Git-visible changes at close",
@@ -2194,12 +2841,12 @@ def render_handoff(
     def build(include_outcomes):
         sections = [
             "# Orchestrator handoff", "generated_at: " + generated_at,
-            "consumed_at: (not yet)", "goal: " + goal,
+            "consumed_at: " + HANDOFF_CONSUMED_AT_PLACEHOLDER, "goal: " + goal,
         ]
         if warning:
             sections.append(warning)
         values_by_name = {
-            "done": [
+            "done": list(carried_done) + [
                 handoff_task_line(task_id, title, outcome, include_outcomes)
                 for task_id, title, outcome in done
             ],
@@ -2212,6 +2859,7 @@ def render_handoff(
             sections.extend(
                 "- " + line for line in limited_lines(
                     values_by_name[name], limit=limits[name],
+                    omitted=carried_done_omitted if name == "done" else 0,
                 )
             )
         if notes:
@@ -2224,20 +2872,29 @@ def render_handoff(
         return "\n".join(sections) + "\n"
 
     content = build(include_outcomes=True)
-    if len(content) <= HANDOFF_MAX_CHARS:
+    if len(content) <= HANDOFF_UNCONSUMED_MAX_CHARS:
+        if handoff_structure(content) is None:
+            raise RuntimeError("rendered handoff is invalid")
         return content
 
     content = build(include_outcomes=False)
     for group in (("done", "decisions"), ("next", "unresolved")):
-        while len(content) > HANDOFF_MAX_CHARS and any(limits[name] for name in group):
+        while (
+                len(content) > HANDOFF_UNCONSUMED_MAX_CHARS
+                and any(limits[name] for name in group)):
             for name in group:
-                if len(content) <= HANDOFF_MAX_CHARS:
+                if len(content) <= HANDOFF_UNCONSUMED_MAX_CHARS:
                     break
                 if limits[name]:
                     limits[name] -= 1
                     content = build(include_outcomes=False)
-    if len(content) > HANDOFF_MAX_CHARS:
-        raise RuntimeError("bounded handoff fields exceed the 4000-character budget")
+    if len(content) > HANDOFF_UNCONSUMED_MAX_CHARS:
+        raise RuntimeError(
+            "bounded handoff fields exceed the consumption-reserved "
+            "3989-character budget"
+        )
+    if handoff_structure(content) is None:
+        raise RuntimeError("rendered handoff is invalid")
     return content
 
 
@@ -2254,19 +2911,42 @@ def orchestrator_start_brief(baton_dir, tasks, consume_handoff=True):
         say(line)
     if consume_handoff:
         with file_lock(lock_path(baton_dir, "orchestrator-handoff")):
-            handoff = read_handoff(baton_dir)
+            presentation = read_handoff(baton_dir)
+            cursor = read_handoff_cursor(baton_dir)
+            handoff = (
+                cursor["handoff"]
+                if cursor is not None and cursor["version"] in (2, 3)
+                else presentation
+            )
             if handoff:
                 consumed = now()
-                if re.search(r"^consumed_at:.*$", handoff, re.MULTILINE):
-                    handoff = re.sub(
-                        r"^consumed_at:.*$", "consumed_at: " + consumed,
-                        handoff, count=1, flags=re.MULTILINE,
+                try:
+                    handoff = consume_handoff_content(handoff, consumed)
+                except ValueError as error:
+                    die(str(error))
+                if cursor is not None and cursor["version"] in (2, 3):
+                    cursor_content = {"version": cursor["version"], "handoff": handoff}
+                    if cursor["version"] == 2:
+                        cursor_content.update({
+                            "accepted_at": cursor["accepted_at"],
+                            "seen_ids": sorted(cursor["seen_ids"]),
+                        })
+                    else:
+                        cursor_content["reported_ids"] = sorted(
+                            cursor["reported_ids"]
+                        )
+                    atomic_json(
+                        orchestrator_handoff_cursor_path(baton_dir), cursor_content,
                     )
-                else:
-                    handoff = handoff.rstrip() + "\nconsumed_at: " + consumed + "\n"
                 atomic_write(orchestrator_handoff_path(baton_dir), handoff)
     else:
-        handoff = read_handoff(baton_dir)
+        presentation = read_handoff(baton_dir)
+        cursor = read_handoff_cursor(baton_dir)
+        handoff = (
+            cursor["handoff"]
+            if cursor is not None and cursor["version"] in (2, 3)
+            else presentation
+        )
     if handoff:
         say("\nCurrent handoff:")
         say(handoff.rstrip())
@@ -2331,7 +3011,7 @@ def latest_worker_exit(task):
 def compile_current_task_capsule(baton_dir, task):
     config = load_config(baton_dir)
     _, memory_text = read_memory(baton_dir)
-    memory_entries = memory_index_entries(memory_text)
+    memory_entries, _memory_bodies = memory_records(memory_text)
     with open(task_md_path(baton_dir, task["id"]), encoding="utf-8") as source:
         return compile_context_capsule(
             task, source.read(), memory_entries,
@@ -2603,6 +3283,9 @@ def orchestrator_close_brief(
                     task["id"], entry.get("answer", ""),
                 )))
     decisions = [text for _at, text in sorted(decisions, reverse=True)]
+    accepted_ids = {
+        task_id for _accepted_at, task_id, _title, _outcome in done_candidates
+    }
     next_ids = [task["id"] for task in tasks
                 if task.get("status") in {"queued", "needs_review"}]
     unresolved = [task["id"] for task in tasks
@@ -2610,17 +3293,63 @@ def orchestrator_close_brief(
     with file_lock(lock_path(baton_dir, "orchestrator-handoff")):
         previous = read_handoff(baton_dir)
         previous_at = handoff_field(previous, "generated_at")
-        previous_done = handoff_done_ids(previous)
+        previous_seen = handoff_done_ids(previous)
+        cursor = read_handoff_cursor(baton_dir)
+        reported_ids = set()
+        carried_done = []
+        carried_done_omitted = 0
+        if cursor is not None and cursor["version"] == 3:
+            if not cursor["reported_ids"].issubset(accepted_ids):
+                die("orchestrator handoff cursor is invalid")
+            reported_ids.update(cursor["reported_ids"])
+            if not handoff_presentations_match(cursor["handoff"], previous):
+                carried_done, carried_done_omitted = handoff_done_presentation(
+                    cursor["handoff"],
+                )
+        else:
+            if cursor is not None and cursor["version"] == 2:
+                previous_at = cursor["accepted_at"]
+                previous_seen = (
+                    set(cursor["seen_ids"])
+                    | handoff_done_ids(cursor["handoff"])
+                )
+                if not handoff_presentations_match(cursor["handoff"], previous):
+                    carried_done, carried_done_omitted = handoff_done_presentation(
+                        cursor["handoff"],
+                    )
+            elif cursor is not None and cursor["accepted_at"] == previous_at:
+                previous_seen.update(cursor["seen_ids"])
+            elif cursor is not None:
+                # A version-1 cursor and Markdown were separate publications.
+                # Recover from their last visible boundary and migrate atomically.
+                pass
+            # Legacy cursors only identify their current timestamp boundary.
+            # Preserve that format's deterministic behavior once during migration:
+            # earlier acceptances are treated as reported and unseen acceptances at
+            # or after the boundary remain eligible. Only snapshot-backed accepted
+            # IDs are trusted when the durable version-3 identity set is created.
+            reported_ids.update(previous_seen & accepted_ids)
+            if previous_at:
+                reported_ids.update(
+                    task_id for accepted_at, task_id, _title, _outcome
+                    in done_candidates if accepted_at < previous_at
+                )
         done = {}
-        for accepted_at, task_id, title, outcome in done_candidates:
-            if (
-                    (not previous_at or accepted_at >= previous_at)
-                    and task_id not in previous_done):
+        for _accepted_at, task_id, title, outcome in done_candidates:
+            if task_id not in reported_ids:
                 done[task_id] = (task_id, title, outcome)
+        generated_at = now()
+        reported_ids.update(done)
         content = render_handoff(
-            now(), goal, working_tree, sorted(done.values()), decisions,
-            next_ids, unresolved, notes, avoid_notes,
+            generated_at, goal, working_tree, sorted(done.values()), decisions,
+            next_ids, unresolved, notes, avoid_notes, carried_done,
+            carried_done_omitted,
         )
+        atomic_json(orchestrator_handoff_cursor_path(baton_dir), {
+            "version": 3,
+            "reported_ids": sorted(reported_ids),
+            "handoff": content,
+        })
         atomic_write(orchestrator_handoff_path(baton_dir), content)
     say(content.rstrip())
     say(worker_usage_sentence(tasks + archived_tasks))
@@ -2633,7 +3362,9 @@ def orchestrator_close_brief(
 def cmd_orchestrator_brief(args):
     require_orchestrator()
     baton_dir = require_baton_dir()
-    tasks = load_all_tasks(baton_dir, validate_history=args.phase != "close")
+    tasks = None
+    if args.phase != "close":
+        tasks = load_all_tasks(baton_dir)
     if args.include_log_tail and args.phase != "review":
         die("--include-log-tail is valid only for the review phase")
     if args.goal is not None and args.phase != "close":
@@ -2672,11 +3403,13 @@ def cmd_orchestrator_brief(args):
     elif args.phase == "run":
         orchestrator_run_brief(baton_dir, tasks)
     else:
-        archived_tasks = load_archived_tasks(baton_dir, validate_history=False)
         tree_state = working_tree_state(project_root(baton_dir))
-        orchestrator_close_brief(
-            baton_dir, tasks, archived_tasks, goal, avoid_notes, notes, tree_state,
-        )
+        with file_lock(lock_path(baton_dir, "scheduler")):
+            tasks = load_all_tasks(baton_dir, validate_history=False)
+            archived_tasks = load_archived_tasks(baton_dir, validate_history=False)
+            orchestrator_close_brief(
+                baton_dir, tasks, archived_tasks, goal, avoid_notes, notes, tree_state,
+            )
 
 
 def claude_code_hook_fragment():
@@ -2826,7 +3559,7 @@ def cmd_hook_event(args):
                     baton_dir, tasks, consume_handoff=False,
                 )
             else:
-                context = "Baton state:\n" + render_next_actions(baton_dir)
+                context = "Baton state:\n" + render_next_actions(baton_dir, tasks)
         if args.name == "session-start":
             output = captured_out.getvalue()
             if hook_input.get("source") == "compact":
@@ -3194,13 +3927,19 @@ def finalize_task(
         report_requires_sections):
     attempt = task.get("attempt", 1)
     submitted = None
+    submitted_digest = None
     path = result_path(baton_dir, task["id"], attempt)
     result_exists = os.path.exists(path)
     if result_exists:
         try:
+            submitted_digest = sha256_regular_file(path)
             submitted = read_json(path)
+            if sha256_regular_file(path) != submitted_digest:
+                submitted = None
+                submitted_digest = None
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             submitted = None
+            submitted_digest = None
     with task_lock(baton_dir, task["id"]):
         current = load_task(baton_dir, task["id"])
         runner = current.get("runner", {})
@@ -3225,13 +3964,7 @@ def finalize_task(
             status, note = "failed", "worker_error: " + outcome["error"]
         elif outcome.get("returncode") != 0 and not result_exists:
             status, note = "failed", "worker_exit_{}".format(outcome.get("returncode"))
-        elif (
-                not isinstance(submitted, dict)
-                or submitted.get("status") not in WORKER_FINAL
-                or not isinstance(submitted.get("note"), str)
-                or not isinstance(submitted.get("at"), str)
-                or submitted.get("lease") != lease
-                or declared_paths is None):
+        elif review_result_schema_problems(submitted) or submitted.get("lease") != lease:
             status, note = "failed", "invalid_worker_output"
         elif submitted["status"] == "needs_review" and not report_is_ready(
                 report_path(baton_dir, task["id"], attempt)):
@@ -3246,7 +3979,8 @@ def finalize_task(
         elif violations:
             status, note = "blocked", "scope_violation"
         elif (
-                {path.casefold() for path in declared_paths or []}
+                len(declared_paths or []) != len(observed_paths)
+                or {path.casefold() for path in declared_paths or []}
                 != {path.casefold() for path in observed_paths}):
             status, note = "failed", "changed_paths_mismatch"
         else:
@@ -3271,18 +4005,23 @@ def finalize_task(
         else:
             current.pop("scope_violations", None)
             current.pop("scope_baseline", None)
+        exit_details = {
+            "attempt": attempt,
+            "status": status,
+            "exit_code": outcome.get("returncode"),
+            "note": note,
+            "declared_paths": declared_paths,
+            "observed_paths": list(observed_paths),
+        }
+        if submitted_digest is not None:
+            exit_details["result_digest"] = "sha256:" + submitted_digest
         if warning:
+            exit_details["warning"] = warning
             record(
-                current, "worker_exited", status=status,
-                exit_code=outcome.get("returncode"), note=note, warning=warning,
-                declared_paths=declared_paths, observed_paths=list(observed_paths),
+                current, "worker_exited", **exit_details,
             )
         else:
-            record(
-                current, "worker_exited", status=status,
-                exit_code=outcome.get("returncode"), note=note,
-                declared_paths=declared_paths, observed_paths=list(observed_paths),
-            )
+            record(current, "worker_exited", **exit_details)
         save_task(baton_dir, current)
     say("[{}] {}{}".format(
         task["id"], status, " ({})".format(note) if note else "",
@@ -3358,7 +4097,7 @@ def run_wave(args, baton_dir, context):
         max_parallel, _timeout_minutes = configured_limits(config, args.max_parallel)
         report_requires_sections = configured_report_requires_sections(config)
         _, memory_text = read_memory(baton_dir)
-        memory_entries = memory_index_entries(memory_text)
+        memory_entries, _memory_bodies = memory_records(memory_text)
     except ValueError as error:
         die(str(error))
 
@@ -3837,14 +4576,22 @@ def task_problems(
     task_id = task.get("id")
     prefix = (task_id + ": ") if shape["id"] else "task state: "
     tier = None
+    report_requires_sections = False
     if config is not None and shape["tier"]:
         try:
             tier = configured_task_tier(config, task, tier_cache)
         except ValueError as error:
             problems.append(prefix + str(error))
+    if config is not None:
+        try:
+            report_requires_sections = configured_report_requires_sections(config)
+        except ValueError:
+            pass
     state_directory = archive_dir(baton_dir) if archived else tasks_dir(baton_dir)
     if shape["id"] and not os.path.exists(os.path.join(state_directory, task_id + ".json")):
         problems.append(prefix + "state filename does not match its id")
+    if archived and shape["status"] and task["status"] not in ("done", "cancelled"):
+        problems.append(prefix + "archived task status must be done or cancelled")
     dependencies = task.get("depends_on")
     if shape["depends_on"]:
         if len(dependencies) != len(set(dependencies)):
@@ -3870,9 +4617,27 @@ def task_problems(
     elif shape["status"] and runner:
         problems.append(prefix + "runner exists while task is not running")
     if (not archived and shape["id"] and shape["status"] and shape["attempt"]
-            and task["status"] == "needs_review"
-            and not report_is_ready(report_path(baton_dir, task_id, task["attempt"]))):
-        problems.append(prefix + "review report is missing or invalid")
+            and task["status"] == "needs_review"):
+        report = report_path(baton_dir, task_id, task["attempt"])
+        if not report_is_ready(report):
+            problems.append(prefix + "review report is missing or invalid")
+        for problem in report_gate_problems(
+                report, "needs_review", report_requires_sections):
+            problems.append(prefix + problem)
+        if shape["history"]:
+            try:
+                review_evidence_details(baton_dir, task)
+            except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+                problems.append(prefix + str(error))
+    elif (
+            shape["id"] and shape["status"] and shape["attempt"]
+            and task["status"] == "done" and shape["history"]
+            and latest_worker_exit(task).get("result_digest") is not None
+    ):
+        try:
+            review_evidence_details(baton_dir, task, archived=archived)
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+            problems.append(prefix + str(error))
     violations = task.get("scope_violations")
     if violations:
         if shape["status"] and task["status"] not in ("blocked", "failed"):
@@ -3893,6 +4658,518 @@ def task_problems(
             except (OSError, UnicodeDecodeError, ValueError) as error:
                 problems.append(str(error))
     return problems
+
+
+def archive_task_id_is_valid(task_id):
+    return (
+        isinstance(task_id, str)
+        and TASK_ID_RE.fullmatch(task_id) is not None
+        and int(task_id[1:task_id.index("-")]) > 0
+    )
+
+
+def task_requires_work_artifact(task):
+    history = task.get("history")
+    return isinstance(history, list) and any(
+        isinstance(entry, dict) and entry.get("event") == "launched"
+        for entry in history
+    )
+
+
+def task_requires_spec_artifact(task):
+    history = task.get("history")
+    return isinstance(history, list) and any(
+        isinstance(entry, dict) and entry.get("event") == "created"
+        for entry in history
+    )
+
+
+def archive_companion_ids(directory, suffix):
+    ids = set()
+    if not os.path.isdir(directory):
+        return ids
+    for name in os.listdir(directory):
+        if suffix and not name.endswith(suffix):
+            continue
+        task_id = name[:-len(suffix)] if suffix else name
+        if archive_task_id_is_valid(task_id):
+            ids.add(task_id)
+    return ids
+
+
+def archive_layout_problems(baton_dir, active, archived):
+    """Return read-only diagnostics for pending, split, and orphaned archives."""
+    problems = []
+    journal = archive_transaction_path(baton_dir)
+    if os.path.lexists(journal):
+        problems.append(
+            "archive transaction is pending at {}; run 'baton archive' to recover"
+            .format(journal)
+        )
+
+    active_by_id = {
+        task.get("id"): task for task in active
+        if archive_task_id_is_valid(task.get("id"))
+    }
+    archived_by_id = {
+        task.get("id"): task for task in archived
+        if archive_task_id_is_valid(task.get("id"))
+    }
+    active_ids = set(active_by_id)
+    archived_ids = set(archived_by_id)
+    active_markdown = archive_companion_ids(tasks_dir(baton_dir), ".md")
+    active_work = archive_companion_ids(work_dir(baton_dir), "")
+    archived_markdown = archive_companion_ids(archive_dir(baton_dir), ".md")
+    archived_work = archive_companion_ids(archive_dir(baton_dir), ".work")
+
+    companion_groups = (
+        (active_markdown, tasks_dir(baton_dir), ".md", stat.S_ISREG, "task spec"),
+        (active_work, work_dir(baton_dir), "", stat.S_ISDIR, "work"),
+        (archived_markdown, archive_dir(baton_dir), ".md", stat.S_ISREG,
+         "archived task spec"),
+        (archived_work, archive_dir(baton_dir), ".work", stat.S_ISDIR,
+         "archived work"),
+    )
+    for task_ids, directory, suffix, expected_type, label in companion_groups:
+        for task_id in sorted(task_ids):
+            path = os.path.join(directory, task_id + suffix)
+            try:
+                path_stat = os.lstat(path)
+            except OSError as error:
+                problems.append("{}: cannot inspect {}: {}".format(task_id, label, error))
+            else:
+                if not expected_type(path_stat.st_mode):
+                    problems.append("{}: {} has an unexpected type".format(task_id, label))
+
+    for task_id in sorted(active_ids & (archived_markdown | archived_work)):
+        problems.append(
+            "{}: active task state has archived companion artifacts".format(task_id)
+        )
+    for task_id in sorted(archived_ids & (active_markdown | active_work)):
+        problems.append(
+            "{}: archived task state has active companion artifacts".format(task_id)
+        )
+    for task_id in sorted(active_markdown - active_ids):
+        problems.append(
+            "{}: active task spec has no corresponding active state".format(task_id)
+        )
+    for task_id in sorted(active_work - active_ids):
+        problems.append(
+            "{}: active work has no corresponding active state".format(task_id)
+        )
+    for task_id in sorted(archived_markdown - archived_ids):
+        problems.append(
+            "{}: archived task spec has no corresponding archived state".format(task_id)
+        )
+    for task_id in sorted(archived_work - archived_ids):
+        problems.append(
+            "{}: archived work has no corresponding archived state".format(task_id)
+        )
+    for task_id, task in sorted(archived_by_id.items()):
+        if task_requires_spec_artifact(task) and task_id not in archived_markdown:
+            problems.append("{}: archived task spec is missing".format(task_id))
+        if task_requires_work_artifact(task) and task_id not in archived_work:
+            problems.append("{}: required archived work is missing".format(task_id))
+    for task_id, task in sorted(active_by_id.items()):
+        if task_requires_work_artifact(task) and task_id not in active_work:
+            problems.append("{}: required active work is missing".format(task_id))
+    return problems
+
+
+def archive_artifact(task_id, source, destination, kind):
+    return {
+        "task_id": task_id,
+        "source": source,
+        "destination": destination,
+        "kind": kind,
+    }
+
+
+def archive_artifact_path(baton_dir, relative_path):
+    return os.path.join(baton_dir, *relative_path.split("/"))
+
+
+def require_archive_artifact_type(path, kind, required=False):
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            raise ValueError("required archive artifact is missing: {}".format(path))
+        return False
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ValueError("archive transaction artifact is a symlink: {}".format(path))
+    expected = stat.S_ISREG if kind == "file" else stat.S_ISDIR
+    if not expected(path_stat.st_mode):
+        raise ValueError(
+            "archive transaction artifact has unexpected type: {}".format(path)
+        )
+    return True
+
+
+def build_archive_transaction(baton_dir, tasks):
+    artifacts = []
+    task_ids = []
+    for task in tasks:
+        task_id = task["id"]
+        task_ids.append(task_id)
+        entries = (
+            archive_artifact(
+                task_id, "tasks/" + task_id + ".json",
+                "archive/" + task_id + ".json", "file",
+            ),
+            archive_artifact(
+                task_id, "tasks/" + task_id + ".md",
+                "archive/" + task_id + ".md", "file",
+            ),
+        )
+        for artifact in entries:
+            source = archive_artifact_path(baton_dir, artifact["source"])
+            require_archive_artifact_type(source, artifact["kind"], required=True)
+            artifacts.append(artifact)
+        source_work = work_dir(baton_dir, task_id)
+        if os.path.lexists(source_work):
+            require_archive_artifact_type(source_work, "directory", required=True)
+            artifacts.append(archive_artifact(
+                task_id, "work/" + task_id,
+                "archive/" + task_id + ".work", "directory",
+            ))
+        elif task_requires_work_artifact(task):
+            raise ValueError(
+                "cannot archive {}: required work artifact is missing".format(task_id)
+            )
+    transaction = {"version": 1, "tasks": task_ids, "artifacts": artifacts}
+    validate_archive_transaction(transaction)
+    for artifact in artifacts:
+        destination = archive_artifact_path(baton_dir, artifact["destination"])
+        if os.path.lexists(destination):
+            raise ValueError("archive destination already exists: {}".format(destination))
+    return transaction
+
+
+def validate_archive_transaction(transaction):
+    problem = "archive transaction journal is invalid"
+    if not isinstance(transaction, dict) or set(transaction) != {
+            "version", "tasks", "artifacts"}:
+        raise ValueError(problem + ": unexpected top-level shape")
+    if type(transaction["version"]) is not int or transaction["version"] != 1:
+        raise ValueError(problem + ": unsupported version")
+    task_ids = transaction["tasks"]
+    artifacts = transaction["artifacts"]
+    if (
+            not isinstance(task_ids, list) or not task_ids
+            or any(not archive_task_id_is_valid(item) for item in task_ids)
+            or len(task_ids) != len(set(task_ids))):
+        raise ValueError(problem + ": task list is missing or invalid")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError(problem + ": artifact list is missing or invalid")
+    required_by_task = {
+        task_id: {
+            ("tasks/" + task_id + ".json", "archive/" + task_id + ".json", "file"),
+            ("tasks/" + task_id + ".md", "archive/" + task_id + ".md", "file"),
+        }
+        for task_id in task_ids
+    }
+    seen = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {
+                "task_id", "source", "destination", "kind"}:
+            raise ValueError(problem + ": artifact entry has an unexpected shape")
+        task_id = artifact["task_id"]
+        triple = (
+            artifact["source"], artifact["destination"], artifact["kind"],
+        )
+        allowed = required_by_task.get(task_id, set()) | ({
+            ("work/" + task_id, "archive/" + task_id + ".work", "directory")
+        } if task_id in required_by_task else set())
+        if triple not in allowed:
+            raise ValueError(problem + ": artifact paths are not trusted")
+        key = (task_id,) + triple
+        if key in seen:
+            raise ValueError(problem + ": duplicate artifact entry")
+        seen.add(key)
+    for task_id, required in required_by_task.items():
+        present = {item[1:] for item in seen if item[0] == task_id}
+        if not required.issubset(present):
+            raise ValueError(problem + ": required task artifacts are missing")
+    return transaction
+
+
+def read_archive_transaction(baton_dir):
+    journal = archive_transaction_path(baton_dir)
+    try:
+        transaction = read_json(journal)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "cannot recover pending archive transaction at {}: {}"
+            .format(journal, error)
+        ) from error
+    try:
+        return validate_archive_transaction(transaction)
+    except ValueError as error:
+        raise ValueError(
+            "cannot recover pending archive transaction at {}: {}"
+            .format(journal, error)
+        ) from error
+
+
+def archive_artifact_state(baton_dir, artifact):
+    source = archive_artifact_path(baton_dir, artifact["source"])
+    destination = archive_artifact_path(baton_dir, artifact["destination"])
+    source_exists = require_archive_artifact_type(source, artifact["kind"])
+    destination_exists = require_archive_artifact_type(destination, artifact["kind"])
+    if source_exists == destination_exists:
+        detail = "both source and destination exist" if source_exists else (
+            "neither source nor destination exists"
+        )
+        raise ValueError(
+            "archive transaction is ambiguous for {}: {}; journal preserved at {}"
+            .format(artifact["task_id"], detail, archive_transaction_path(baton_dir))
+        )
+    return source, destination, source_exists
+
+
+def archive_transaction_task(baton_dir, transaction, task_id):
+    """Load one transaction task from its unique, trusted JSON location."""
+    artifact = next(
+        artifact for artifact in transaction["artifacts"]
+        if artifact["task_id"] == task_id
+        and artifact["source"] == "tasks/" + task_id + ".json"
+    )
+    source, destination, source_exists = archive_artifact_state(baton_dir, artifact)
+    path = source if source_exists else destination
+    try:
+        task = require_loaded_task_shape(
+            read_json(path), path, validate_history_fields=True,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(
+            "archive transaction task state is invalid for {} at {}: {}; "
+            "journal preserved at {}".format(
+                task_id, path, error, archive_transaction_path(baton_dir),
+            )
+        ) from error
+    if task.get("id") != task_id:
+        raise ValueError(
+            "archive transaction task identity is invalid for {} at {}; "
+            "journal preserved at {}".format(
+                task_id, path, archive_transaction_path(baton_dir),
+            )
+        )
+    if task.get("status") not in ("done", "cancelled"):
+        raise ValueError(
+            "archive transaction task lifecycle is invalid for {} at {}; "
+            "journal preserved at {}".format(
+                task_id, path, archive_transaction_path(baton_dir),
+            )
+        )
+    return task
+
+
+def validate_archive_transaction_topology(baton_dir, transaction):
+    """Reject journal work entries that disagree with the preserved topology."""
+    journal = archive_transaction_path(baton_dir)
+    work_task_ids = {
+        artifact["task_id"] for artifact in transaction["artifacts"]
+        if artifact["kind"] == "directory"
+    }
+    for task_id in transaction["tasks"]:
+        task = archive_transaction_task(baton_dir, transaction, task_id)
+        active_path = work_dir(baton_dir, task_id)
+        archived_path = os.path.join(archive_dir(baton_dir), task_id + ".work")
+        active_exists = require_archive_artifact_type(active_path, "directory")
+        archived_exists = require_archive_artifact_type(archived_path, "directory")
+        if active_exists and archived_exists:
+            detail = "both active and archived work exist"
+        elif task_requires_work_artifact(task) and task_id not in work_task_ids:
+            detail = (
+                "the canonical work artifact entry is missing"
+                if active_exists or archived_exists else
+                "the canonical required work artifact entry is missing"
+            )
+        elif task_requires_work_artifact(task) and not (
+                active_exists or archived_exists):
+            detail = "the required work artifact is missing"
+        elif active_exists or archived_exists:
+            if task_id in work_task_ids:
+                continue
+            detail = "the canonical work artifact entry is missing"
+        elif task_id in work_task_ids:
+            detail = "the work artifact entry has no active or archived work"
+        else:
+            continue
+        raise ValueError(
+            "archive transaction work topology is invalid for {}: {}; "
+            "journal preserved at {}".format(task_id, detail, journal)
+        )
+
+
+def bind_atomic_archive_rename(platform_name, library):
+    """Bind the platform's atomic no-replace rename and return its call shape."""
+    if platform_name.startswith("linux"):
+        try:
+            operation = library.renameat2
+        except AttributeError:
+            return None, "libc renameat2 is unavailable"
+        operation.argtypes = (
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        operation.restype = ctypes.c_int
+
+        def rename_no_replace(source, destination):
+            return operation(-100, source, -100, destination, 1)
+
+        return rename_no_replace, "renameat2(RENAME_NOREPLACE)"
+    if platform_name == "darwin":
+        try:
+            operation = library.renamex_np
+        except AttributeError:
+            return None, "libc renamex_np is unavailable"
+        operation.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        operation.restype = ctypes.c_int
+
+        def rename_no_replace(source, destination):
+            return operation(source, destination, 0x00000004)
+
+        return rename_no_replace, "renamex_np(RENAME_EXCL)"
+    return None, "unsupported operating system {}".format(platform_name)
+
+
+try:
+    ATOMIC_ARCHIVE_RENAME_LIBRARY = ctypes.CDLL(None, use_errno=True)
+except OSError as error:
+    ATOMIC_ARCHIVE_RENAME_LIBRARY = None
+    ATOMIC_ARCHIVE_RENAME = None
+    ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC = "cannot load the process C library: {}".format(
+        error
+    )
+else:
+    ATOMIC_ARCHIVE_RENAME, ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC = (
+        bind_atomic_archive_rename(sys.platform, ATOMIC_ARCHIVE_RENAME_LIBRARY)
+    )
+
+
+def archive_atomic_rename_boundary(_source, _destination):
+    """Test probe immediately before the atomic no-replace operation."""
+
+
+def atomic_archive_rename_no_replace(source, destination):
+    """Atomically move one archive artifact without replacing any destination."""
+    try:
+        source_bytes = os.fsencode(source)
+        destination_bytes = os.fsencode(destination)
+    except TypeError as error:
+        raise TypeError("archive move paths must be path-like values") from error
+    for label, path, encoded in (
+            ("source", source, source_bytes),
+            ("destination", destination, destination_bytes)):
+        if not encoded:
+            raise ValueError("archive move {} path must not be empty".format(label))
+        if b"\0" in encoded:
+            raise ValueError(
+                "archive move {} path must not contain a null byte".format(label)
+            )
+    if ATOMIC_ARCHIVE_RENAME is None:
+        raise RuntimeError(
+            "atomic no-replace archive move is unavailable ({}); refusing to "
+            "move {} to {}".format(
+                ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC, source, destination,
+            )
+        )
+
+    archive_atomic_rename_boundary(source, destination)
+    ctypes.set_errno(0)
+    result = ATOMIC_ARCHIVE_RENAME(source_bytes, destination_bytes)
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if result != -1 or not error_number:
+        raise RuntimeError(
+            "atomic no-replace archive move returned an invalid native result "
+            "for {} to {} using {}".format(
+                source, destination, ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC,
+            )
+        )
+    if error_number == errno.EEXIST:
+        raise ValueError(
+            "refusing to overwrite archive transaction destination: {}"
+            .format(destination)
+        )
+    unavailable_errors = {
+        errno.EINVAL, errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    if error_number in unavailable_errors:
+        raise RuntimeError(
+            "atomic no-replace archive move is unavailable on this filesystem "
+            "using {}; refusing to move {} to {}: {}".format(
+                ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC, source, destination,
+                os.strerror(error_number),
+            )
+        )
+    raise OSError(
+        error_number,
+        "atomic no-replace archive move failed from {} to {} using {}: {}".format(
+            source, destination, ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC,
+            os.strerror(error_number),
+        ),
+        source,
+        None,
+        destination,
+    )
+
+
+def durable_archive_rename(source, destination):
+    if os.path.lexists(destination):
+        raise ValueError(
+            "refusing to overwrite archive transaction destination: {}"
+            .format(destination)
+        )
+    atomic_archive_rename_no_replace(source, destination)
+    for directory in dict.fromkeys((os.path.dirname(source), os.path.dirname(destination))):
+        sync_directory(directory)
+
+
+def archive_transaction_boundary(_name):
+    """Test probe after each durable journal or artifact boundary."""
+
+
+def complete_archive_transaction(baton_dir, transaction):
+    states = [
+        archive_artifact_state(baton_dir, artifact)
+        for artifact in transaction["artifacts"]
+    ]
+    for index, (artifact, state) in enumerate(zip(transaction["artifacts"], states)):
+        source, destination, source_exists = state
+        if source_exists:
+            durable_archive_rename(source, destination)
+            archive_transaction_boundary("move-{}".format(index))
+
+
+def remove_archive_transaction(baton_dir):
+    journal = archive_transaction_path(baton_dir)
+    os.unlink(journal)
+    sync_directory(baton_dir)
+    archive_transaction_boundary("journal-removed")
+
+
+def rollback_archive_transaction(baton_dir, transaction):
+    for artifact in reversed(transaction["artifacts"]):
+        source, destination, source_exists = archive_artifact_state(baton_dir, artifact)
+        if not source_exists:
+            durable_archive_rename(destination, source)
+    remove_archive_transaction(baton_dir)
+
+
+def recover_archive_transaction(baton_dir):
+    if not os.path.lexists(archive_transaction_path(baton_dir)):
+        return False
+    transaction = read_archive_transaction(baton_dir)
+    validate_archive_transaction_topology(baton_dir, transaction)
+    complete_archive_transaction(baton_dir, transaction)
+    remove_archive_transaction(baton_dir)
+    return True
 
 
 def cmd_validate(args):
@@ -3965,7 +5242,7 @@ def cmd_validate(args):
                         problems.append(prefix + str(error))
     try:
         _, memory_text = read_memory(baton_dir)
-        memory_entries = memory_index_entries(memory_text)
+        memory_entries, _memory_bodies = memory_records(memory_text)
     except (OSError, UnicodeDecodeError, ValueError) as error:
         problems.append("memory: {}".format(error))
     try:
@@ -3974,6 +5251,7 @@ def cmd_validate(args):
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
         say("PROBLEM: cannot read task state: {}".format(error))
         raise SystemExit(1) from error
+    problems.extend(archive_layout_problems(baton_dir, active, archived))
     all_tasks = active + archived
     shapes = [task_validation_shape(task) for task in all_tasks]
     active_pairs = list(zip(active, shapes[:len(active)]))
@@ -4046,38 +5324,33 @@ def cmd_archive(args):
     destination = archive_dir(baton_dir)
     os.makedirs(destination, exist_ok=True)
     with file_lock(lock_path(baton_dir, "scheduler")):
-        eligible = [
-            task for task in load_all_tasks(baton_dir)
-            if task["status"] in ("done", "cancelled")
-        ]
-        plan = []
-        for task in eligible:
-            task_id = task["id"]
-            for source in (
-                    task_json_path(baton_dir, task_id),
-                    task_md_path(baton_dir, task_id)):
-                if os.path.exists(source):
-                    plan.append((source, os.path.join(destination, os.path.basename(source))))
-            source_work = work_dir(baton_dir, task_id)
-            if os.path.isdir(source_work):
-                plan.append((source_work, os.path.join(destination, task_id + ".work")))
-        for _source, target in plan:
-            if os.path.lexists(target):
-                die("archive destination already exists: {}".format(target))
         blocked_signals = {signal.SIGINT, signal.SIGTERM}
         if hasattr(signal, "SIGHUP"):
             blocked_signals.add(signal.SIGHUP)
         previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
-        completed = []
         try:
-            for source, target in plan:
-                shutil.move(source, target)
-                completed.append((source, target))
-        except BaseException:
-            for source, target in reversed(completed):
-                with suppress(OSError):
-                    shutil.move(target, source)
-            raise
+            recover_archive_transaction(baton_dir)
+            eligible = [
+                task for task in load_all_tasks(baton_dir)
+                if task["status"] in ("done", "cancelled")
+            ]
+            if eligible:
+                transaction = build_archive_transaction(baton_dir, eligible)
+                atomic_json(archive_transaction_path(baton_dir), transaction)
+                try:
+                    archive_transaction_boundary("journal-created")
+                    complete_archive_transaction(baton_dir, transaction)
+                except BaseException as error:
+                    try:
+                        rollback_archive_transaction(baton_dir, transaction)
+                    except BaseException as rollback_error:
+                        raise RuntimeError(
+                            "archive failed and durable rollback could not complete; "
+                            "pending journal preserved at {}: {}"
+                            .format(archive_transaction_path(baton_dir), rollback_error)
+                        ) from error
+                    raise
+                remove_archive_transaction(baton_dir)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     say("archived %d task(s)" % len(eligible))
@@ -4130,11 +5403,155 @@ def memory_index_entries(text):
     return entries
 
 
+def memory_entries_heading(text):
+    """Return the structural Entries heading that immediately follows the index."""
+    index_heading = re.search(r"^## Index[ \t]*$", text, re.MULTILINE)
+    if not index_heading:
+        return None
+    following = re.search(
+        r"^## [^\n]+[ \t]*$", text[index_heading.end():], re.MULTILINE,
+    )
+    if not following or not re.fullmatch(
+            r"## Entries[ \t]*", following.group(0)):
+        return None
+    start = index_heading.end() + following.start()
+    end = index_heading.end() + following.end()
+    return (start, end)
+
+
+def memory_records(text):
+    """Validate index/body parity and return ordered index entries and rendered bodies."""
+    index_headings = list(re.finditer(r"^## Index[ \t]*$", text, re.MULTILINE))
+    entries_headings = list(re.finditer(r"^## Entries[ \t]*$", text, re.MULTILINE))
+    if len(index_headings) != 1:
+        raise ValueError(
+            "malformed memory structure: expected exactly one '## Index' section"
+        )
+    if len(entries_headings) > 1:
+        raise ValueError(
+            "malformed memory structure: duplicate '## Entries' sections"
+        )
+
+    index_heading = index_headings[0]
+    following = re.search(
+        r"^## [^\n]+[ \t]*$", text[index_heading.end():], re.MULTILINE,
+    )
+    entries_heading = entries_headings[0] if entries_headings else None
+    if entries_heading is not None and (
+            entries_heading.start() < index_heading.end()
+            or following is None
+            or index_heading.end() + following.start() != entries_heading.start()):
+        raise ValueError(
+            "malformed memory structure: '## Entries' must be the first level-2 "
+            "section after '## Index'"
+        )
+    if entries_heading is None and following is not None:
+        raise ValueError(
+            "malformed memory structure: noncanonical section between '## Index' "
+            "and '## Entries'"
+        )
+
+    entry_heading_pattern = re.compile(
+        r"^### (M\d{3,})(?:[ \t]+[^\n]*)?[ \t]*$", re.MULTILINE,
+    )
+    entry_like_headings = list(re.finditer(r"^### M[^\n]*$", text, re.MULTILINE))
+    malformed_entry_lines = [
+        text.count("\n", 0, heading.start()) + 1
+        for heading in entry_like_headings
+        if entry_heading_pattern.fullmatch(heading.group(0)) is None
+    ]
+    if malformed_entry_lines:
+        raise ValueError(
+            "malformed memory structure: invalid full entry headings at lines "
+            + ", ".join(str(line) for line in malformed_entry_lines)
+        )
+    all_body_headings = list(entry_heading_pattern.finditer(text))
+    orphaned_before_entries = [
+        heading.group(1) for heading in all_body_headings
+        if entries_heading is None or heading.start() < entries_heading.end()
+    ]
+    if orphaned_before_entries:
+        raise ValueError(
+            "malformed memory structure: orphan full entry headings outside "
+            "'## Entries': " + ", ".join(orphaned_before_entries)
+        )
+
+    try:
+        entries = memory_index_entries(text)
+    except ValueError as error:
+        raise ValueError("malformed memory structure: " + str(error)) from None
+    index_by_id = {entry[0]: entry for entry in entries}
+    if not entries_heading:
+        if entries:
+            raise ValueError(
+                "malformed memory structure: memory full entries are missing for "
+                "indexed ids: "
+                + ", ".join(entry[0] for entry in entries)
+            )
+        return entries, {}
+
+    heading_end = entries_heading.end()
+    section = text[heading_end:]
+    headings = list(re.finditer(
+        r"^### (M\d{3,})(?:[ \t]+[^\n]*)?[ \t]*$", section, re.MULTILINE,
+    ))
+    parsed = {}
+    ordered_body_ids = []
+    mismatched = set()
+    duplicates = set()
+    heading_pattern = re.compile(
+        r"### (M\d{3,}) \[([WOB])\] (\S(?:.*\S)?)[ \t]*"
+    )
+    for position, heading in enumerate(headings):
+        memory_id = heading.group(1)
+        if memory_id in parsed:
+            duplicates.add(memory_id)
+        else:
+            ordered_body_ids.append(memory_id)
+        body_end = (
+            headings[position + 1].start()
+            if position + 1 < len(headings) else len(section)
+        )
+        metadata = heading_pattern.fullmatch(heading.group(0))
+        indexed = index_by_id.get(memory_id)
+        if metadata is None or indexed is None or metadata.groups() != indexed:
+            if indexed is not None:
+                mismatched.add(memory_id)
+        parsed.setdefault(memory_id, section[heading.start():body_end].strip())
+
+    missing = [memory_id for memory_id, _audience, _summary in entries
+               if memory_id not in parsed]
+    orphaned = [
+        memory_id for memory_id in ordered_body_ids if memory_id not in index_by_id
+    ]
+    problems = []
+    if missing:
+        problems.append("missing full entries for indexed ids: " + ", ".join(missing))
+    if mismatched:
+        problems.append("mismatched full entry headings for ids: " + ", ".join(
+            memory_id for memory_id, _audience, _summary in entries
+            if memory_id in mismatched
+        ))
+    if duplicates:
+        problems.append("duplicate full entry headings for ids: " + ", ".join(
+            memory_id for memory_id in ordered_body_ids if memory_id in duplicates
+        ))
+    if orphaned:
+        problems.append("orphan full entry headings for ids: " + ", ".join(orphaned))
+    if problems:
+        raise ValueError(
+            "malformed memory structure: memory index/body mismatch: "
+            + "; ".join(problems)
+        )
+    return entries, parsed
+
+
 def cmd_memory_index(args):
     baton_dir = require_baton_dir()
     _, text = read_memory(baton_dir)
     audience = {"worker": "W", "orchestrator": "O"}.get(args.audience)
-    for entry in memory_index_entries(text):
+    entries, _memory_bodies = memory_records(text)
+    for entry in entries:
         if audience is None or entry[1] in (audience, "B"):
             say("{} [{}] {}".format(*entry))
 
@@ -4142,24 +5559,14 @@ def cmd_memory_index(args):
 def cmd_memory_show(args):
     baton_dir = require_baton_dir()
     _, text = read_memory(baton_dir)
+    entries, bodies = memory_records(text)
     indexed = next(
-        (entry for entry in memory_index_entries(text) if entry[0] == args.id),
+        (entry for entry in entries if entry[0] == args.id),
         None,
     )
     if indexed is None:
         die("no memory entry {}".format(args.id))
-    memory_id, audience, summary = indexed
-    heading = re.search(
-        r"^### {} \[{}\] {}[ \t]*$".format(
-            re.escape(memory_id), audience, re.escape(summary),
-        ),
-        text, re.MULTILINE,
-    )
-    if heading is None:
-        die("indexed memory entry {} is missing or invalid".format(args.id))
-    following = re.search(r"^### M", text[heading.end():], re.MULTILINE)
-    end = heading.end() + following.start() if following else len(text)
-    say(text[heading.start():end].strip())
+    say(bodies[args.id])
 
 
 def cmd_memory_add(args):
@@ -4176,22 +5583,26 @@ def cmd_memory_add(args):
         die("memory body must not contain an entry heading beginning with `### M`")
     with file_lock(lock_path(baton_dir, "memory")):
         path, text = read_memory(baton_dir)
-        entries = memory_index_entries(text)
+        entries, _memory_bodies = memory_records(text)
         tag = {"worker": "W", "orchestrator": "O", "both": "B"}[args.audience]
         numbers = [int(memory_id[1:]) for memory_id, _audience, _summary in entries] or [0]
         memory_id = "M%03d" % (max(numbers) + 1)
         index_line = "- {} [{}] {}".format(memory_id, tag, args.summary)
         entry = "### {} [{}] {}\n{}\n".format(memory_id, tag, args.summary, args.body)
-        if "## Entries" in text:
-            head, marker, tail = text.partition("## Entries")
-            text = head.rstrip() + "\n" + index_line + "\n\n" + marker
-            if tail.strip():
-                text += tail.rstrip() + "\n\n"
+        entries_heading = memory_entries_heading(text)
+        if entries_heading:
+            heading_start, heading_end = entries_heading
+            head = text[:heading_start]
+            marker_and_tail = text[heading_start:]
+            text = head.rstrip() + "\n" + index_line + "\n\n" + marker_and_tail
+            if marker_and_tail[heading_end - heading_start:].strip():
+                text = text.rstrip() + "\n\n"
             else:
                 text += "\n\n"
             text += entry
         else:
             text = text.rstrip() + "\n" + index_line + "\n\n## Entries\n\n" + entry
+        memory_records(text)
         atomic_write(path, text)
     say("added {}".format(memory_id))
 

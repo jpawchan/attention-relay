@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import platform
@@ -18,6 +19,9 @@ from types import SimpleNamespace
 
 TASKS = 500
 ARCHIVED = 500
+BATON_ENVIRONMENT_KEYS = (
+    "BATON_TASK_ID", "BATON_ATTEMPT", "BATON_LEASE", "BATON_DIR", "BATON_ROOT",
+)
 RECEIPT = {
     "task_id": "",
     "attempt": 1,
@@ -55,14 +59,36 @@ Use M001 M002 M003 M004 M005 M006.
 """
 
 
+def benchmark_environment(overrides=None):
+    environment = os.environ.copy()
+    for key in BATON_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    if overrides:
+        environment.update({key: str(value) for key, value in overrides.items()})
+    return environment
+
+
 def run_checked(argv, cwd, env=None):
     result = subprocess.run(
-        [str(item) for item in argv], cwd=cwd, env=env,
+        [str(item) for item in argv], cwd=cwd,
+        env=benchmark_environment(env),
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE, text=True,
     )
     if result.returncode:
         raise RuntimeError("{} failed: {}".format(" ".join(map(str, argv)), result.stderr))
+
+
+def suite_environment(base):
+    """Give only the copied suite an explicit Python matching this process."""
+    environment = os.environ.copy()
+    for key in BATON_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    shim_dir = base / "suite-python"
+    shim_dir.mkdir()
+    (shim_dir / "python3").symlink_to(sys.executable)
+    environment["PATH"] = str(shim_dir) + os.pathsep + environment.get("PATH", "")
+    return environment
 
 
 def git_project(path):
@@ -81,7 +107,7 @@ def task_value(task_id, status="queued", history=None):
         "title": "benchmark task " + task_id,
         "status": status,
         "attempt": 1,
-        "tier": "default",
+        "tier": "benchmark",
         "scope": ["src/{}/**".format(task_id)],
         "depends_on": [],
         "created_at": "2026-01-01T00:00:00Z",
@@ -90,11 +116,75 @@ def task_value(task_id, status="queued", history=None):
     }
 
 
+def finalized_evidence(task_id):
+    """Build deterministic, nontrivial review evidence for one archived task."""
+    changed_path = "src/{}/benchmark-output.txt".format(task_id)
+    lease = "benchmark-{}-attempt-1".format(task_id)
+    note = "benchmark evidence ready"
+    result = {
+        "status": "needs_review",
+        "note": note,
+        "at": "2026-01-01T00:00:01Z",
+        "lease": lease,
+        "changed_paths": [changed_path],
+    }
+    result_text = json.dumps(result, sort_keys=True) + "\n"
+    report_lines = [
+        "# {} finalized benchmark report".format(task_id),
+        "",
+        "## Result",
+        "needs_review",
+        "",
+        "## Changes",
+        "- Generated deterministic review evidence for `{}`.".format(changed_path),
+        "- Preserved lifecycle, attempt, lease, and changed-path attribution.",
+        "",
+        "## Verification",
+    ]
+    report_lines.extend(
+        "- Evidence check {:02d}: result, report, and diff metadata agree for {}."
+        .format(index, task_id)
+        for index in range(1, 25)
+    )
+    report_lines.extend((
+        "",
+        "## Decisions and risks",
+        "- The fixture is synthetic, deterministic, and requires no network access.",
+        "",
+    ))
+    diff_lines = [
+        "diff --git a/{0} b/{0}".format(changed_path),
+        "new file mode 100644",
+        "index 0000000..{:07x}".format(int(task_id[1:5])),
+        "--- /dev/null",
+        "+++ b/{}".format(changed_path),
+        "@@ -0,0 +1,48 @@",
+    ]
+    diff_lines.extend(
+        "+{} benchmark review payload line {:02d}: ".format(task_id, index)
+        + "deterministic finalized evidence exercises hashing and artifact reads"
+        for index in range(1, 49)
+    )
+    return {
+        "changed_path": changed_path,
+        "lease": lease,
+        "note": note,
+        "result": result_text,
+        "result_digest": "sha256:" + hashlib.sha256(result_text.encode()).hexdigest(),
+        "report": "\n".join(report_lines),
+        "diff": "\n".join(diff_lines) + "\n",
+    }
+
+
 def prepare_fixture(source, base):
     project = base / "project"
     git_project(project)
     run_checked((source, "init", project), project)
     runtime = project / ".baton"
+    with (runtime / "config.toml").open("a", encoding="utf-8") as config:
+        config.write(
+            '\n[tiers.benchmark]\ncommand = "/usr/bin/true {prompt_file}"\n'
+        )
     memory_lines = [
         "- M{:03d} [W] Benchmark memory summary {}".format(index, index)
         for index in range(1, 7)
@@ -126,23 +216,36 @@ def prepare_fixture(source, base):
         (receipt_dir / "attempt-1.briefs.json").write_text(json.dumps(receipt) + "\n")
     for number in range(TASKS + 1, TASKS + ARCHIVED + 1):
         task_id = "T{:04d}-benchmark".format(number)
+        evidence = finalized_evidence(task_id)
         history = [
             {
                 "at": "2026-01-01T00:00:00Z", "event": "launched",
                 "attempt": 1, "capsule_chars": 700 + number % 200,
+                "lease": evidence["lease"],
             },
             {
-                "at": "2026-01-01T00:00:01Z", "event": "worker_exited",
-                "status": "failed", "note": "worker_timeout",
+                "at": "2026-01-01T00:00:02Z", "event": "worker_exited",
+                "attempt": 1, "status": "needs_review", "exit_code": 0,
+                "note": evidence["note"],
+                "declared_paths": [evidence["changed_path"]],
+                "observed_paths": [evidence["changed_path"]],
+                "result_digest": evidence["result_digest"],
+            },
+            {
+                "at": "2026-01-01T00:00:03Z", "event": "accepted",
+                "note": "benchmark fixture",
             },
         ]
         (archive / (task_id + ".json")).write_text(
-            json.dumps(task_value(task_id, status="failed", history=history)) + "\n"
+            json.dumps(task_value(task_id, status="done", history=history)) + "\n"
         )
         receipt_dir = archive / (task_id + ".work")
         receipt_dir.mkdir()
         receipt = dict(RECEIPT, task_id=task_id)
         (receipt_dir / "attempt-1.briefs.json").write_text(json.dumps(receipt) + "\n")
+        (receipt_dir / "attempt-1.result.json").write_text(evidence["result"])
+        (receipt_dir / "attempt-1.report.md").write_text(evidence["report"])
+        (receipt_dir / "attempt-1.diff").write_text(evidence["diff"])
     tracked = project / "tracked"
     tracked.mkdir()
     for number in range(300):
@@ -170,9 +273,7 @@ def measured_rss(argv, cwd, env=None):
         "print(repr((time.perf_counter()-started,usage.ru_utime+usage.ru_stime,usage.ru_maxrss)))\n"
         "raise SystemExit(os.waitstatus_to_exitcode(status))\n"
     )
-    merged = os.environ.copy()
-    if env:
-        merged.update(env)
+    merged = benchmark_environment(env)
     result = subprocess.run(
         [sys.executable, "-c", script, str(cwd), *map(str, argv)],
         env=merged, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -263,10 +364,6 @@ def hot_path_benchmarks(source, project, base, samples):
     create_project = base / "task-create-project"
     shutil.copytree(project, create_project)
     runtime = create_project / ".baton"
-    with (runtime / "config.toml").open("a", encoding="utf-8") as config:
-        config.write(
-            '\n[tiers.benchmark]\ncommand = "/usr/bin/true {prompt_file}"\n'
-        )
     globals_dict = module["cmd_task_create"].__globals__
     original_load = globals_dict["load_tasks_from"]
     original_require_orchestrator = globals_dict["require_orchestrator"]
@@ -320,10 +417,13 @@ def main():
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--suite-samples", type=int, default=3)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output", "--json-out", dest="output", type=Path)
     parser.add_argument("--skip-suite", action="store_true")
     parser.add_argument("--hot-paths-only", action="store_true")
+    parser.add_argument("--mode", choices=("full", "hot"))
     args = parser.parse_args()
+    if args.mode == "hot":
+        args.hot_paths_only = True
     source = args.source.resolve()
     repo = args.repo.resolve()
     results = {
@@ -349,7 +449,7 @@ def main():
             print(encoded, end="")
             return
         installed = project / ".baton" / "baton"
-        env = dict(os.environ, BATON_DIR=str(project / ".baton"))
+        env = benchmark_environment({"BATON_DIR": project / ".baton"})
         suite_repo = base / "suite"
         shutil.copytree(
             repo, suite_repo,
@@ -402,8 +502,10 @@ def main():
         )
 
         if not args.skip_suite:
+            suite_env = suite_environment(base)
             suite_command = lambda: (
-                (sys.executable, suite_repo / "tests" / "test_baton.py"), suite_repo, None,
+                (sys.executable, suite_repo / "tests" / "test_baton.py"),
+                suite_repo, suite_env,
             )
             results["benchmarks"]["full_test_suite"] = benchmark(
                 "full_test_suite", suite_command, args.suite_samples, warmups=0,

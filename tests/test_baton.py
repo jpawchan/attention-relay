@@ -8,20 +8,34 @@ import os
 import re
 import runpy
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_BATON = ROOT / "framework" / "baton"
 AUTHOR_EMAIL = "78247292+jpawchan@users.noreply.github.com"
+BATON_ENVIRONMENT_KEYS = (
+    "BATON_TASK_ID", "BATON_ATTEMPT", "BATON_LEASE", "BATON_DIR", "BATON_ROOT",
+)
+
+
+def clean_test_environment(overrides=None):
+    environment = os.environ.copy()
+    for key in BATON_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    if overrides:
+        environment.update({key: str(value) for key, value in overrides.items()})
+    return environment
 
 GOOD_WORKER = r'''
 import json
@@ -191,7 +205,7 @@ tid = os.environ["BATON_TASK_ID"]
 attempt = os.environ["BATON_ATTEMPT"]
 path = rd / "work" / tid / f"attempt-{attempt}.result.json"
 path.write_text(json.dumps({
-    "status": "needs_review", "note": "manual", "at": "now",
+    "status": "needs_review", "note": "manual", "at": "2026-01-01T00:00:00Z",
     "lease": os.environ["BATON_LEASE"], "changed_paths": [],
 }))
 '''
@@ -285,9 +299,7 @@ class BatonTests(unittest.TestCase):
         self.temp.cleanup()
 
     def command(self, argv, cwd, env=None, check=False, timeout=15):
-        merged = os.environ.copy()
-        if env:
-            merged.update({k: str(v) for k, v in env.items()})
+        merged = clean_test_environment(env)
         result = subprocess.run(
             [str(arg) for arg in argv], cwd=cwd, env=merged, text=True,
             stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
@@ -404,6 +416,13 @@ class BatonTests(unittest.TestCase):
         path = project / ".baton" / "tasks" / f"{task_id}.json"
         return json.loads(path.read_text())
 
+    def require_case_sensitive_filesystem(self):
+        probe = self.base / "case-sensitive-probe"
+        probe.mkdir()
+        (probe / "Probe").write_text("probe\n")
+        if (probe / "probe").exists():
+            self.skipTest("temporary filesystem is not case-sensitive")
+
     def lease_task(self, project, task_id, lease):
         runtime = project / ".baton"
         state_path = runtime / "tasks" / f"{task_id}.json"
@@ -477,6 +496,160 @@ class BatonTests(unittest.TestCase):
             project, "task", "accept", task_id, "--brief", token, check=True,
         )
 
+    def instrument_atomic_write_os(self, module, fail_operation=None):
+        real_os = os
+        events = []
+        directory_descriptors = set()
+        injected = OSError("injected parent durability failure")
+
+        class ObservedOS:
+            def __getattr__(self, name):
+                return getattr(real_os, name)
+
+            def fsync(self, descriptor):
+                if descriptor in directory_descriptors:
+                    events.append("parent-fsync")
+                    if fail_operation == "parent-fsync":
+                        raise injected
+                else:
+                    events.append("temp-fsync")
+                return real_os.fsync(descriptor)
+
+            def replace(self, source, destination):
+                events.append("replace")
+                if fail_operation == "replace":
+                    raise injected
+                return real_os.replace(source, destination)
+
+            def open(self, path, flags):
+                events.append(("parent-open", real_os.fspath(path), flags))
+                if fail_operation == "parent-open":
+                    raise injected
+                descriptor = real_os.open(path, flags)
+                directory_descriptors.add(descriptor)
+                return descriptor
+
+            def close(self, descriptor):
+                if descriptor in directory_descriptors:
+                    events.append("parent-close")
+                    directory_descriptors.remove(descriptor)
+                return real_os.close(descriptor)
+
+        module["atomic_write"].__globals__["os"] = ObservedOS()
+        return events, directory_descriptors, injected
+
+    def test_atomic_write_fsyncs_parent_after_replace_and_closes_descriptor(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_atomic_order_probe")
+        parent = self.base / "durable" / "nested"
+        parent.mkdir(parents=True)
+        target = parent / "state.json"
+        target.write_text("old\n")
+        events, directory_descriptors, _injected = self.instrument_atomic_write_os(
+            module,
+        )
+
+        module["atomic_write"](target, "new\n", mode=0o640)
+
+        self.assertEqual(target.read_text(), "new\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(events, [
+            "temp-fsync", "replace",
+            ("parent-open", str(parent), os.O_RDONLY | os.O_DIRECTORY),
+            "parent-fsync", "parent-close",
+        ])
+        self.assertEqual(directory_descriptors, set())
+        self.assertEqual(list(parent.glob(".baton-write-*")), [])
+
+    def test_atomic_write_supports_plain_relative_paths_and_syncs_dot(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_atomic_relative_probe")
+        working = self.base / "relative"
+        working.mkdir()
+        events, directory_descriptors, _injected = self.instrument_atomic_write_os(
+            module,
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(working)
+            module["atomic_write"]("state.json", "relative\n")
+        finally:
+            os.chdir(previous)
+
+        self.assertEqual((working / "state.json").read_text(), "relative\n")
+        self.assertEqual(events, [
+            "temp-fsync", "replace",
+            ("parent-open", ".", os.O_RDONLY | os.O_DIRECTORY),
+            "parent-fsync", "parent-close",
+        ])
+        self.assertEqual(directory_descriptors, set())
+        self.assertEqual(list(working.glob(".baton-write-*")), [])
+
+    def test_atomic_write_parent_sync_failures_block_dependents_and_retry_cleanly(self):
+        for operation in ("parent-open", "parent-fsync"):
+            with self.subTest(operation=operation):
+                module = runpy.run_path(
+                    str(SOURCE_BATON),
+                    run_name="baton_atomic_{}_failure_probe".format(operation),
+                )
+                parent = self.base / operation
+                parent.mkdir()
+                target = parent / "state.json"
+                target.write_text("old\n")
+                events, directory_descriptors, injected = (
+                    self.instrument_atomic_write_os(module, operation)
+                )
+                dependent_publications = []
+
+                caught = None
+                try:
+                    module["atomic_write"](target, "durable-or-failed\n")
+                    dependent_publications.append("published")
+                except OSError as error:
+                    caught = error
+
+                self.assertIs(caught, injected)
+                self.assertEqual(dependent_publications, [])
+                self.assertEqual(target.read_text(), "durable-or-failed\n")
+                self.assertEqual(events[:3], [
+                    "temp-fsync", "replace",
+                    ("parent-open", str(parent), os.O_RDONLY | os.O_DIRECTORY),
+                ])
+                self.assertEqual(
+                    events[3:],
+                    [] if operation == "parent-open"
+                    else ["parent-fsync", "parent-close"],
+                )
+                self.assertEqual(directory_descriptors, set())
+                self.assertEqual(list(parent.glob(".baton-write-*")), [])
+
+                module["atomic_write"].__globals__["os"] = os
+                module["atomic_write"](target, "durable-or-failed\n")
+                dependent_publications.append("published")
+                self.assertEqual(dependent_publications, ["published"])
+                self.assertEqual(target.read_text(), "durable-or-failed\n")
+                self.assertEqual(list(parent.glob(".baton-write-*")), [])
+
+    def test_atomic_write_replace_failure_preserves_target_and_cleans_temp(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_atomic_cleanup_probe")
+        parent = self.base / "replace-failure"
+        parent.mkdir()
+        target = parent / "state.json"
+        target.write_text("old\n")
+        events, directory_descriptors, injected = self.instrument_atomic_write_os(
+            module, "replace",
+        )
+
+        caught = None
+        try:
+            module["atomic_write"](target, "new\n")
+        except OSError as error:
+            caught = error
+
+        self.assertIs(caught, injected)
+        self.assertEqual(target.read_text(), "old\n")
+        self.assertEqual(events, ["temp-fsync", "replace"])
+        self.assertEqual(directory_descriptors, set())
+        self.assertEqual(list(parent.glob(".baton-write-*")), [])
+
     def test_init_requires_git_and_creates_only_runtime_files(self):
         plain = self.base / "plain"
         plain.mkdir()
@@ -507,11 +680,21 @@ class BatonTests(unittest.TestCase):
 
         config = runtime / "config.toml"
         memory = runtime / "memory.md"
+        cursor = runtime / "orchestrator-handoff-cursor.json"
         config.write_text("# preserved config\n")
         memory.write_text("# preserved memory\n")
+        cursor.write_text(
+            '{"version": 1, "accepted_at": "2026-01-01T00:00:00Z", '
+            '"seen_ids": []}\n'
+        )
         self.command([SOURCE_BATON, "init", project, "--force"], project, check=True)
         self.assertEqual(config.read_text(), "# preserved config\n")
         self.assertEqual(memory.read_text(), "# preserved memory\n")
+        self.assertEqual(
+            cursor.read_text(),
+            '{"version": 1, "accepted_at": "2026-01-01T00:00:00Z", '
+            '"seen_ids": []}\n',
+        )
 
         nested = project / "nested"
         nested.mkdir()
@@ -584,6 +767,17 @@ class BatonTests(unittest.TestCase):
                     rejected.stderr,
                 )
                 self.assertIn("nested-link", rejected.stderr)
+
+        project = self.make_project("runtime-cursor-symlink")
+        external = self.base / "external-cursor.json"
+        external.write_text("{}\n")
+        cursor = project / ".baton" / "orchestrator-handoff-cursor.json"
+        cursor.symlink_to(external)
+
+        rejected = self.baton(project, "status")
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("managed runtime file is not a regular file:", rejected.stderr)
+        self.assertIn("orchestrator-handoff-cursor.json", rejected.stderr)
 
     def test_status_reuses_loaded_tasks_when_rendering_next_actions(self):
         project = self.make_project("status-load-count")
@@ -903,6 +1097,82 @@ class BatonTests(unittest.TestCase):
                 self.assertEqual(worker_exit["declared_paths"], expected)
                 self.assertEqual(worker_exit["observed_paths"], expected)
 
+    def test_case_colliding_observed_paths_fail_changed_path_attribution(self):
+        self.require_case_sensitive_filesystem()
+        project = self.make_project("case-colliding-observed-paths")
+        worker = self.write_worker(GOOD_WORKER.replace(
+            'target_file = target / f"{tid}.txt"\n'
+            'target_file.write_text(f"attempt {attempt}\\n")',
+            'target_file = target / "Foo.txt"\n'
+            'target_file.write_text(f"attempt {attempt}\\n")\n'
+            '(target / "foo.txt").write_text(f"attempt {attempt} lower\\n")',
+        ))
+        self.configure(project, worker)
+        task_id = self.create_task(project, "case collision", ["case/**"])
+
+        self.baton(project, "run", task_id, check=True)
+
+        state = self.state(project, task_id)
+        worker_exit = state["history"][-1]
+        expected = ["case/Foo.txt", "case/foo.txt"]
+        self.assertEqual(worker_exit["observed_paths"], expected)
+        diff = (
+            project / ".baton" / "work" / task_id / "attempt-1.diff"
+        ).read_text()
+        for path in expected:
+            self.assertIn(path, diff)
+        self.assertEqual(worker_exit["declared_paths"], ["case/Foo.txt"])
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["last_note"], "changed_paths_mismatch")
+
+    def test_single_observed_path_accepts_case_variant_declaration(self):
+        self.require_case_sensitive_filesystem()
+        project = self.make_project("single-case-variant-declaration")
+        worker = self.write_worker(GOOD_WORKER.replace(
+            'target_file = target / f"{tid}.txt"',
+            'target_file = target / "Foo.txt"',
+        ).replace(
+            'changed = [target_file.relative_to(root).as_posix()]',
+            'changed = [target_file.relative_to(root).as_posix().lower()]',
+        ))
+        self.configure(project, worker)
+        task_id = self.create_task(project, "case variant declaration", ["case/**"])
+
+        self.baton(project, "run", task_id, check=True)
+
+        state = self.state(project, task_id)
+        worker_exit = state["history"][-1]
+        self.assertEqual(state["status"], "needs_review")
+        self.assertEqual(worker_exit["declared_paths"], ["case/foo.txt"])
+        self.assertEqual(worker_exit["observed_paths"], ["case/Foo.txt"])
+
+    def test_multiple_distinct_observed_paths_accept_exact_declarations(self):
+        project = self.make_project("multiple-distinct-observed-paths")
+        worker = self.write_worker(GOOD_WORKER.replace(
+            'changed = [target_file.relative_to(root).as_posix()]',
+            'second_file = target / "second.txt"\n'
+            'second_file.write_text(f"attempt {attempt} second\\n")\n'
+            'changed = [target_file.relative_to(root).as_posix(),\n'
+            '           second_file.relative_to(root).as_posix()]',
+        ))
+        self.configure(project, worker)
+        task_id = self.create_task(project, "multiple distinct paths", ["many/**"])
+
+        self.baton(project, "run", task_id, check=True)
+
+        state = self.state(project, task_id)
+        worker_exit = state["history"][-1]
+        expected = [f"many/{task_id}.txt", "many/second.txt"]
+        self.assertEqual(state["status"], "needs_review")
+        self.assertEqual(worker_exit["declared_paths"], expected)
+        self.assertEqual(worker_exit["observed_paths"], expected)
+
+    def test_case_variant_duplicate_worker_result_paths_are_invalid(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_worker_paths_probe")
+        self.assertIsNone(module["worker_changed_paths"](
+            ["case/Foo.txt", "case/foo.txt"],
+        ))
+
     def test_needs_decision_round_trip(self):
         project = self.make_project()
         worker = self.write_worker(GOOD_WORKER)
@@ -1119,7 +1389,9 @@ class BatonTests(unittest.TestCase):
         proc = subprocess.Popen(
             [str(project / ".baton" / "baton"), "run", task_id],
             cwd=project,
-            env=dict(os.environ, FINISH_MARKER=str(marker), SELF_ACCEPT_RESULT=str(self_accept)),
+            env=clean_test_environment({
+                "FINISH_MARKER": marker, "SELF_ACCEPT_RESULT": self_accept,
+            }),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         deadline = time.monotonic() + 5
@@ -1433,6 +1705,20 @@ class BatonTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("missing required report section `## Verification`", rejected.stderr)
 
+    def test_report_backtick_in_backtick_fence_info_does_not_hide_heading(self):
+        project, task_id, env, report, token = self.prepare_finish(
+            "invalid-backtick-info",
+        )
+        report.write_text(
+            "# task report\n\n## Result\nneeds_review\n\n## Changes\n- changes\n\n"
+            "`````foo`bar\n## Verification\n- verification\n\n"
+            "## Decisions and risks\n- none\n"
+        )
+        self.baton(
+            project, "task", "finish", task_id, "--status", "needs_review",
+            "--brief", token, env=env, check=True,
+        )
+
     def test_report_heading_inside_three_space_indented_fence_does_not_count(self):
         project, task_id, env, report, token = self.prepare_finish("indented-fence")
         report.write_text(
@@ -1476,6 +1762,56 @@ class BatonTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("missing required report section `## Verification`", rejected.stderr)
         self.assertNotIn("missing required report section `## Decisions", rejected.stderr)
+
+    def test_commonmark_fence_state_handles_openers_and_closers(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_fence_state_probe")
+        transition = module["commonmark_fence_state"]
+        cases = (
+            ("backtick info", "```python", None, ("`", 3)),
+            ("invalid backtick info", "`````foo`bar", None, None),
+            ("tilde info with backtick", "  ~~~~ foo`bar", None, ("~", 4)),
+            ("three-space indent", "   ```", None, ("`", 3)),
+            ("four-space indent", "    ```", None, None),
+            ("shorter closer", "```", ("`", 4), ("`", 4)),
+            ("mismatched closer", "~~~~", ("`", 4), ("`", 4)),
+            ("longer closer with whitespace", "  `````` \t", ("`", 4), None),
+        )
+        for name, line, before, after in cases:
+            with self.subTest(name=name):
+                self.assertEqual(transition(line, before), after)
+
+    def test_report_fence_matrix_preserves_real_section_routing(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_report_fence_probe")
+        problems = module["report_section_problems"]
+        specimens = (
+            ("backtick-lf", "```python\n", "````` \t\n"),
+            ("tilde-crlf-info", "   ~~~~ markdown`ok\r\n", " ~~~~~\t\r\n"),
+            (
+                "mixed-shorter-mismatched",
+                "  ````text\r\n",
+                "```\n~~~\r\n   ``````\t\n",
+            ),
+        )
+        prefix = (
+            "# report\n\n## Result\nneeds_review\n\n## Changes\n- changes\n\n"
+        )
+        suffix = (
+            "## Verification\n- verification\r\n\n"
+            "## Decisions and risks\n- none\n"
+        )
+        for name, opener, closer in specimens:
+            with self.subTest(name=name):
+                report = prefix + opener + "## Verification\r\n- fenced heading\n" + closer
+                self.assertEqual(problems(report + suffix, "needs_review"), [])
+
+        unterminated = prefix + "~~~ info`allowed\r\n" + suffix
+        self.assertEqual(
+            problems(unterminated, "needs_review"),
+            [
+                "missing required report section `## Verification`",
+                "missing required report section `## Decisions and risks`",
+            ],
+        )
 
     def test_crlf_structured_report_is_accepted(self):
         project, task_id, env, report, token = self.prepare_finish("crlf-report")
@@ -1584,6 +1920,1052 @@ class BatonTests(unittest.TestCase):
         )
         self.assertNotEqual(stale.returncode, 0)
         self.assertIn("report-phase brief token is required", stale.stderr)
+
+    def assert_multiline_retry_context_is_published_once(
+            self, name, status, command, option, value, expected_entry,
+            expected_event, expected_stdout):
+        project = self.make_project(name + "-multiline-publication")
+        task_id = self.create_task(project, name + " multiline publication", ["retry/**"])
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        original_state = json.loads(state_path.read_text())
+        original_state["status"] = status
+        state_path.write_text(json.dumps(original_state))
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+
+        result = self.baton(
+            project, "task", command, task_id, option, value, check=True,
+        )
+
+        final_state = self.state(project, task_id)
+        spec_text = spec_path.read_text()
+        self.assertEqual(result.stdout, expected_stdout.format(task_id=task_id))
+        self.assertEqual((final_state["status"], final_state["attempt"]), ("queued", 2))
+        new_history = final_state["history"][len(original_state["history"]):]
+        self.assertEqual([entry["event"] for entry in new_history], [expected_event])
+        self.assertEqual(spec_text.count(expected_entry), 1)
+        markers = re.findall(
+            r"<!-- baton-retry-publication:v1 transition=(\w+) attempt=(\d+) "
+            r"digest=sha256:[0-9a-f]{64} -->",
+            spec_text,
+        )
+        self.assertEqual(markers, [(command, "1")])
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_multiline_retry_proof_probe",
+        )
+        proof = module["retry_publication_marker"](
+            task_id, command, 1, expected_entry,
+        )
+        self.assertIn(proof + "\n" + expected_entry + "\n", spec_text)
+        retry_capsule = self.baton(
+            project, "task", "capsule", task_id, "--raw", check=True,
+        ).stdout
+        self.assertNotIn("baton-retry-publication", retry_capsule)
+        label = "Decision" if command == "decide" else "Review feedback"
+        self.assertIn(
+            label + ": " + expected_entry.splitlines()[0].rstrip(), retry_capsule,
+        )
+
+    def test_decide_publishes_multiline_fenced_answer_once(self):
+        answer = "Use this implementation:\n```python\nprint('durable')\n```"
+        self.assert_multiline_retry_context_is_published_once(
+            "decision", "needs_decision", "decide", "--answer", answer,
+            "- " + answer, "decided", "{task_id} answered and re-queued\n",
+        )
+
+    def test_return_publishes_multiline_fenced_feedback_once(self):
+        reason = "Please preserve this example:\n```python\nprint('retry')\n```"
+        self.assert_multiline_retry_context_is_published_once(
+            "return", "needs_review", "return", "--reason", reason,
+            "- attempt 1: " + reason, "returned",
+            "{task_id} returned for attempt 2\n",
+        )
+
+    def test_decide_preserves_multiline_whitespace_and_embedded_heading(self):
+        answer = "Preserve lines  \n\n## Embedded user heading\nfinal line  "
+        self.assert_multiline_retry_context_is_published_once(
+            "decision-exact-multiline", "needs_decision", "decide", "--answer",
+            answer, "- " + answer, "decided",
+            "{task_id} answered and re-queued\n",
+        )
+
+    def test_retry_publication_precedes_unterminated_fenced_input(self):
+        cases = (
+            (
+                "decision", "needs_decision", "decide", "--answer",
+                "Keep this exact:\n```text\nunterminated decision",
+                "- Keep this exact:\n```text\nunterminated decision",
+                "decided", "{task_id} answered and re-queued\n",
+            ),
+            (
+                "return", "needs_review", "return", "--reason",
+                "Keep this exact:\n~~~text\nunterminated feedback",
+                "- attempt 1: Keep this exact:\n~~~text\nunterminated feedback",
+                "returned", "{task_id} returned for attempt 2\n",
+            ),
+        )
+        for (
+                name, status, command, option, value, entry,
+                event, stdout,
+        ) in cases:
+            with self.subTest(command=command):
+                self.assert_multiline_retry_context_is_published_once(
+                    name + "-unterminated", status, command, option, value,
+                    entry, event, stdout,
+                )
+
+    def assert_retry_context_append_failure_is_safe(
+            self, status, transition_name, transition_argv, expected_context):
+        project = self.make_project("{}-append-failure".format(transition_name))
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "retry context append failure", ["retry/**"])
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = status
+        state_path.write_text(json.dumps(task))
+
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_retry_append_failure_probe",
+        )
+        globals_ = module[transition_name].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["require_orchestrator"] = lambda: None
+
+        def fail_append(*_args):
+            raise OSError("simulated specification publication failure")
+
+        globals_["append_md_section"] = fail_append
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as stopped:
+                module["main"](["task", *transition_argv(task_id)])
+
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("simulated specification publication failure", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        failed_state = self.state(project, task_id)
+        self.assertEqual((failed_state["status"], failed_state["attempt"]), (status, 1))
+        self.assertNotIn(expected_context, (
+            runtime / "tasks" / f"{task_id}.md"
+        ).read_text())
+
+        run = self.baton(project, "run", task_id)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(f"skip {task_id}: status is {status}", run.stdout)
+        self.assertEqual(self.state(project, task_id), failed_state)
+        work = runtime / "work" / task_id
+        self.assertFalse(work.exists() and any(work.glob("attempt-2.*")))
+
+    def test_return_append_failure_keeps_retry_non_runnable(self):
+        self.assert_retry_context_append_failure_is_safe(
+            "needs_review", "cmd_task_return",
+            lambda task_id: [
+                "return", task_id, "--reason", "Publish durable feedback",
+            ],
+            "- attempt 1: Publish durable feedback",
+        )
+
+    def test_decide_append_failure_keeps_retry_non_runnable(self):
+        self.assert_retry_context_append_failure_is_safe(
+            "needs_decision", "cmd_task_decide",
+            lambda task_id: [
+                "decide", task_id, "--answer", "Use the durable answer",
+            ],
+            "- Use the durable answer",
+        )
+
+    def assert_retry_final_state_failure_is_idempotent(
+            self, status, transition_name, transition_argv, expected_context,
+            expected_stdout, expected_event):
+        project = self.make_project("{}-state-failure".format(transition_name))
+        task_id = self.create_task(project, "retry final state failure", ["retry/**"])
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = status
+        state_path.write_text(json.dumps(task))
+        original_state = self.state(project, task_id)
+        token_path = runtime / "work" / task_id / "review-brief-token.json"
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text("{}\n")
+
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_retry_state_failure_probe",
+        )
+        globals_ = module[transition_name].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["require_orchestrator"] = lambda: None
+        original_save_task = globals_["save_task"]
+
+        def fail_final_save(baton_dir, current):
+            if current.get("id") == task_id and current.get("status") == "queued":
+                raise OSError("simulated final task state persistence failure")
+            return original_save_task(baton_dir, current)
+
+        globals_["save_task"] = fail_final_save
+        first_stdout = io.StringIO()
+        first_stderr = io.StringIO()
+        with redirect_stdout(first_stdout), redirect_stderr(first_stderr):
+            with self.assertRaises(SystemExit) as stopped:
+                module["main"](["task", *transition_argv(task_id)])
+
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(first_stdout.getvalue(), "")
+        self.assertIn(
+            "simulated final task state persistence failure", first_stderr.getvalue(),
+        )
+        self.assertNotIn("Traceback", first_stderr.getvalue())
+        self.assertEqual(self.state(project, task_id), original_state)
+        self.assertFalse(token_path.exists())
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        first_spec = spec_path.read_text()
+        self.assertEqual(first_spec.count(expected_context), 1)
+        marker_pattern = (
+            r"<!-- baton-retry-publication:v1 transition={} attempt=1 "
+            r"digest=sha256:[0-9a-f]{{64}} -->"
+        ).format(transition_name.removeprefix("cmd_task_"))
+        self.assertEqual(len(re.findall(marker_pattern, first_spec)), 1)
+
+        globals_["save_task"] = original_save_task
+        second_stdout = io.StringIO()
+        second_stderr = io.StringIO()
+        with redirect_stdout(second_stdout), redirect_stderr(second_stderr):
+            module["main"](["task", *transition_argv(task_id)])
+
+        self.assertEqual(second_stdout.getvalue(), expected_stdout.format(task_id=task_id))
+        self.assertEqual(second_stderr.getvalue(), "")
+        final_state = self.state(project, task_id)
+        self.assertEqual((final_state["status"], final_state["attempt"]), ("queued", 2))
+        new_history = final_state["history"][len(original_state["history"]):]
+        self.assertEqual([entry["event"] for entry in new_history], [expected_event])
+        final_spec = spec_path.read_text()
+        self.assertEqual(final_spec.count(expected_context), 1)
+        self.assertEqual(len(re.findall(marker_pattern, final_spec)), 1)
+
+    def test_return_final_state_failure_retries_without_duplicate_feedback(self):
+        self.assert_retry_final_state_failure_is_idempotent(
+            "needs_review", "cmd_task_return",
+            lambda task_id: [
+                "return", task_id, "--reason", "Publish durable feedback",
+            ],
+            "- attempt 1: Publish durable feedback",
+            "{task_id} returned for attempt 2\n", "returned",
+        )
+
+    def test_decide_final_state_failure_retries_without_duplicate_answer(self):
+        self.assert_retry_final_state_failure_is_idempotent(
+            "needs_decision", "cmd_task_decide",
+            lambda task_id: [
+                "decide", task_id, "--answer", "Use the durable answer",
+            ],
+            "- Use the durable answer",
+            "{task_id} answered and re-queued\n", "decided",
+        )
+
+    def test_bare_cr_retry_publication_routes_and_retries_idempotently(self):
+        cases = (
+            (
+                "decide", "Decisions", "needs_decision", "cmd_task_decide",
+                lambda task_id: [
+                    "decide", task_id, "--answer", "Use the bare CR answer",
+                ],
+                "- Use the bare CR answer", "decided",
+                b"## Decisions\n\n## Review feedback\n",
+                b"## Decisions\r## Review feedback\n",
+                b"## Review feedback\n",
+            ),
+            (
+                "return", "Review feedback", "needs_review", "cmd_task_return",
+                lambda task_id: [
+                    "return", task_id, "--reason", "Fix the bare CR feedback",
+                ],
+                "- attempt 1: Fix the bare CR feedback", "returned",
+                b"## Review feedback\n",
+                b"## Review feedback\r## Retry tail\ntail bytes stay exact\n",
+                b"## Retry tail\n",
+            ),
+        )
+        for (
+                command, section, status, transition_name, transition_argv,
+                entry, expected_event, original_target, mixed_target,
+                later_heading,
+        ) in cases:
+            with self.subTest(command=command):
+                project = self.make_project("bare-cr-retry-" + command)
+                task_id = self.create_task(
+                    project, "bare CR retry " + command, ["retry/**"],
+                )
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = status
+                state_path.write_text(json.dumps(state))
+                original_state = self.state(project, task_id)
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                original_spec = spec_path.read_bytes()
+                self.assertEqual(original_spec.count(original_target), 1)
+                before = original_spec.replace(original_target, mixed_target, 1)
+                spec_path.write_bytes(before)
+
+                module = runpy.run_path(
+                    str(SOURCE_BATON),
+                    run_name="baton_bare_cr_retry_{}_probe".format(command),
+                )
+                globals_ = module[transition_name].__globals__
+                globals_["require_baton_dir"] = lambda: str(runtime)
+                globals_["require_orchestrator"] = lambda: None
+                original_save_task = globals_["save_task"]
+
+                def fail_final_save(baton_dir, current):
+                    if current.get("id") == task_id and current.get("status") == "queued":
+                        raise OSError("simulated final task state persistence failure")
+                    return original_save_task(baton_dir, current)
+
+                globals_["save_task"] = fail_final_save
+                first_stderr = io.StringIO()
+                with redirect_stdout(io.StringIO()), redirect_stderr(first_stderr):
+                    with self.assertRaises(SystemExit) as stopped:
+                        module["main"](["task", *transition_argv(task_id)])
+
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertIn(
+                    "simulated final task state persistence failure",
+                    first_stderr.getvalue(),
+                )
+                self.assertEqual(self.state(project, task_id), original_state)
+                proof = module["retry_publication_marker"](
+                    task_id, command, 1, entry,
+                )
+                publication = (proof + "\n" + entry + "\n").encode()
+                first_spec = spec_path.read_bytes()
+                target = ("## " + section).encode() + b"\r"
+                target_end = first_spec.index(target) + len(target)
+                self.assertEqual(first_spec[target_end:target_end + len(publication)], publication)
+                self.assertLess(target_end, first_spec.index(later_heading, target_end))
+                self.assertEqual(first_spec.count(proof.encode()), 1)
+                self.assertEqual(first_spec.count(entry.encode()), 1)
+                self.assertEqual(first_spec.replace(publication, b"", 1), before)
+                decoded = first_spec.decode()
+                self.assertTrue(module["task_spec_has_retry_publication"](
+                    decoded, section, proof, entry,
+                ))
+
+                globals_["save_task"] = original_save_task
+                second_stdout = io.StringIO()
+                with redirect_stdout(second_stdout), redirect_stderr(io.StringIO()):
+                    module["main"](["task", *transition_argv(task_id)])
+
+                final_state = self.state(project, task_id)
+                self.assertEqual(
+                    (final_state["status"], final_state["attempt"]),
+                    ("queued", 2),
+                )
+                new_history = final_state["history"][len(original_state["history"]):]
+                self.assertEqual([event["event"] for event in new_history], [expected_event])
+                final_spec = spec_path.read_bytes()
+                self.assertEqual(final_spec, first_spec)
+                self.assertEqual(final_spec.count(proof.encode()), 1)
+                self.assertEqual(final_spec.count(entry.encode()), 1)
+
+    def test_return_multiline_final_state_failure_retries_one_publication(self):
+        reason = "Preserve this retry:\n```python\nprint('feedback')\n```"
+        self.assert_retry_final_state_failure_is_idempotent(
+            "needs_review", "cmd_task_return",
+            lambda task_id: ["return", task_id, "--reason", reason],
+            "- attempt 1: " + reason,
+            "{task_id} returned for attempt 2\n", "returned",
+        )
+
+    def test_decide_multiline_final_state_failure_retries_one_publication(self):
+        answer = "Use this answer:\n```python\nprint('decision')\n```"
+        self.assert_retry_final_state_failure_is_idempotent(
+            "needs_decision", "cmd_task_decide",
+            lambda task_id: ["decide", task_id, "--answer", answer],
+            "- " + answer,
+            "{task_id} answered and re-queued\n", "decided",
+        )
+
+    def test_single_line_retry_publication_migrates_without_duplicate_text(self):
+        cases = (
+            (
+                "decide", "Decisions", "needs_decision", "--answer",
+                "Use the existing answer", "- Use the existing answer",
+            ),
+            (
+                "return", "Review feedback", "needs_review", "--reason",
+                "Use the existing feedback", "- attempt 1: Use the existing feedback",
+            ),
+        )
+        for command, section, status, option, value, entry in cases:
+            with self.subTest(command=command):
+                project = self.make_project("legacy-single-line-" + command)
+                task_id = self.create_task(project, "legacy retry publication", ["retry/**"])
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = status
+                state_path.write_text(json.dumps(state))
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                spec_path.write_text(spec_path.read_text().replace(
+                    "## " + section + "\n", "## " + section + "\n" + entry + "\n", 1,
+                ))
+
+                self.baton(
+                    project, "task", command, task_id, option, value, check=True,
+                )
+
+                spec_text = spec_path.read_text()
+                self.assertEqual(spec_text.count(entry), 1)
+                self.assertEqual(spec_text.count("<!-- baton-retry-publication:v1 "), 1)
+                final_state = self.state(project, task_id)
+                self.assertEqual(
+                    (final_state["status"], final_state["attempt"]), ("queued", 2),
+                )
+
+    def assert_retry_context_serializes_with_run(
+            self, project, task_id, transition_name, transition_args,
+            expected_spec_entry, expected_prompt_context):
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        work = runtime / "work" / task_id
+        prior_artifacts = {
+            path.name: path.read_bytes()
+            for path in work.glob("attempt-1.*")
+        }
+        self.assertTrue(prior_artifacts)
+
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_retry_publication_probe",
+        )
+        globals_ = module[transition_name].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["require_orchestrator"] = lambda: None
+        original_append = globals_["append_md_section"]
+        original_file_lock = globals_["file_lock"]
+        original_prepare_worker = globals_["prepare_worker"]
+        publication_paused = threading.Event()
+        release_publication = threading.Event()
+        scheduler_lock_attempted = threading.Event()
+        prompt_prepared = threading.Event()
+        context_at_preparation = []
+        errors = {}
+
+        def synchronized_append(baton_dir, current_id, section, text):
+            if (
+                    threading.current_thread().name == "retry-publication-probe"
+                    and current_id == task_id):
+                publication_paused.set()
+                if not release_publication.wait(5):
+                    raise RuntimeError("retry publication synchronization timed out")
+            return original_append(baton_dir, current_id, section, text)
+
+        @contextmanager
+        def observed_file_lock(path):
+            if (
+                    threading.current_thread().name == "retry-run-probe"
+                    and path == globals_["lock_path"](str(runtime), "scheduler")):
+                scheduler_lock_attempted.set()
+            with original_file_lock(path):
+                yield
+
+        def observed_prepare_worker(baton_dir, config, task, memory_entries):
+            prepared = original_prepare_worker(
+                baton_dir, config, task, memory_entries,
+            )
+            if threading.current_thread().name == "retry-run-probe":
+                context_at_preparation.append(
+                    expected_spec_entry in spec_path.read_text()
+                )
+                prompt_prepared.set()
+            return prepared
+
+        globals_["append_md_section"] = synchronized_append
+        globals_["file_lock"] = observed_file_lock
+        globals_["prepare_worker"] = observed_prepare_worker
+
+        def retry():
+            try:
+                module[transition_name](transition_args)
+            except BaseException as error:
+                errors["retry"] = error
+
+        context = {
+            "lease": "retry-publication-lease",
+            "stop_event": threading.Event(),
+            "task_ids": [],
+        }
+
+        def run():
+            try:
+                module["run_wave"](
+                    SimpleNamespace(ids=[task_id], max_parallel=None, dry_run=False),
+                    str(runtime), context,
+                )
+            except BaseException as error:
+                errors["run"] = error
+
+        retry_thread = threading.Thread(
+            target=retry, name="retry-publication-probe",
+        )
+        run_thread = threading.Thread(target=run, name="retry-run-probe")
+        previous_directory = os.getcwd()
+        previous_baton_dir = os.environ.get("BATON_DIR")
+        run_started = False
+        prepared_before_release = None
+        retry_non_runnable_before_context = None
+        try:
+            os.chdir(project)
+            os.environ["BATON_DIR"] = str(runtime)
+            retry_thread.start()
+            self.assertTrue(publication_paused.wait(5))
+            paused_state = self.state(project, task_id)
+            retry_non_runnable_before_context = (
+                paused_state["status"] in ("needs_review", "needs_decision")
+                and paused_state["attempt"] == 1
+                and expected_spec_entry not in spec_path.read_text()
+            )
+
+            run_thread.start()
+            run_started = True
+            self.assertTrue(scheduler_lock_attempted.wait(5))
+            prepared_before_release = prompt_prepared.wait(0.5)
+        finally:
+            release_publication.set()
+            retry_thread.join(5)
+            if run_started:
+                run_thread.join(10)
+            os.chdir(previous_directory)
+            if previous_baton_dir is None:
+                os.environ.pop("BATON_DIR", None)
+            else:
+                os.environ["BATON_DIR"] = previous_baton_dir
+
+        self.assertFalse(retry_thread.is_alive())
+        self.assertFalse(run_thread.is_alive())
+        self.assertEqual(errors, {})
+        self.assertTrue(retry_non_runnable_before_context)
+        final_state = self.state(project, task_id)
+        self.assertEqual((final_state["status"], final_state["attempt"]), (
+            "needs_review", 2,
+        ))
+        self.assertNotIn("runner", final_state)
+        self.assertIn(expected_spec_entry, spec_path.read_text())
+        with self.subTest("scheduler publication fence"):
+            self.assertFalse(
+                prepared_before_release,
+                "run prepared attempt 2 before retry context publication completed",
+            )
+        with self.subTest("context durable at prompt preparation"):
+            self.assertEqual(context_at_preparation, [True])
+        with self.subTest("persisted prompt contains retry context"):
+            self.assertIn(
+                expected_prompt_context,
+                (work / "attempt-2.prompt.md").read_text(),
+            )
+        self.assertEqual(
+            prior_artifacts,
+            {path.name: path.read_bytes() for path in work.glob("attempt-1.*")},
+        )
+
+    def test_return_publishes_feedback_before_retry_run_prepares_prompt(self):
+        project = self.make_project("return-run-publication")
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "return run publication", ["retry/**"])
+        self.baton(project, "run", task_id, check=True)
+
+        self.assert_retry_context_serializes_with_run(
+            project, task_id, "cmd_task_return",
+            SimpleNamespace(id=task_id, reason="Include the corrected retry contract"),
+            "- attempt 1: Include the corrected retry contract",
+            "Review feedback: - attempt 1: Include the corrected retry contract",
+        )
+
+    def test_decide_publishes_answer_before_retry_run_prepares_prompt(self):
+        project = self.make_project("decide-run-publication")
+        decision_worker = self.write_worker(
+            NO_CHANGE_WORKER.replace("needs_review", "needs_decision"),
+        )
+        self.configure(project, decision_worker)
+        task_id = self.create_task(project, "decide run publication", ["decision/**"])
+        self.baton(project, "run", task_id, check=True)
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+
+        self.assert_retry_context_serializes_with_run(
+            project, task_id, "cmd_task_decide",
+            SimpleNamespace(id=task_id, answer="Use the durable decision answer"),
+            "- Use the durable decision answer",
+            "Decision: - Use the durable decision answer",
+        )
+
+    def test_decide_routes_answer_to_exact_decisions_heading(self):
+        project = self.make_project("exact-decision-heading")
+        task_id = self.create_task(project, "exact decision heading", ["decision/**"])
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        context = "Context may mention `## Decisions` without opening that section."
+        spec_path.write_text(spec_path.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            context,
+        ))
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_decision"
+        state_path.write_text(json.dumps(state))
+
+        decided = self.baton(
+            project, "task", "decide", task_id, "--answer", "Use option A",
+            check=True,
+        )
+
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_decision_sections_probe")
+        sections = module["task_spec_sections"](spec_path.read_text())
+        self.assertEqual(decided.stdout, f"{task_id} answered and re-queued\n")
+        self.assertEqual(sections["Context"], context)
+        self.assertEqual(
+            module["latest_task_spec_entry"](sections["Decisions"]),
+            "- Use option A",
+        )
+        retry_capsule = self.baton(
+            project, "task", "capsule", task_id, "--raw", check=True,
+        )
+        self.assertIn("Decision: - Use option A", retry_capsule.stdout)
+        self.assertNotIn("Use option A", sections["Context"])
+
+    def test_task_spec_fence_scanner_handles_crlf_mixed_endings_and_offsets(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_crlf_scanner_probe")
+        headings = module["task_spec_headings"]
+        contains_entry = module["task_spec_contains_unfenced_entry"]
+        specimens = (
+            (
+                "invalid-backtick-info",
+                "`````foo`bar\r\n## Decisions\n",
+                "Decisions",
+            ),
+            (
+                "backtick-crlf-close",
+                "   ````python\n## Decisions\r\n```\n"
+                "the shorter closer stays fenced\r\n   ``````\r\n"
+                "## Decisions\r\n",
+                "Decisions",
+            ),
+            (
+                "tilde-mixed-close",
+                "  ~~~~~ markdown\r\n## Review feedback\n`````\r\n~~~~\n"
+                "the mismatched and shorter closers stay fenced\r\n"
+                "   ~~~~~~~\n## Review feedback\r\n",
+                "Review feedback",
+            ),
+        )
+        for name, spec, expected_name in specimens:
+            with self.subTest(name=name):
+                start = spec.rindex("## " + expected_name)
+                body_end = start + len("## " + expected_name)
+                self.assertEqual(headings(spec), [(expected_name, start, body_end)])
+                self.assertEqual(spec[start:body_end], "## " + expected_name)
+
+        entry = "- attempt 1: Preserve CRLF"
+        self.assertTrue(contains_entry("preface\r\n" + entry + "\r\ntail", entry))
+        self.assertFalse(contains_entry(
+            "``` text\r\n" + entry + "\r\n```\r\noutside\n", entry,
+        ))
+        self.assertEqual(
+            headings("~~~ info`allowed\r\n## Decisions\nunterminated"),
+            [],
+        )
+
+    def test_retry_publication_proof_scanner_handles_all_line_endings(self):
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_retry_line_endings_probe",
+        )
+        marker = "<!-- baton-retry-publication:v1 proof -->"
+        entry = "- exact entry"
+        specimens = (
+            ("lf", "\n", "\n", "\n"),
+            ("crlf", "\r\n", "\r\n", "\r\n"),
+            ("bare-cr", "\r", "\r", "\r"),
+            ("mixed", "\r", "\r\n", "\n"),
+        )
+        for name, heading_end, marker_end, entry_end in specimens:
+            with self.subTest(name=name):
+                prefix = "preamble" + entry_end
+                target = "## Decisions" + heading_end
+                publication = marker + marker_end + entry + entry_end
+                later = "## Review feedback\nuntouched\n"
+                spec = prefix + target + publication + later
+                body_start = len(prefix + target)
+                body_end = len(prefix + target + publication)
+                self.assertEqual(
+                    module["task_spec_section_bounds"](spec, "Decisions"),
+                    (body_start, body_end),
+                )
+                self.assertTrue(module["task_spec_has_retry_publication"](
+                    spec, "Decisions", marker, entry,
+                ))
+                self.assertFalse(module["task_spec_has_retry_publication"](
+                    spec, "Review feedback", marker, entry,
+                ))
+
+    def test_retry_publication_routes_past_crlf_fences_without_rewriting_bytes(self):
+        cases = (
+            (
+                "decision", "Decisions", "needs_decision", "decide", "--answer",
+                "Preserve decision bytes", "- Preserve decision bytes",
+                b"   ````python\r\n## Decisions\r\n- Preserve decision bytes\r\n```\r\n"
+                b"shorter closer remains code\n   ``````\r\n",
+            ),
+            (
+                "feedback", "Review feedback", "needs_review", "return", "--reason",
+                "Preserve feedback bytes", "- attempt 1: Preserve feedback bytes",
+                b"  ~~~~~ markdown\r\n## Review feedback\n"
+                b"- attempt 1: Preserve feedback bytes\r\n`````\r\n~~~~\n"
+                b"mismatched closers remain code\r\n   ~~~~~~~\r\n",
+            ),
+        )
+        placeholder = (
+            b"List the paths and facts the worker needs. Reference memory ids when useful."
+        )
+        for (
+                name, section, status, command, option, value, entry, fence,
+        ) in cases:
+            with self.subTest(name=name):
+                project = self.make_project("crlf-fenced-publication-" + name)
+                task_id = self.create_task(project, name + " CRLF publication", [name + "/**"])
+                runtime = project / ".baton"
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                before = spec_path.read_bytes().replace(b"\n", b"\r\n")
+                before = before.replace(placeholder, fence.rstrip(b"\r\n"), 1)
+                spec_path.write_bytes(before)
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = status
+                state_path.write_text(json.dumps(state))
+
+                self.baton(
+                    project, "task", command, task_id, option, value, check=True,
+                )
+
+                after = spec_path.read_bytes()
+                marker = re.search(
+                    rb"<!-- baton-retry-publication:v1 [^\r\n]+ -->\n", after,
+                )
+                self.assertIsNotNone(marker)
+                publication = marker.group(0) + entry.encode() + b"\n"
+                self.assertEqual(after.replace(publication, b"", 1), before)
+                target = b"## " + section.encode() + b"\r\n"
+                self.assertTrue(after.index(fence) < after.index(target))
+                self.assertTrue(after.index(target) < after.index(publication))
+                self.assertEqual(after.count(fence), 1)
+
+    def test_decide_ignores_fenced_decisions_heading(self):
+        project = self.make_project("fenced-decision-heading")
+        task_id = self.create_task(project, "fenced decision heading", ["decision/**"])
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        fence = (
+            "   ````markdown\n"
+            "## Decisions\n"
+            "```\n"
+            "the shorter backtick run does not close this example\n"
+            "   ``````\n"
+        )
+        before = spec_path.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            fence.rstrip("\n"),
+        )
+        spec_path.write_text(before)
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_decision"
+        state_path.write_text(json.dumps(state))
+
+        self.baton(
+            project, "task", "decide", task_id, "--answer", "Use option B",
+            check=True,
+        )
+
+        after = spec_path.read_text()
+        self.assertEqual(after.count(fence), 1)
+        self.assertRegex(
+            after,
+            r"## Decisions\n"
+            r"<!-- baton-retry-publication:v1 [^\n]+ -->\n"
+            r"- Use option B\n",
+        )
+        self.assertNotIn("- Use option B\n```", after)
+
+    def test_decide_appends_section_when_only_decisions_heading_is_fenced(self):
+        project = self.make_project("only-fenced-decision-heading")
+        task_id = self.create_task(
+            project, "only fenced decision heading", ["decision/**"],
+        )
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        fence = "```text\n## Decisions\n```\n"
+        before = spec_path.read_text().replace("\n## Decisions\n", "\n", 1).replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            fence.rstrip("\n"),
+        )
+        spec_path.write_text(before)
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_decision"
+        state_path.write_text(json.dumps(state))
+
+        self.baton(
+            project, "task", "decide", task_id, "--answer", "Append outside",
+            check=True,
+        )
+
+        after = spec_path.read_text()
+        self.assertEqual(after.count(fence), 1)
+        self.assertRegex(
+            after,
+            r"## Decisions\n"
+            r"<!-- baton-retry-publication:v1 transition=decide attempt=1 "
+            r"digest=sha256:[0-9a-f]{64} -->\n"
+            r"- Append outside\n$",
+        )
+
+    def test_return_routes_feedback_to_exact_review_feedback_heading(self):
+        project = self.make_project("exact-review-feedback-heading")
+        task_id = self.create_task(
+            project, "exact review feedback heading", ["feedback/**"],
+        )
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        context = "Context may mention `## Review feedback` without opening that section."
+        spec_path.write_text(spec_path.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            context,
+        ))
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_review"
+        state_path.write_text(json.dumps(state))
+
+        returned = self.baton(
+            project, "task", "return", task_id, "--reason", "Tighten the tests",
+            check=True,
+        )
+
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_feedback_sections_probe")
+        sections = module["task_spec_sections"](spec_path.read_text())
+        self.assertEqual(returned.stdout, f"{task_id} returned for attempt 2\n")
+        self.assertEqual(sections["Context"], context)
+        self.assertEqual(
+            module["latest_task_spec_entry"](sections["Review feedback"]),
+            "- attempt 1: Tighten the tests",
+        )
+        retry_capsule = self.baton(
+            project, "task", "capsule", task_id, "--raw", check=True,
+        )
+        self.assertIn(
+            "Review feedback: - attempt 1: Tighten the tests", retry_capsule.stdout,
+        )
+        self.assertNotIn("Tighten the tests", sections["Context"])
+
+    def test_return_ignores_fenced_review_feedback_heading(self):
+        project = self.make_project("fenced-review-feedback-heading")
+        task_id = self.create_task(
+            project, "fenced review feedback heading", ["feedback/**"],
+        )
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        fence = (
+            "  ~~~~~ markdown\n"
+            "## Review feedback\n"
+            "`````\n"
+            "~~~~\n"
+            "the mismatched and shorter runs do not close this example\n"
+            "   ~~~~~~~\n"
+        )
+        before = spec_path.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            fence.rstrip("\n"),
+        )
+        spec_path.write_text(before)
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_review"
+        state_path.write_text(json.dumps(state))
+
+        self.baton(
+            project, "task", "return", task_id, "--reason", "Keep the real section",
+            check=True,
+        )
+
+        after = spec_path.read_text()
+        self.assertEqual(after.count(fence), 1)
+        self.assertRegex(
+            after,
+            r"## Review feedback\n"
+            r"<!-- baton-retry-publication:v1 [^\n]+ -->\n"
+            r"- attempt 1: Keep the real section\n",
+        )
+        self.assertNotIn(
+            "## Review feedback\n- attempt 1: Keep the real section\n`````", after,
+        )
+
+    def test_retry_publication_ignores_matching_entries_inside_fences(self):
+        cases = (
+            (
+                "decision", "Decisions", "needs_decision",
+                "decide", "--answer", "Use fenced answer",
+                "- Use fenced answer", "   ````text\n- Use fenced answer\n   ``````\n",
+            ),
+            (
+                "return", "Review feedback", "needs_review",
+                "return", "--reason", "Use fenced feedback",
+                "- attempt 1: Use fenced feedback",
+                "  ~~~~~ markdown\n- attempt 1: Use fenced feedback\n  ~~~~~~~\n",
+            ),
+        )
+        for (
+                name, section, status, command, option, value, entry, fence,
+        ) in cases:
+            with self.subTest(name=name):
+                project = self.make_project("fenced-retry-entry-" + name)
+                task_id = self.create_task(
+                    project, "fenced retry entry " + name, [name + "/**"],
+                )
+                runtime = project / ".baton"
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                spec_path.write_text(spec_path.read_text().replace(
+                    "## " + section + "\n", "## " + section + "\n" + fence, 1,
+                ))
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = status
+                state_path.write_text(json.dumps(state))
+
+                result = self.baton(
+                    project, "task", command, task_id, option, value, check=True,
+                )
+
+                after = spec_path.read_text()
+                self.assertEqual(after.count(fence), 1)
+                heading_index = after.index("## " + section + "\n")
+                marker_index = after.index(
+                    "<!-- baton-retry-publication:v1 ", heading_index,
+                )
+                entry_index = after.index(entry + "\n", marker_index)
+                fence_index = after.index(fence, entry_index + len(entry))
+                self.assertLess(heading_index, entry_index)
+                self.assertLess(heading_index, marker_index)
+                self.assertLess(marker_index, entry_index)
+                self.assertLess(entry_index, fence_index)
+                self.assertEqual(self.state(project, task_id)["attempt"], 2)
+                self.assertEqual(result.returncode, 0)
+
+    def test_retry_publication_ignores_matching_proof_inside_fence(self):
+        project = self.make_project("fenced-retry-proof")
+        task_id = self.create_task(
+            project, "fenced retry proof", ["decision/**"],
+        )
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "needs_decision"
+        state_path.write_text(json.dumps(state))
+        entry = "- Use the durable answer"
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_fenced_retry_proof_probe",
+        )
+        proof = module["retry_publication_marker"](
+            task_id, "decide", 1, entry,
+        )
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        fenced_proof = "```text\n" + proof + "\n```\n"
+        spec_path.write_text(spec_path.read_text().replace(
+            "## Decisions\n", "## Decisions\n" + fenced_proof, 1,
+        ))
+
+        result = self.baton(
+            project, "task", "decide", task_id,
+            "--answer", "Use the durable answer", check=True,
+        )
+
+        after = spec_path.read_text()
+        self.assertEqual(result.stdout, f"{task_id} answered and re-queued\n")
+        self.assertEqual(after.count(fenced_proof), 1)
+        self.assertIn("## Decisions\n" + proof + "\n" + entry + "\n", after)
+        self.assertEqual(after.count(proof), 2)
+        self.assertEqual(
+            (self.state(project, task_id)["status"],
+             self.state(project, task_id)["attempt"]),
+            ("queued", 2),
+        )
+
+    def test_retry_publication_requires_current_adjacent_entry_in_target_section(self):
+        cases = (
+            ("wrong-section", "Review feedback", "current", "exact"),
+            ("marker-only", "Decisions", "current", "missing"),
+            ("edited-entry", "Decisions", "current", "edited"),
+            ("stale-attempt", "Decisions", "stale", "exact"),
+            ("wrong-transition", "Decisions", "wrong-transition", "exact"),
+        )
+        for name, poison_section, proof_kind, entry_kind in cases:
+            with self.subTest(name=name):
+                project = self.make_project("retry-proof-" + name)
+                task_id = self.create_task(
+                    project, "retry proof " + name, ["decision/**"],
+                )
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "needs_decision"
+                state_path.write_text(json.dumps(state))
+                entry = "- Use the exact durable answer"
+                module = runpy.run_path(
+                    str(SOURCE_BATON),
+                    run_name="baton_retry_proof_{}_probe".format(
+                        name.replace("-", "_"),
+                    ),
+                )
+                marker = module["retry_publication_marker"]
+                current_proof = marker(task_id, "decide", 1, entry)
+                poison_proof = marker(
+                    task_id,
+                    "return" if proof_kind == "wrong-transition" else "decide",
+                    0 if proof_kind == "stale" else 1,
+                    entry,
+                )
+                poisoned = poison_proof + "\n"
+                if entry_kind == "exact":
+                    poisoned += entry + "\n"
+                elif entry_kind == "edited":
+                    poisoned += entry + " with an edit\n"
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                spec_path.write_text(spec_path.read_text().replace(
+                    "## " + poison_section + "\n",
+                    "## " + poison_section + "\n" + poisoned,
+                    1,
+                ))
+
+                result = self.baton(
+                    project, "task", "decide", task_id,
+                    "--answer", "Use the exact durable answer", check=True,
+                )
+
+                after = spec_path.read_text()
+                self.assertEqual(result.stdout, f"{task_id} answered and re-queued\n")
+                self.assertIn(current_proof + "\n" + entry + "\n", after)
+                self.assertTrue(module["task_spec_has_retry_publication"](
+                    after, "Decisions", current_proof, entry,
+                ))
+                self.assertIn(poison_proof, after)
+                if entry_kind == "exact":
+                    self.assertIn(entry, after)
+                elif entry_kind == "edited":
+                    self.assertIn(entry + " with an edit", after)
+                self.assertEqual(
+                    (self.state(project, task_id)["status"],
+                     self.state(project, task_id)["attempt"]),
+                    ("queued", 2),
+                )
 
     def test_orchestrator_review_brief_accept_gate_and_worker_denial(self):
         project = self.make_project()
@@ -1706,6 +3088,17 @@ class BatonTests(unittest.TestCase):
         state_path = runtime / "tasks" / f"{task_id}.json"
         state = json.loads(state_path.read_text())
         state["attempt"] = 5
+        launch = next(
+            entry for entry in state["history"] if entry.get("event") == "launched"
+        )
+        worker_exit = next(
+            entry for entry in state["history"]
+            if entry.get("event") == "worker_exited"
+        )
+        state["history"].extend((
+            {**launch, "attempt": 5},
+            {**worker_exit, "attempt": 5},
+        ))
         state_path.write_text(json.dumps(state))
         for suffix in ("brief.md", "report.md", "result.json", "diff"):
             (work / f"attempt-5.{suffix}").write_bytes(
@@ -1833,6 +3226,236 @@ class BatonTests(unittest.TestCase):
         gate_off_report.write_text(gate_off_report.read_text() + "changed without brief\n")
         self.baton(gate_off, "task", "accept", gate_off_id, check=True)
 
+    def test_review_result_schema_and_lifecycle_forgery_are_rejected(self):
+        missing = object()
+        cases = (
+            ("wrong-status", "status", "failed", "status does not match worker exit"),
+            ("wrong-note", "note", "forged note", "note does not match worker exit"),
+            ("wrong-lease", "lease", "forged-lease", "lease does not match launch"),
+            ("non-string-lease", "lease", 7, "lease must be non-empty text"),
+            ("non-string-time", "at", 7, "at must be a valid UTC timestamp"),
+            ("invalid-time", "at", "2026-02-30T00:00:00Z",
+             "at must be a valid UTC timestamp"),
+            ("non-string-note", "note", 7, "note must be text"),
+            ("wrong-paths", "changed_paths", [],
+             "changed_paths do not match worker exit declared_paths"),
+            ("extra-field", "forged", True, "exactly these fields"),
+            ("missing-field", "note", missing, "exactly these fields"),
+        )
+        for name, field, value, diagnostic in cases:
+            with self.subTest(case=name):
+                project = self.make_project("result-forgery-" + name)
+                self.configure(project, self.write_worker(GOOD_WORKER))
+                task_id = self.create_task(project, name, ["evidence/**"])
+                self.baton(project, "run", task_id, check=True)
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                work = runtime / "work" / task_id
+                result_path = work / "attempt-1.result.json"
+                result = json.loads(result_path.read_text())
+                if value is missing:
+                    result.pop(field)
+                else:
+                    result[field] = value
+                result_path.write_text(json.dumps(result))
+                state_before = state_path.read_bytes()
+
+                validation = self.baton(project, "validate")
+                review = self.baton(
+                    project, "orchestrator", "brief", "--phase", "review", task_id,
+                )
+                for rejected in (validation, review):
+                    self.assertEqual(rejected.returncode, 1)
+                    self.assertIn(diagnostic, rejected.stdout + rejected.stderr)
+                    self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertFalse((work / "review-brief-token.json").exists())
+                self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
+
+    def test_review_result_rejects_missing_duplicate_reordered_and_wrong_attempt_evidence(self):
+        cases = ("missing-launch", "duplicate-launch", "missing-exit", "reordered",
+                 "wrong-attempt", "duplicate-exit")
+        for case in cases:
+            with self.subTest(case=case):
+                project = self.make_project("lifecycle-" + case)
+                self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+                task_id = self.create_task(project, case)
+                self.baton(project, "run", task_id, check=True)
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                history = state["history"]
+                launch_index = next(
+                    index for index, entry in enumerate(history)
+                    if entry.get("event") == "launched"
+                )
+                exit_index = next(
+                    index for index, entry in enumerate(history)
+                    if entry.get("event") == "worker_exited"
+                )
+                if case == "missing-launch":
+                    history.pop(launch_index)
+                elif case == "duplicate-launch":
+                    history.insert(launch_index + 1, dict(history[launch_index]))
+                elif case == "missing-exit":
+                    history.pop(exit_index)
+                elif case == "reordered":
+                    launch = history.pop(launch_index)
+                    history.insert(exit_index, launch)
+                elif case == "wrong-attempt":
+                    history[launch_index]["attempt"] = state["attempt"] + 1
+                else:
+                    history.insert(exit_index + 1, dict(history[exit_index]))
+                state_path.write_text(json.dumps(state))
+                state_before = state_path.read_bytes()
+                work = runtime / "work" / task_id
+
+                validation = self.baton(project, "validate")
+                review = self.baton(
+                    project, "orchestrator", "brief", "--phase", "review", task_id,
+                )
+                for rejected in (validation, review):
+                    self.assertEqual(rejected.returncode, 1)
+                    self.assertIn("lifecycle", rejected.stdout + rejected.stderr)
+                    self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertFalse((work / "review-brief-token.json").exists())
+
+    def test_malformed_review_history_rejects_every_gate_without_mutation(self):
+        project = self.make_project("malformed-review-history")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(
+            project, "malformed review history", ["evidence/**"],
+        )
+        self.baton(project, "run", task_id, check=True)
+        _brief, token = self.review_brief_token(project, task_id)
+
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        work = runtime / "work" / task_id
+        state = json.loads(state_path.read_text())
+        state["history"].insert(1, "forged-history-entry")
+        state_path.write_text(json.dumps(state))
+        state_before = state_path.read_bytes()
+        evidence_before = {
+            path.name: path.read_bytes() for path in work.iterdir() if path.is_file()
+        }
+
+        commands = (
+            ("validate",),
+            ("orchestrator", "brief", "--phase", "review", task_id),
+            ("task", "accept", task_id, "--brief", token),
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                rejected = self.baton(project, *command)
+                output = rejected.stdout + rejected.stderr
+                self.assertEqual(rejected.returncode, 1, output)
+                self.assertIn("history entry 1 must be an object", output)
+                self.assertNotIn("Traceback", output)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in work.iterdir() if path.is_file()
+                    },
+                    evidence_before,
+                )
+                self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
+
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_malformed_review_history_probe",
+        )
+        with self.assertRaisesRegex(
+                ValueError, "review lifecycle history entry 1 must be an object"):
+            module["review_evidence_details"](str(runtime), state)
+
+    def test_post_finalization_result_mutation_blocks_validate_review_and_accept(self):
+        project = self.make_project("post-finalization-result-mutation")
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "post-finalization mutation")
+        self.baton(project, "run", task_id, check=True)
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        work = runtime / "work" / task_id
+        worker_exit = self.state(project, task_id)["history"][-1]
+        self.assertRegex(worker_exit["result_digest"], r"^sha256:[0-9a-f]{64}$")
+        _brief, token = self.review_brief_token(project, task_id)
+        token_path = work / "review-brief-token.json"
+        token_before = token_path.read_bytes()
+        result_path = work / "attempt-1.result.json"
+        result = json.loads(result_path.read_text())
+        result["at"] = "2026-01-01T00:00:00Z"
+        result_path.write_text(json.dumps(result))
+        state_before = state_path.read_bytes()
+
+        validation = self.baton(project, "validate")
+        review = self.baton(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+        )
+        accept = self.baton(
+            project, "task", "accept", task_id, "--brief", token,
+        )
+        for rejected in (validation, review, accept):
+            self.assertEqual(rejected.returncode, 1)
+            self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+        self.assertIn("changed after finalization", validation.stdout)
+        self.assertIn("changed after finalization", review.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual(token_path.read_bytes(), token_before)
+        self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
+
+    def test_valid_legacy_finalized_review_result_remains_supported(self):
+        project = self.make_project("legacy-finalized-result")
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "legacy finalized result")
+        self.baton(project, "run", task_id, check=True)
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        worker_exit = state["history"][-1]
+        worker_exit.pop("attempt")
+        worker_exit.pop("result_digest")
+        worker_exit.pop("observed_paths")
+        state_path.write_text(json.dumps(state))
+
+        self.baton(project, "validate", check=True)
+        _brief, token = self.review_brief_token(project, task_id)
+        self.baton(
+            project, "task", "accept", task_id, "--brief", token, check=True,
+        )
+        self.baton(project, "archive", check=True)
+        self.baton(project, "validate", check=True)
+
+    def test_archived_finalized_result_digest_is_validated_without_mutation(self):
+        project = self.make_project("archived-result-mutation")
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "archived result mutation")
+        self.baton(project, "run", task_id, check=True)
+        self.accept_task(project, task_id)
+        self.baton(project, "archive", check=True)
+        runtime = project / ".baton"
+        state_path = runtime / "archive" / f"{task_id}.json"
+        result_path = (
+            runtime / "archive" / f"{task_id}.work" / "attempt-1.result.json"
+        )
+        result = json.loads(result_path.read_text())
+        result["at"] = "2026-01-01T00:00:00Z"
+        result_path.write_text(json.dumps(result))
+        state_before = state_path.read_bytes()
+        work_entries_before = sorted(
+            path.name for path in result_path.parent.iterdir()
+        )
+
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        self.assertIn("changed after finalization", validation.stdout)
+        self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertEqual(
+            sorted(path.name for path in result_path.parent.iterdir()),
+            work_entries_before,
+        )
+
     def test_review_evidence_mutations_reject_without_consuming_token(self):
         for artifact in ("report.md", "result.json", "diff"):
             with self.subTest(artifact=artifact):
@@ -1861,11 +3484,25 @@ class BatonTests(unittest.TestCase):
                 self.assertEqual(json.loads(token_path.read_text())["token"], token)
                 self.assertEqual(self.state(project, task_id)["status"], "needs_review")
 
-                _fresh, fresh_token = self.review_brief_token(project, task_id)
-                self.baton(
-                    project, "task", "accept", task_id,
-                    "--brief", fresh_token, check=True,
-                )
+                if artifact == "result.json":
+                    fresh = self.baton(
+                        project, "orchestrator", "brief", "--phase", "review",
+                        task_id,
+                    )
+                    self.assertEqual(fresh.returncode, 1)
+                    self.assertIn("changed after finalization", fresh.stderr)
+                    self.assertEqual(
+                        json.loads(token_path.read_text())["token"], token,
+                    )
+                    self.assertEqual(
+                        self.state(project, task_id)["status"], "needs_review",
+                    )
+                else:
+                    _fresh, fresh_token = self.review_brief_token(project, task_id)
+                    self.baton(
+                        project, "task", "accept", task_id,
+                        "--brief", fresh_token, check=True,
+                    )
 
     def test_review_and_accept_reject_structurally_invalid_report_drift(self):
         project = self.make_project()
@@ -2049,7 +3686,7 @@ class BatonTests(unittest.TestCase):
         compact = subprocess.run(
             [runtime / "baton", "hook-event", "session-start"],
             cwd=project, input='{"source":"compact"}', text=True,
-            capture_output=True,
+            capture_output=True, env=clean_test_environment(),
         )
         self.assertEqual(compact.returncode, 0)
         self.assertIn("Which model and reasoning level should Baton use", compact.stdout)
@@ -2062,7 +3699,7 @@ class BatonTests(unittest.TestCase):
         compact = subprocess.run(
             [runtime / "baton", "hook-event", "session-start"],
             cwd=project, input='{"source":"compact"}', text=True,
-            capture_output=True,
+            capture_output=True, env=clean_test_environment(),
         )
         self.assertEqual(compact.returncode, 0)
         self.assertNotIn("Which model and reasoning level should Baton use", compact.stdout)
@@ -2342,7 +3979,11 @@ class BatonTests(unittest.TestCase):
         globals_ = module["orchestrator_start_brief"].__globals__
         globals_["file_lock"] = LockProbe
         globals_["read_handoff"] = lambda _baton_dir: events.append("read") or handoff
+        globals_["read_handoff_cursor"] = (
+            lambda _baton_dir: events.append("cursor-read") or None
+        )
         globals_["atomic_write"] = lambda *_args: events.append("write")
+        globals_["atomic_json"] = lambda *_args: events.append("cursor-write")
         globals_["load_archived_tasks"] = lambda _baton_dir: events.append("archive") or []
         globals_["task_lock"] = lambda *_args: self.fail(
             "task lock nested in handoff lock"
@@ -2357,7 +3998,7 @@ class BatonTests(unittest.TestCase):
             "/baton", [], consume_handoff=True,
         )
         self.assertEqual(events, [
-            ("enter", "orchestrator-handoff.lock"), "read", "write",
+            ("enter", "orchestrator-handoff.lock"), "read", "cursor-read", "write",
             ("exit", "orchestrator-handoff.lock"),
         ])
         events.clear()
@@ -2366,7 +4007,8 @@ class BatonTests(unittest.TestCase):
             "/baton", [], archived, "next goal", [], [], False,
         )
         self.assertEqual(events, [
-            "archive", ("enter", "orchestrator-handoff.lock"), "read", "write",
+            "archive", ("enter", "orchestrator-handoff.lock"), "read",
+            "cursor-read", "cursor-write", "write",
             ("exit", "orchestrator-handoff.lock"),
         ])
 
@@ -2481,7 +4123,7 @@ class BatonTests(unittest.TestCase):
                 )[0].splitlines()
             ]
 
-        self.assertLessEqual(len(content), 4000)
+        self.assertLessEqual(len(content), 3989)
         self.assertNotIn("outcome:", content)
         self.assertEqual(section("done", "decisions"), ["+12 more"])
         self.assertEqual(section("decisions", "next"), ["+12 more"])
@@ -2492,6 +4134,245 @@ class BatonTests(unittest.TestCase):
         for note in notes:
             self.assertIn("- " + note, content)
         self.assertTrue(content.endswith("- " + avoid[-1] + "\n"))
+
+    def test_handoff_consumption_reserves_and_compacts_every_legacy_boundary(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_consumption_budget")
+        globals_ = module["render_handoff"].__globals__
+        generated_at = "2026-01-01T00:00:00Z"
+        consumed_at = "2026-01-01T00:00:01Z"
+        expected_headings = [
+            "done:", "decisions:", "next:", "unresolved:", "notes:", "avoid:",
+        ]
+
+        def legacy_render(size, task_id):
+            # Recreate the former renderer's 4,000-character close budget.
+            reserved_limit = globals_["HANDOFF_UNCONSUMED_MAX_CHARS"]
+            globals_["HANDOFF_UNCONSUMED_MAX_CHARS"] = 4000
+            try:
+                arguments = (
+                    generated_at, "continue safely", False,
+                    [(task_id, "accepted result", "verified")], [], [], [],
+                )
+                base = module["render_handoff"](
+                    *arguments, ["x"], ["avoid regression"],
+                )
+                content = module["render_handoff"](
+                    *arguments, ["x" * (1 + size - len(base))],
+                    ["avoid regression"],
+                )
+            finally:
+                globals_["HANDOFF_UNCONSUMED_MAX_CHARS"] = reserved_limit
+            self.assertEqual(len(content), size)
+            return content
+
+        versions = {3989: None, 3990: 1, 3999: 2, 4000: 3}
+        for size, version in versions.items():
+            with self.subTest(size=size, version=version):
+                project = self.make_project("handoff-consumption-{}".format(size))
+                runtime = project / ".baton"
+                task_id = "T{}-budget-identity".format(size)
+                content = legacy_render(size, task_id)
+                if size == 3990:
+                    self.assertEqual(
+                        len(content.replace(
+                            "consumed_at: (not yet)",
+                            "consumed_at: " + consumed_at, 1,
+                        )),
+                        4001,
+                    )
+                handoff_path = runtime / "orchestrator-handoff.md"
+                cursor_path = runtime / "orchestrator-handoff-cursor.json"
+                handoff_path.write_text(content)
+                if version == 1:
+                    cursor_path.write_text(json.dumps({
+                        "version": 1, "accepted_at": generated_at,
+                        "seen_ids": [task_id],
+                    }))
+                elif version == 2:
+                    cursor_path.write_text(json.dumps({
+                        "version": 2, "accepted_at": generated_at,
+                        "seen_ids": [task_id], "handoff": content,
+                    }))
+                elif version == 3:
+                    cursor_path.write_text(json.dumps({
+                        "version": 3, "reported_ids": [task_id],
+                        "handoff": content,
+                    }))
+                task = {
+                    "id": task_id, "title": "accepted result", "status": "done",
+                    "history": [{"event": "accepted", "at": generated_at}],
+                }
+                clock = {"now": consumed_at}
+                globals_["now"] = lambda: clock["now"]
+                globals_["say"] = lambda *_args: None
+                expected_consumed = module["consume_handoff_content"](
+                    content, consumed_at,
+                )
+                self.assertEqual(
+                    module["consume_handoff_content"](content, consumed_at),
+                    expected_consumed,
+                )
+
+                module["orchestrator_start_brief"](runtime, [task])
+                consumed = handoff_path.read_text()
+                self.assertEqual(consumed, expected_consumed)
+                self.assertEqual(len(consumed), 4000)
+                self.assertEqual(
+                    module["handoff_field"](consumed, "generated_at"), generated_at,
+                )
+                self.assertEqual(
+                    module["handoff_field"](consumed, "consumed_at"), consumed_at,
+                )
+                self.assertEqual(
+                    [line for line in consumed.splitlines() if line in expected_headings],
+                    expected_headings,
+                )
+                self.assertIn(task_id, consumed)
+                if version in (2, 3):
+                    self.assertEqual(
+                        json.loads(cursor_path.read_text())["handoff"], consumed,
+                    )
+                if version is not None:
+                    module["read_handoff_cursor"](runtime)
+
+                clock["now"] = "2026-01-01T00:00:02Z"
+                before_second = consumed
+                module["orchestrator_start_brief"](runtime, [task])
+                second = handoff_path.read_text()
+                self.assertEqual(
+                    second,
+                    before_second.replace(consumed_at, clock["now"], 1),
+                )
+
+                clock["now"] = "2026-01-01T00:00:03Z"
+                module["orchestrator_close_brief"](
+                    runtime, [task], [], "continue after migration", [], [], False,
+                )
+                closed = handoff_path.read_text()
+                migrated = module["read_handoff_cursor"](runtime)
+                self.assertLessEqual(len(closed), 3989)
+                self.assertEqual(migrated["version"], 3)
+                self.assertIn(task_id, migrated["reported_ids"])
+                self.assertEqual(migrated["handoff"], closed)
+
+                clock["now"] = "2026-01-01T00:00:04Z"
+                module["orchestrator_start_brief"](runtime, [task])
+                self.assertLessEqual(len(handoff_path.read_text()), 4000)
+                self.assertLessEqual(
+                    len(module["read_handoff_cursor"](runtime)["handoff"]), 4000,
+                )
+
+    def test_small_handoff_consumption_is_an_exact_metadata_replacement(self):
+        project = self.make_project("small-handoff-consumption")
+        runtime = project / ".baton"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_small_consumption")
+        content = module["render_handoff"](
+            "2026-01-01T00:00:00Z", "preserve ordinary bytes", False,
+            [("T900-small", "small task", "verified")], ["decision"],
+            ["T901-next"], ["T902-unresolved"], ["note"], ["avoid"],
+        )
+        cursor_path = runtime / "orchestrator-handoff-cursor.json"
+        handoff_path = runtime / "orchestrator-handoff.md"
+        handoff_path.write_text(content)
+        cursor_path.write_text(json.dumps({
+            "version": 3, "reported_ids": [], "handoff": content,
+        }))
+        globals_ = module["orchestrator_start_brief"].__globals__
+        globals_["now"] = lambda: "2026-01-01T00:00:01Z"
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_start_brief"](runtime, [])
+
+        expected = content.replace(
+            "consumed_at: (not yet)",
+            "consumed_at: 2026-01-01T00:00:01Z", 1,
+        )
+        self.assertEqual(handoff_path.read_bytes(), expected.encode())
+        self.assertEqual(json.loads(cursor_path.read_text())["handoff"], expected)
+        self.assertEqual(
+            module["handoff_done_ids"](expected), {"T900-small"},
+        )
+
+    def test_handoff_consumption_malformed_or_uncompactable_is_no_mutation(self):
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_consumption_failure")
+        globals_ = module["orchestrator_start_brief"].__globals__
+        base = module["render_handoff"](
+            "2026-01-01T00:00:00Z", "valid goal", False,
+            [], [], [], [], [], ["avoid"],
+        )
+        malformed = (
+            base.replace("done:\n", "", 1),
+            base.replace(
+                "consumed_at: (not yet)\n",
+                "consumed_at: (not yet)\nconsumed_at: (not yet)\n", 1,
+            ),
+        )
+        for index, content in enumerate(malformed):
+            with self.subTest(kind="malformed", index=index):
+                project = self.make_project("malformed-consumption-{}".format(index))
+                runtime = project / ".baton"
+                handoff_path = runtime / "orchestrator-handoff.md"
+                cursor_path = runtime / "orchestrator-handoff-cursor.json"
+                handoff_path.write_text(content)
+                cursor_path.write_text(json.dumps({
+                    "version": 3, "reported_ids": [], "handoff": content,
+                }, indent=2) + "\n")
+                before = handoff_path.read_bytes(), cursor_path.read_bytes()
+                globals_["now"] = lambda: "2026-01-01T00:00:01Z"
+                globals_["say"] = lambda *_args: None
+
+                with self.assertRaises(SystemExit):
+                    module["orchestrator_start_brief"](runtime, [])
+                self.assertEqual(
+                    (handoff_path.read_bytes(), cursor_path.read_bytes()), before,
+                )
+
+        project = self.make_project("invalid-consumption-timestamp")
+        runtime = project / ".baton"
+        handoff_path = runtime / "orchestrator-handoff.md"
+        cursor_path = runtime / "orchestrator-handoff-cursor.json"
+        handoff_path.write_text(base)
+        cursor_path.write_text(json.dumps({
+            "version": 3, "reported_ids": [], "handoff": base,
+        }, indent=2) + "\n")
+        before = handoff_path.read_bytes(), cursor_path.read_bytes()
+        globals_["now"] = lambda: "2026-02-30T00:00:01Z"
+        globals_["say"] = lambda *_args: None
+        with self.assertRaises(SystemExit):
+            module["orchestrator_start_brief"](runtime, [])
+        self.assertEqual((handoff_path.read_bytes(), cursor_path.read_bytes()), before)
+
+        task_prefix = "T900-"
+        template = (
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: g\n"
+            "done:\n- {task_id}:\n"
+            "decisions:\n- (none)\n"
+            "next:\n- (none)\n"
+            "unresolved:\n- (none)\n"
+            "avoid:\n- (none)\n"
+        )
+        short = template.format(task_id=task_prefix + "x")
+        uncompactable = template.format(
+            task_id=task_prefix + "x" * (1 + 4000 - len(short)),
+        )
+        self.assertEqual(len(uncompactable), 4000)
+        self.assertIsNotNone(module["handoff_structure"](uncompactable))
+        project = self.make_project("uncompactable-consumption")
+        runtime = project / ".baton"
+        handoff_path = runtime / "orchestrator-handoff.md"
+        cursor_path = runtime / "orchestrator-handoff-cursor.json"
+        handoff_path.write_text(uncompactable)
+        cursor_path.write_text(json.dumps({
+            "version": 3, "reported_ids": [], "handoff": uncompactable,
+        }, indent=2) + "\n")
+        before = handoff_path.read_bytes(), cursor_path.read_bytes()
+        globals_["now"] = lambda: "2026-01-01T00:00:01Z"
+        with self.assertRaises(SystemExit):
+            module["orchestrator_start_brief"](runtime, [])
+        self.assertEqual((handoff_path.read_bytes(), cursor_path.read_bytes()), before)
 
     def test_close_to_start_round_trip_includes_outcome_warning_and_notes(self):
         project = self.make_project()
@@ -2557,7 +4438,7 @@ class BatonTests(unittest.TestCase):
         for hook_input in ('{"source":"startup"}', '{"source":"compact"}'):
             hooked = subprocess.run(
                 hook_command, cwd=project, input=hook_input, text=True,
-                capture_output=True,
+                capture_output=True, env=clean_test_environment(),
             )
             self.assertEqual(hooked.returncode, 0)
             self.assertEqual(hooked.stderr, "")
@@ -2602,6 +4483,1030 @@ class BatonTests(unittest.TestCase):
         self.assertIn(task_id, first)
         self.assertIn(" — outcome: Reviewer-confirmed result", first)
         self.assertNotIn(task_id, second)
+
+    def test_handoff_acceptance_tracking_survives_clock_rollback(self):
+        project = self.make_project("handoff-clock-rollback")
+        runtime = project / ".baton"
+        handoff = runtime / "orchestrator-handoff.md"
+        cursor = runtime / "orchestrator-handoff-cursor.json"
+        handoff.unlink(missing_ok=True)
+        cursor.unlink(missing_ok=True)
+        old = {
+            "id": "T901-old", "title": "accepted at the first boundary",
+            "status": "done", "history": [{
+                "event": "accepted", "at": "2026-01-01T00:00:10Z",
+            }],
+        }
+        rollback = {
+            "id": "T902-rollback", "title": "accepted after clock rollback",
+            "status": "done", "history": [{
+                "event": "accepted", "at": "2026-01-01T00:00:05Z",
+            }],
+        }
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_rollback_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        clock = iter((
+            "2026-01-01T00:00:10Z",
+            "2026-01-01T00:00:06Z",
+            "2026-01-01T00:00:07Z",
+        ))
+        globals_["now"] = lambda: next(clock)
+        globals_["say"] = lambda *_args: None
+
+        counts = []
+        for tasks in ([old], [old, rollback], [old, rollback]):
+            module["orchestrator_close_brief"](
+                runtime, tasks, [], "next goal", [], [], False,
+            )
+            done = handoff.read_text().split("done:\n", 1)[1].split(
+                "decisions:\n", 1,
+            )[0]
+            counts.append((done.count(old["id"]), done.count(rollback["id"])))
+
+        self.assertEqual(counts, [(1, 0), (0, 1), (0, 0)])
+        state = json.loads(cursor.read_text())
+        self.assertEqual(state["version"], 3)
+        self.assertEqual(state["reported_ids"], [old["id"], rollback["id"]])
+
+    def test_handoff_close_snapshot_serializes_with_acceptance(self):
+        project = self.make_project("handoff-close-accept-race")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        config = project / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\naccept_requires_brief = false\n"
+        )
+        task_id = self.create_task(project, "close accept race", ["race/**"])
+        self.baton(project, "run", task_id, check=True)
+        runtime = project / ".baton"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_close_accept_probe")
+        globals_ = module["cmd_orchestrator_brief"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["say"] = lambda *_args: None
+        original_load_archived = globals_["load_archived_tasks"]
+        original_file_lock = globals_["file_lock"]
+        original_atomic_write = globals_["atomic_write"]
+        snapshot_taken = threading.Event()
+        release_close = threading.Event()
+        accept_lock_attempted = threading.Event()
+        close_published = threading.Event()
+        errors = {}
+
+        def paused_load_archived(baton_dir, validate_history=True):
+            if threading.current_thread().name == "close-probe":
+                snapshot_taken.set()
+                if not release_close.wait(5):
+                    raise RuntimeError("close synchronization timed out")
+            return original_load_archived(baton_dir, validate_history)
+
+        @contextmanager
+        def observed_file_lock(path):
+            if (
+                    threading.current_thread().name == "accept-probe"
+                    and path == globals_["lock_path"](str(runtime), "scheduler")):
+                accept_lock_attempted.set()
+            with original_file_lock(path):
+                yield
+
+        def observed_atomic_write(path, content, mode=0o644):
+            original_atomic_write(path, content, mode)
+            if (
+                    threading.current_thread().name == "close-probe"
+                    and path == globals_["orchestrator_handoff_path"](str(runtime))):
+                close_published.set()
+
+        later_times = iter((
+            "2026-01-01T00:00:04Z", "2026-01-01T00:00:05Z",
+        ))
+
+        def deterministic_now():
+            thread = threading.current_thread().name
+            if thread == "close-probe":
+                return "2026-01-01T00:00:02Z"
+            if thread == "accept-probe":
+                return (
+                    "2026-01-01T00:00:03Z" if close_published.is_set()
+                    else "2026-01-01T00:00:01Z"
+                )
+            return next(later_times)
+
+        globals_["load_archived_tasks"] = paused_load_archived
+        globals_["file_lock"] = observed_file_lock
+        globals_["atomic_write"] = observed_atomic_write
+        globals_["now"] = deterministic_now
+        close_args = SimpleNamespace(
+            phase="close", include_log_tail=False, goal="continue",
+            avoid=[], note=[], id=None,
+        )
+
+        def close():
+            try:
+                module["cmd_orchestrator_brief"](close_args)
+            except BaseException as error:
+                errors["close"] = error
+
+        def accept():
+            try:
+                module["cmd_task_accept"](SimpleNamespace(
+                    id=task_id, brief=None, note="accepted during close",
+                ))
+            except BaseException as error:
+                errors["accept"] = error
+
+        close_thread = threading.Thread(target=close, name="close-probe")
+        accept_thread = threading.Thread(target=accept, name="accept-probe")
+        close_thread.start()
+        self.assertTrue(snapshot_taken.wait(5))
+        accept_thread.start()
+        self.assertTrue(accept_lock_attempted.wait(5))
+        release_close.set()
+        close_thread.join(5)
+        accept_thread.join(5)
+        self.assertFalse(close_thread.is_alive())
+        self.assertFalse(accept_thread.is_alive())
+        self.assertEqual(errors, {})
+
+        handoff = runtime / "orchestrator-handoff.md"
+
+        def done_count():
+            return handoff.read_text().split("done:\n", 1)[1].split(
+                "decisions:\n", 1,
+            )[0].count(task_id)
+
+        counts = [done_count()]
+        globals_["load_archived_tasks"] = original_load_archived
+        for _close in range(2):
+            module["cmd_orchestrator_brief"](close_args)
+            counts.append(done_count())
+
+        task = self.state(project, task_id)
+        accepted_at = next(
+            entry["at"] for entry in task["history"]
+            if entry.get("event") == "accepted"
+        )
+        first_generated_at = "2026-01-01T00:00:02Z"
+        self.assertLess(first_generated_at, accepted_at)
+        self.assertEqual(counts, [0, 1, 0])
+
+    def test_handoff_close_recovers_interrupted_presentation_publication(self):
+        project = self.make_project("handoff-interrupted-publication")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        config = project / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\naccept_requires_brief = false\n"
+        )
+        first_id = self.create_task(project, "published before failure", ["first/**"])
+        second_id = self.create_task(project, "accepted after failure", ["second/**"])
+        self.baton(project, "run", first_id, check=True)
+        self.baton(project, "run", second_id, check=True)
+        runtime = project / ".baton"
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: previous\n"
+            "done:\n- (none)\n"
+        )
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_interrupted_publication_probe",
+        )
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["say"] = lambda *_args: None
+        clock = {"now": "2026-01-01T00:00:01Z"}
+        globals_["now"] = lambda: clock["now"]
+
+        module["cmd_task_accept"](SimpleNamespace(
+            id=first_id, brief=None, note="first accepted result",
+        ))
+        clock["now"] = "2026-01-01T00:00:02Z"
+        original_atomic_write = globals_["atomic_write"]
+        publication_attempted = threading.Event()
+        fail_presentation = {"armed": True}
+
+        def interrupted_atomic_write(path, content, mode=0o644):
+            if (
+                    fail_presentation["armed"]
+                    and path == globals_["orchestrator_handoff_path"](str(runtime))):
+                fail_presentation["armed"] = False
+                publication_attempted.set()
+                raise OSError("injected handoff presentation failure")
+            original_atomic_write(path, content, mode)
+
+        globals_["atomic_write"] = interrupted_atomic_write
+        with self.assertRaisesRegex(OSError, "injected handoff presentation failure"):
+            module["orchestrator_close_brief"](
+                runtime, [self.state(project, first_id), self.state(project, second_id)],
+                [], "failed close", [], [], False,
+            )
+        self.assertTrue(publication_attempted.is_set())
+        state_path = runtime / "orchestrator-handoff-cursor.json"
+        state_after_failure = json.loads(state_path.read_text())
+        self.assertEqual(state_after_failure["version"], 3)
+        self.assertEqual(state_after_failure["reported_ids"], [first_id])
+        self.assertIn(first_id, state_after_failure["handoff"])
+        self.assertIn("goal: previous\n", handoff.read_text())
+
+        clock["now"] = "2026-01-01T00:00:03Z"
+        module["cmd_task_accept"](SimpleNamespace(
+            id=second_id, brief=None, note="second accepted result",
+        ))
+        clock["now"] = "2026-01-01T00:00:04Z"
+        tasks = [self.state(project, first_id), self.state(project, second_id)]
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "recovered close", [], [], False,
+        )
+        recovered_done = handoff.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+
+        clock["now"] = "2026-01-01T00:00:05Z"
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "next close", [], [], False,
+        )
+        following_done = handoff.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+        self.assertEqual(recovered_done.count(first_id), 1)
+        self.assertEqual(recovered_done.count(second_id), 1)
+        self.assertNotIn(first_id, following_done)
+        self.assertNotIn(second_id, following_done)
+
+    def test_start_recovers_cursor_handoff_after_interrupted_close_publication(self):
+        project = self.make_project("start-recovers-cursor-publication")
+        runtime = project / ".baton"
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: stale Markdown goal\n"
+            "done:\n- T900-stale: stale done entry\n"
+            "decisions:\n- stale decision\n"
+            "next:\n- T900-stale\n"
+            "unresolved:\n- T900-stale\n"
+            "notes:\n- stale note\n"
+            "avoid:\n- stale warning\n"
+        )
+        done_id = "T901-canonical-done"
+        decision_id = "T902-canonical-decision"
+        next_id = "T903-canonical-next"
+        unresolved_id = "T904-canonical-unresolved"
+        tasks = [
+            {
+                "id": done_id, "title": "canonical completed work", "status": "done",
+                "history": [{
+                    "event": "accepted", "at": "2026-01-01T00:00:01Z",
+                    "note": "canonical outcome",
+                }],
+            },
+            {
+                "id": decision_id, "title": "canonical decision", "status": "done",
+                "history": [{
+                    "event": "decided", "at": "2026-01-01T00:00:01Z",
+                    "answer": "use the cursor presentation",
+                }],
+            },
+            {"id": next_id, "title": "canonical next", "status": "queued"},
+            {
+                "id": unresolved_id, "title": "canonical unresolved",
+                "status": "needs_decision", "last_note": "choose recovery policy",
+            },
+        ]
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_start_cursor_recovery_probe",
+        )
+        globals_ = module["cmd_orchestrator_brief"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["load_all_tasks"] = lambda *_args, **_kwargs: tasks
+        clock = {"now": "2026-01-01T00:00:01Z"}
+        globals_["now"] = lambda: clock["now"]
+        original_atomic_write = globals_["atomic_write"]
+        fail_presentation = {"armed": True}
+
+        def interrupted_atomic_write(path, content, mode=0o644):
+            if (
+                    fail_presentation["armed"]
+                    and path == globals_["orchestrator_handoff_path"](str(runtime))):
+                fail_presentation["armed"] = False
+                raise OSError("injected handoff presentation failure")
+            original_atomic_write(path, content, mode)
+
+        globals_["atomic_write"] = interrupted_atomic_write
+        globals_["say"] = lambda *_args: None
+        with self.assertRaisesRegex(OSError, "injected handoff presentation failure"):
+            module["orchestrator_close_brief"](
+                runtime, tasks, [], "canonical recovered goal",
+                ["avoid stale Markdown"], ["canonical operator note"], True,
+            )
+
+        cursor_path = runtime / "orchestrator-handoff-cursor.json"
+        cursor_after_failure = json.loads(cursor_path.read_text())
+        canonical = cursor_after_failure["handoff"]
+        self.assertIn("goal: canonical recovered goal\n", canonical)
+        self.assertIn("goal: stale Markdown goal\n", handoff.read_text())
+
+        brief_args = SimpleNamespace(
+            phase="start", include_log_tail=False, goal=None,
+            avoid=[], note=[], id=None,
+        )
+        emitted = []
+        globals_["say"] = emitted.append
+        clock["now"] = "2026-01-01T00:00:02Z"
+        module["cmd_orchestrator_brief"](brief_args)
+        output = "\n".join(emitted)
+        for expected in (
+                "# Orchestrator handoff",
+                "generated_at: 2026-01-01T00:00:01Z",
+                "consumed_at: 2026-01-01T00:00:02Z",
+                "goal: canonical recovered goal",
+                "warning: uncommitted Git-visible changes at close",
+                f"{done_id}: canonical completed work — outcome: canonical outcome",
+                f"{decision_id}: use the cursor presentation",
+                f"next:\n- {next_id}",
+                f"unresolved:\n- {unresolved_id}",
+                "notes:\n- canonical operator note",
+                "avoid:\n- avoid stale Markdown"):
+            self.assertIn(expected, output)
+        self.assertNotIn("stale Markdown goal", output)
+        consumed_cursor = json.loads(cursor_path.read_text())
+        self.assertEqual(consumed_cursor["handoff"], handoff.read_text())
+        self.assertNotIn("consumed_at: (not yet)", consumed_cursor["handoff"])
+
+        emitted.clear()
+        clock["now"] = "2026-01-01T00:00:03Z"
+        module["cmd_orchestrator_brief"](brief_args)
+        self.assertNotIn("consumed_at: (not yet)", "\n".join(emitted))
+        self.assertEqual(json.loads(cursor_path.read_text())["handoff"], handoff.read_text())
+
+        clock["now"] = "2026-01-01T00:00:04Z"
+        globals_["say"] = lambda *_args: None
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "following close", [], [], False,
+        )
+        following = handoff.read_text()
+        self.assertNotIn(done_id, following)
+        self.assertEqual(json.loads(cursor_path.read_text())["handoff"], following)
+
+    def test_handoff_same_second_cursor_survives_three_closes(self):
+        project = self.make_project("same-second-three-closes")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        config = project / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\naccept_requires_brief = false\n"
+        )
+        task_id = self.create_task(project, "three close cursor", ["cursor/**"])
+        self.baton(project, "run", task_id, check=True)
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:00Z"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_three_close_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["now"] = lambda: boundary
+        globals_["say"] = lambda *_args: None
+        module["cmd_task_accept"](SimpleNamespace(
+            id=task_id, brief=None, note="accepted at boundary",
+        ))
+
+        counts = []
+        for _close in range(3):
+            module["orchestrator_close_brief"](
+                runtime, [self.state(project, task_id)], [],
+                "next goal", [], [], False,
+            )
+            done = (runtime / "orchestrator-handoff.md").read_text().split(
+                "done:\n", 1,
+            )[1].split("decisions:\n", 1)[0]
+            counts.append(done.count(task_id))
+
+        self.assertEqual(counts, [1, 0, 0])
+
+    def test_handoff_same_second_cursor_includes_new_interleaved_acceptance(self):
+        project = self.make_project("same-second-interleaved-acceptance")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        config = project / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\naccept_requires_brief = false\n"
+        )
+        old_id = self.create_task(project, "old boundary task", ["old/**"])
+        new_id = self.create_task(project, "new boundary task", ["new/**"])
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:00Z"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_interleave_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        globals_["now"] = lambda: boundary
+        globals_["say"] = lambda *_args: None
+
+        def accept(task_id):
+            self.baton(project, "run", task_id, check=True)
+            module["cmd_task_accept"](SimpleNamespace(
+                id=task_id, brief=None, note="accepted at boundary",
+            ))
+
+        def close():
+            tasks = [self.state(project, task_id) for task_id in (old_id, new_id)]
+            module["orchestrator_close_brief"](
+                runtime, tasks, [], "next goal", [], [], False,
+            )
+            return (runtime / "orchestrator-handoff.md").read_text().split(
+                "done:\n", 1,
+            )[1].split("decisions:\n", 1)[0]
+
+        accept(old_id)
+        sections = [close(), close()]
+        accept(new_id)
+        sections.extend((close(), close()))
+
+        self.assertEqual([section.count(old_id) for section in sections], [1, 0, 0, 0])
+        self.assertEqual([section.count(new_id) for section in sections], [0, 0, 1, 0])
+
+    def test_handoff_cursor_remembers_same_second_ids_omitted_by_done_limit(self):
+        project = self.make_project("same-second-cursor-overflow")
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:00Z"
+        tasks = [
+            {
+                "id": f"T{number:03d}-overflow", "title": "t" * 240,
+                "status": "done", "history": [{
+                    "event": "accepted", "at": boundary, "note": "done",
+                }],
+            }
+            for number in range(1, 13)
+        ]
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_overflow_cursor_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["now"] = lambda: boundary
+        globals_["say"] = lambda *_args: None
+
+        sections = []
+        for _close in range(2):
+            module["orchestrator_close_brief"](
+                runtime, tasks, [], "next goal", [], [], False,
+            )
+            content = (runtime / "orchestrator-handoff.md").read_text()
+            self.assertLessEqual(len(content), 4000)
+            sections.append(content.split("done:\n", 1)[1].split(
+                "decisions:\n", 1,
+            )[0])
+
+        self.assertIn("+4 more", sections[0])
+        self.assertTrue(all(task["id"] not in sections[1] for task in tasks))
+
+    def test_handoff_overflow_crash_recovery_and_consumption_preserve_presentation(self):
+        project = self.make_project("handoff-overflow-crash-recovery")
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:00Z"
+        handoff_path = runtime / "orchestrator-handoff.md"
+        handoff_path.write_text(
+            "# Orchestrator handoff\n"
+            "generated_at: 2025-12-31T23:59:59Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: stale presentation\n"
+            "done:\n- (none)\n"
+        )
+        tasks = [
+            {
+                "id": f"T{number:03d}-recovered", "title": f"result {number:02d}",
+                "status": "done", "history": [{
+                    "event": "accepted", "at": boundary,
+                    "note": f"outcome {number:02d}",
+                }],
+            }
+            for number in range(1, 13)
+        ]
+        tasks[0]["history"].append({
+            "event": "decided", "at": boundary, "answer": "first decision",
+        })
+        tasks[1]["history"].append({
+            "event": "decided", "at": boundary, "answer": "second decision",
+        })
+        tasks.extend({
+            "id": f"T{number:03d}-next", "title": "queued", "status": "queued",
+        } for number in range(101, 111))
+        tasks.extend({
+            "id": f"T{number:03d}-unresolved", "title": "blocked",
+            "status": "needs_decision",
+        } for number in range(201, 211))
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_overflow_recovery_probe",
+        )
+        globals_ = module["orchestrator_close_brief"].__globals__
+        clock = {"now": boundary}
+        globals_["now"] = lambda: clock["now"]
+        globals_["say"] = lambda *_args: None
+        original_atomic_write = globals_["atomic_write"]
+        fail_presentation = {"armed": True}
+
+        def interrupted_atomic_write(path, content, mode=0o644):
+            if (
+                    fail_presentation["armed"]
+                    and path == globals_["orchestrator_handoff_path"](str(runtime))):
+                fail_presentation["armed"] = False
+                raise OSError("injected overflow handoff presentation failure")
+            original_atomic_write(path, content, mode)
+
+        globals_["atomic_write"] = interrupted_atomic_write
+        with self.assertRaisesRegex(
+                OSError, "injected overflow handoff presentation failure"):
+            module["orchestrator_close_brief"](
+                runtime, tasks, [], "preserve canonical summary",
+                ["avoid duplicate summaries"], ["keep exact presentation"], True,
+            )
+
+        cursor_path = runtime / "orchestrator-handoff-cursor.json"
+        cursor_after_failure = json.loads(cursor_path.read_text())
+        expected_done = [
+            f"- T{number:03d}-recovered: result {number:02d}"
+            f" — outcome: outcome {number:02d}"
+            for number in range(1, 9)
+        ] + ["- +4 more"]
+        expected = "\n".join([
+            "# Orchestrator handoff",
+            f"generated_at: {boundary}",
+            "consumed_at: (not yet)",
+            "goal: preserve canonical summary",
+            "warning: uncommitted Git-visible changes at close",
+            "done:", *expected_done,
+            "decisions:",
+            "- T002-recovered: second decision",
+            "- T001-recovered: first decision",
+            "next:",
+            *(f"- T{number:03d}-next" for number in range(101, 109)),
+            "- +2 more",
+            "unresolved:",
+            *(f"- T{number:03d}-unresolved" for number in range(201, 209)),
+            "- +2 more",
+            "notes:", "- keep exact presentation",
+            "avoid:", "- avoid duplicate summaries",
+        ]) + "\n"
+        self.assertEqual(cursor_after_failure["handoff"], expected)
+        self.assertNotEqual(handoff_path.read_text(), expected)
+
+        globals_["atomic_write"] = original_atomic_write
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "preserve canonical summary",
+            ["avoid duplicate summaries"], ["keep exact presentation"], True,
+        )
+        recovered_cursor = json.loads(cursor_path.read_text())
+        self.assertEqual(recovered_cursor["handoff"], expected)
+        self.assertEqual(handoff_path.read_text(), expected)
+        done_section = expected.split("done:\n", 1)[1].split("decisions:\n", 1)[0]
+        self.assertEqual(sum(
+            line.startswith("- T") for line in done_section.splitlines()
+        ), 8)
+        self.assertIn("- +4 more\n", done_section)
+        self.assertNotIn("+1 more", done_section)
+
+        emitted = []
+        globals_["say"] = emitted.append
+        clock["now"] = "2026-01-01T00:00:01Z"
+        module["orchestrator_start_brief"](runtime, tasks)
+        consumed = expected.replace(
+            "consumed_at: (not yet)",
+            "consumed_at: 2026-01-01T00:00:01Z", 1,
+        )
+        self.assertIn("\nCurrent handoff:\n" + consumed.rstrip(), "\n".join(emitted))
+        self.assertEqual(handoff_path.read_text(), consumed)
+        self.assertEqual(json.loads(cursor_path.read_text())["handoff"], consumed)
+
+        emitted.clear()
+        clock["now"] = "2026-01-01T00:00:02Z"
+        module["orchestrator_start_brief"](runtime, tasks)
+        consumed_again = consumed.replace(
+            "consumed_at: 2026-01-01T00:00:01Z",
+            "consumed_at: 2026-01-01T00:00:02Z", 1,
+        )
+        self.assertEqual(handoff_path.read_text(), consumed_again)
+        self.assertEqual(json.loads(cursor_path.read_text())["handoff"], consumed_again)
+        self.assertEqual(
+            consumed_again.replace("consumed_at: 2026-01-01T00:00:02Z", ""),
+            expected.replace("consumed_at: (not yet)", ""),
+        )
+
+        clock["now"] = "2026-01-01T00:00:03Z"
+        globals_["say"] = lambda *_args: None
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "later close", [], [], False,
+        )
+        later = handoff_path.read_text()
+        later_done = later.split("done:\n", 1)[1].split("decisions:\n", 1)[0]
+        self.assertTrue(all(task["id"] not in later_done for task in tasks[:12]))
+        self.assertEqual(json.loads(cursor_path.read_text())["handoff"], later)
+
+    def test_handoff_cursor_retains_every_reported_acceptance_identity(self):
+        project = self.make_project("handoff-cursor-boundary-rollover")
+        runtime = project / ".baton"
+        first_boundary = "2026-01-01T00:00:00Z"
+        second_boundary = "2026-01-01T00:00:01Z"
+        historical_id = "T901-historical"
+        first_id = "T902-first-boundary"
+        second_id = "T903-second-boundary"
+        tasks = [
+            {
+                "id": task_id, "title": task_id, "status": "done",
+                "history": [{"event": "accepted", "at": accepted_at}],
+            }
+            for task_id, accepted_at in (
+                (historical_id, "2025-12-31T23:59:59Z"),
+                (first_id, first_boundary),
+                (second_id, second_boundary),
+            )
+        ]
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_cursor_rollover_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        clock = iter((first_boundary, second_boundary))
+        globals_["now"] = lambda: next(clock)
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_close_brief"](
+            runtime, tasks[:2], [], "first goal", [], [], False,
+        )
+        cursor_path = runtime / "orchestrator-handoff-cursor.json"
+        first_cursor = json.loads(cursor_path.read_text())
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "second goal", [], [], False,
+        )
+        second_cursor = json.loads(cursor_path.read_text())
+
+        self.assertEqual(first_cursor["version"], 3)
+        self.assertEqual(
+            first_cursor["reported_ids"], [historical_id, first_id],
+        )
+        self.assertEqual(second_cursor["version"], 3)
+        self.assertEqual(
+            second_cursor["reported_ids"], [historical_id, first_id, second_id],
+        )
+
+    def test_handoff_cursor_legacy_absence_uses_visible_done_boundary(self):
+        project = self.make_project("legacy-handoff-without-cursor")
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:00Z"
+        old_id = "T901-legacy-old"
+        new_id = "T902-legacy-new"
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            f"generated_at: {boundary}\n"
+            "consumed_at: (not yet)\n"
+            "goal: legacy\n"
+            f"done:\n- {old_id}: already shown\n"
+        )
+        tasks = [
+            {
+                "id": task_id, "title": title, "status": "done",
+                "history": [{"event": "accepted", "at": boundary}],
+            }
+            for task_id, title in ((old_id, "old"), (new_id, "new"))
+        ]
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_legacy_cursor_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["now"] = lambda: boundary
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "next goal", [], [], False,
+        )
+        done = handoff.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+        self.assertNotIn(old_id, done)
+        self.assertIn(new_id, done)
+
+    def test_handoff_version_one_cursor_is_read_and_migrated(self):
+        project = self.make_project("version-one-handoff-cursor")
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:00Z"
+        old_id = "T901-version-one-old"
+        new_id = "T902-version-one-new"
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            f"generated_at: {boundary}\n"
+            "consumed_at: (not yet)\n"
+            "goal: version one\n"
+            "done:\n- (none)\n"
+        )
+        cursor = runtime / "orchestrator-handoff-cursor.json"
+        cursor.write_text(json.dumps({
+            "version": 1, "accepted_at": boundary, "seen_ids": [old_id],
+        }))
+        tasks = [
+            {
+                "id": task_id, "title": title, "status": "done",
+                "history": [{"event": "accepted", "at": boundary}],
+            }
+            for task_id, title in ((old_id, "old"), (new_id, "new"))
+        ]
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_v1_cursor_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["now"] = lambda: boundary
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "migrated", [], [], False,
+        )
+        done = handoff.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+        migrated = json.loads(cursor.read_text())
+        self.assertNotIn(old_id, done)
+        self.assertIn(new_id, done)
+        self.assertEqual(migrated["version"], 3)
+        self.assertEqual(migrated["reported_ids"], [old_id, new_id])
+        self.assertEqual(migrated["handoff"], handoff.read_text())
+
+    def test_handoff_version_two_cursor_migration_is_deterministic(self):
+        project = self.make_project("version-two-handoff-cursor")
+        runtime = project / ".baton"
+        boundary = "2026-01-01T00:00:10Z"
+        old_id = "T901-version-two-old"
+        rollback_id = "T902-version-two-rollback"
+        forward_id = "T903-version-two-forward"
+        canonical = (
+            "# Orchestrator handoff\n"
+            f"generated_at: {boundary}\n"
+            "consumed_at: (not yet)\n"
+            "goal: canonical version two\n"
+            f"done:\n- {old_id}: canonical accepted task\n"
+        )
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:09Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: interrupted stale presentation\n"
+            "done:\n- (none)\n"
+        )
+        cursor = runtime / "orchestrator-handoff-cursor.json"
+        cursor.write_text(json.dumps({
+            "version": 2, "accepted_at": boundary, "seen_ids": [old_id],
+            "handoff": canonical,
+        }))
+        tasks = [
+            {
+                "id": task_id, "title": title, "status": "done",
+                "history": [{"event": "accepted", "at": accepted_at}],
+            }
+            for task_id, title, accepted_at in (
+                (old_id, "old", boundary),
+                (rollback_id, "legacy ambiguous rollback", "2026-01-01T00:00:05Z"),
+                (forward_id, "new after boundary", "2026-01-01T00:00:11Z"),
+            )
+        ]
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_v2_cursor_probe")
+        globals_ = module["orchestrator_close_brief"].__globals__
+        globals_["now"] = lambda: "2026-01-01T00:00:06Z"
+        globals_["say"] = lambda *_args: None
+
+        module["orchestrator_close_brief"](
+            runtime, tasks, [], "migrated", [], [], False,
+        )
+        done = handoff.read_text().split("done:\n", 1)[1].split(
+            "decisions:\n", 1,
+        )[0]
+        migrated = json.loads(cursor.read_text())
+        self.assertIn(old_id, done)
+        self.assertNotIn(rollback_id, done)
+        self.assertIn(forward_id, done)
+        self.assertEqual(migrated["version"], 3)
+        self.assertEqual(
+            migrated["reported_ids"], [old_id, rollback_id, forward_id],
+        )
+        self.assertEqual(migrated["handoff"], handoff.read_text())
+
+    def test_handoff_version_three_cursor_schema_is_strict_without_mutation(self):
+        valid_handoff = (
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: preserve version three\n"
+            "done:\n- (none)\n"
+        )
+        cases = (
+            {"version": True, "accepted_at": "2026-01-01T00:00:00Z",
+             "seen_ids": []},
+            {"version": 3.0, "reported_ids": [], "handoff": valid_handoff},
+            {"version": None, "reported_ids": [], "handoff": valid_handoff},
+            {"version": "3", "reported_ids": [], "handoff": valid_handoff},
+            {"version": 4, "reported_ids": [], "handoff": valid_handoff},
+            {"version": 3, "reported_ids": [], "handoff": valid_handoff,
+             "extra": True},
+            {"version": 3, "reported_ids": [], "seen_ids": [],
+             "handoff": valid_handoff},
+            {"version": 3, "reported_ids": ["T901-duplicate", "T901-duplicate"],
+             "handoff": valid_handoff},
+            {"version": 3, "reported_ids": ["not-a-task"],
+             "handoff": valid_handoff},
+            {"version": 3, "reported_ids": [], "handoff": valid_handoff.replace(
+                "2026-01-01T00:00:00Z", "2026-02-30T00:00:00Z",
+            )},
+        )
+        for index, cursor_data in enumerate(cases):
+            with self.subTest(index=index):
+                project = self.make_project(f"invalid-v3-cursor-{index}")
+                runtime = project / ".baton"
+                handoff = runtime / "orchestrator-handoff.md"
+                handoff.write_text(valid_handoff)
+                cursor = runtime / "orchestrator-handoff-cursor.json"
+                cursor.write_text(json.dumps(cursor_data))
+                before = (handoff.read_bytes(), cursor.read_bytes())
+
+                rejected = self.baton(
+                    project, "orchestrator", "brief", "--phase", "close",
+                    "--goal", "must reject malformed cursor",
+                )
+
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(
+                    rejected.stderr,
+                    "error: orchestrator handoff cursor is invalid\n",
+                )
+                self.assertEqual((handoff.read_bytes(), cursor.read_bytes()), before)
+
+    def test_handoff_cursor_rejects_unaccepted_reported_id_and_recovers_once(self):
+        project = self.make_project("unaccepted-reported-handoff-id")
+        task_id = self.create_task(
+            project, "future accepted handoff task", ["future/**"],
+        )
+        runtime = project / ".baton"
+        handoff = runtime / "orchestrator-handoff.md"
+        canonical = (
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: preserve trusted acceptance identities\n"
+            "done:\n- (none)\n"
+        )
+        handoff.write_text(canonical)
+        cursor = runtime / "orchestrator-handoff-cursor.json"
+        cursor.write_text(json.dumps({
+            "version": 3, "reported_ids": [task_id], "handoff": canonical,
+        }))
+        before = (handoff.read_bytes(), cursor.read_bytes())
+
+        rejected = self.baton(
+            project, "orchestrator", "brief", "--phase", "close",
+            "--goal", "reject an untrusted reported identity",
+        )
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(
+            rejected.stderr, "error: orchestrator handoff cursor is invalid\n",
+        )
+        self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+        self.assertEqual((handoff.read_bytes(), cursor.read_bytes()), before)
+
+        task_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(task_path.read_text())
+        task["status"] = "done"
+        task["history"].append({
+            "event": "accepted", "at": "2026-01-01T00:00:01Z",
+        })
+        task_path.write_text(json.dumps(task))
+        cursor.write_text(json.dumps({
+            "version": 3, "reported_ids": [], "handoff": canonical,
+        }))
+
+        counts = []
+        for goal in ("publish recovered task", "do not publish it twice"):
+            self.baton(
+                project, "orchestrator", "brief", "--phase", "close",
+                "--goal", goal, check=True,
+            )
+            done = handoff.read_text().split("done:\n", 1)[1].split(
+                "decisions:\n", 1,
+            )[0]
+            counts.append(done.count(task_id))
+
+        self.assertEqual(counts, [1, 0])
+        self.assertEqual(json.loads(cursor.read_text())["reported_ids"], [task_id])
+
+    def test_handoff_cursor_rejects_invalid_timestamps_without_mutation(self):
+        cases = (
+            (1, "2026-99-01T00:00:00Z", "close"),
+            (2, "2026-02-30T00:00:00Z", "start"),
+            (1, "2026-01-01T99:00:00Z", "start"),
+            (2, "2026-1-01T00:00:00Z", "close"),
+        )
+        for index, (version, accepted_at, phase) in enumerate(cases):
+            with self.subTest(version=version, accepted_at=accepted_at, phase=phase):
+                project = self.make_project(f"invalid-cursor-{index}")
+                runtime = project / ".baton"
+                handoff = runtime / "orchestrator-handoff.md"
+                handoff.write_text(
+                    "# Orchestrator handoff\n"
+                    "generated_at: 2026-01-01T00:00:00Z\n"
+                    "consumed_at: (not yet)\n"
+                    "goal: preserve presentation\n"
+                    "done:\n- T900-shown: preserve accepted-task presentation\n"
+                )
+                cursor_data = {
+                    "version": version, "accepted_at": accepted_at,
+                    "seen_ids": [],
+                }
+                if version == 2:
+                    cursor_data["handoff"] = (
+                        "# Orchestrator handoff\n"
+                        f"generated_at: {accepted_at}\n"
+                        "consumed_at: (not yet)\n"
+                        "goal: preserve canonical cursor presentation\n"
+                        "done:\n- T901-canonical: preserve this accepted task\n"
+                    )
+                cursor = runtime / "orchestrator-handoff-cursor.json"
+                cursor.write_text(json.dumps(cursor_data))
+                before = (handoff.read_bytes(), cursor.read_bytes())
+
+                args = ["orchestrator", "brief", "--phase", phase]
+                if phase == "close":
+                    args += ["--goal", "continue safely"]
+                rejected = self.baton(project, *args)
+
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(
+                    rejected.stderr,
+                    "error: orchestrator handoff cursor is invalid\n",
+                )
+                self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+                self.assertEqual((handoff.read_bytes(), cursor.read_bytes()), before)
+
+    def test_invalid_cursor_close_preserves_accepted_task_for_recovery(self):
+        project = self.make_project("invalid-cursor-accepted-task-recovery")
+        task_id = self.create_task(project, "recover accepted task", ["recover/**"])
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        task = json.loads(state_path.read_text())
+        task["status"] = "done"
+        task["history"].append({
+            "event": "accepted", "at": "2000-01-01T00:00:00Z",
+            "note": "must survive the rejected close",
+        })
+        state_path.write_text(json.dumps(task))
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            "generated_at: 1999-12-31T23:59:59Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: last valid handoff\n"
+            "done:\n- (none)\n"
+        )
+        impossible = "9999-99-99T99:99:99Z"
+        cursor = runtime / "orchestrator-handoff-cursor.json"
+        cursor.write_text(json.dumps({
+            "version": 2, "accepted_at": impossible, "seen_ids": [],
+            "handoff": (
+                "# Orchestrator handoff\n"
+                f"generated_at: {impossible}\n"
+                "consumed_at: (not yet)\n"
+                "goal: malformed cursor boundary\n"
+                "done:\n- (none)\n"
+            ),
+        }))
+        before = (handoff.read_bytes(), cursor.read_bytes())
+
+        rejected = self.baton(
+            project, "orchestrator", "brief", "--phase", "close",
+            "--goal", "recover accepted work",
+        )
+
+        if rejected.returncode == 0:
+            self.assertNotIn(task_id, handoff.read_text())
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(
+            rejected.stderr, "error: orchestrator handoff cursor is invalid\n",
+        )
+        self.assertNotIn("Traceback", rejected.stdout + rejected.stderr)
+        self.assertEqual((handoff.read_bytes(), cursor.read_bytes()), before)
+
+        cursor.unlink()
+        recovered = self.baton(
+            project, "orchestrator", "brief", "--phase", "close",
+            "--goal", "recover accepted work", check=True,
+        )
+        self.assertIn(task_id, recovered.stdout)
+        self.assertIn(task_id, handoff.read_text())
+
+    def test_handoff_malformed_cursor_fails_without_rewriting_handoff(self):
+        project = self.make_project("malformed-handoff-cursor")
+        runtime = project / ".baton"
+        handoff = runtime / "orchestrator-handoff.md"
+        handoff.write_text(
+            "# Orchestrator handoff\n"
+            "generated_at: 2026-01-01T00:00:00Z\n"
+            "consumed_at: (not yet)\n"
+            "goal: preserve this handoff\n"
+            "done:\n- (none)\n"
+        )
+        before = handoff.read_bytes()
+        (runtime / "orchestrator-handoff-cursor.json").write_text("{not json\n")
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_malformed_cursor_probe")
+        module["orchestrator_close_brief"].__globals__["say"] = lambda *_args: None
+
+        with self.assertRaises(SystemExit):
+            module["orchestrator_close_brief"](
+                runtime, [], [], "next goal", [], [], False,
+            )
+        self.assertEqual(handoff.read_bytes(), before)
 
     def test_worker_manual_uses_installed_baton_commands(self):
         worker = (ROOT / "framework" / "worker.md").read_text()
@@ -2704,7 +5609,7 @@ class BatonTests(unittest.TestCase):
             with self.subTest(hook_input=hook_input):
                 session = subprocess.run(
                     command, cwd=project, input=hook_input, text=True,
-                    capture_output=True,
+                    capture_output=True, env=clean_test_environment(),
                 )
                 self.assertEqual(
                     (session.returncode, session.stdout, session.stderr),
@@ -2714,7 +5619,7 @@ class BatonTests(unittest.TestCase):
         notice = "Baton: context was compacted; state re-injected below."
         compact = subprocess.run(
             command, cwd=project, input='{"source":"compact"}', text=True,
-            capture_output=True,
+            capture_output=True, env=clean_test_environment(),
         )
         self.assertEqual(compact.returncode, 0)
         self.assertEqual(compact.stderr, "")
@@ -2726,7 +5631,7 @@ class BatonTests(unittest.TestCase):
         )
         capped = subprocess.run(
             command, cwd=project, input='{"source":"compact"}', text=True,
-            capture_output=True,
+            capture_output=True, env=clean_test_environment(),
         )
         self.assertEqual(capped.returncode, 0)
         self.assertEqual(capped.stderr, "")
@@ -2742,6 +5647,7 @@ class BatonTests(unittest.TestCase):
         session = subprocess.run(
             [project / ".baton" / "baton", "hook-event", "session-start"],
             cwd=project, input="not json", text=True, capture_output=True,
+            env=clean_test_environment(),
         )
         self.assertEqual(session.returncode, 0)
         self.assertEqual(session.stderr, "")
@@ -2764,6 +5670,7 @@ class BatonTests(unittest.TestCase):
                 "user-prompt-submit",
             ],
             cwd=project, input="{malformed", text=True, capture_output=True,
+            env=clean_test_environment(),
         )
         self.assertEqual(prompt.returncode, 0)
         self.assertLessEqual(len(prompt.stdout), 9000)
@@ -2814,6 +5721,198 @@ class BatonTests(unittest.TestCase):
             self.assertNotEqual(denied.returncode, 0)
             self.assertIn("worker processes cannot run orchestrator commands", denied.stderr)
 
+    def test_user_prompt_hook_reuses_loaded_snapshot_and_preserves_exact_json(self):
+        project = self.make_project("hook-load-count")
+        self.create_task(project, "hook load count", ["hook/**"])
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_hook_load_probe")
+        globals_dict = module["cmd_hook_event"].__globals__
+        original_load = globals_dict["load_all_tasks"]
+        runtime = str(project / ".baton")
+        tasks = original_load(runtime)
+        expected = module["claude_user_prompt_output"](
+            "Baton state:\n" + module["render_next_actions"](runtime, tasks)
+        )
+        calls = []
+
+        def counted_load(baton_dir, validate_history=True):
+            calls.append((baton_dir, validate_history))
+            return original_load(baton_dir, validate_history)
+
+        previous_directory = os.getcwd()
+        previous_stdin = sys.stdin
+        previous_environment = {
+            key: os.environ.get(key) for key in BATON_ENVIRONMENT_KEYS
+        }
+        globals_dict["load_all_tasks"] = counted_load
+        try:
+            os.chdir(project)
+            sys.stdin = io.StringIO("{malformed")
+            for key in BATON_ENVIRONMENT_KEYS:
+                os.environ.pop(key, None)
+            os.environ["BATON_DIR"] = runtime
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                module["cmd_hook_event"](SimpleNamespace(name="user-prompt-submit"))
+        finally:
+            globals_dict["load_all_tasks"] = original_load
+            os.chdir(previous_directory)
+            sys.stdin = previous_stdin
+            for key, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        output = captured.getvalue()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(output.encode(), expected.encode())
+        self.assertLessEqual(len(output), 9000)
+        self.assertIsInstance(json.loads(output), dict)
+
+    def test_command_environment_ignores_ambient_worker_identity(self):
+        previous = {key: os.environ.get(key) for key in BATON_ENVIRONMENT_KEYS}
+        try:
+            os.environ.update({
+                "BATON_TASK_ID": "T999-ambient",
+                "BATON_ATTEMPT": "9",
+                "BATON_LEASE": "ambient-lease",
+                "BATON_DIR": str(self.base / "ambient-runtime"),
+                "BATON_ROOT": str(self.base / "ambient-root"),
+            })
+            project = self.make_project("ambient-worker-environment")
+            self.create_task(project, "ambient fixture", ["ambient/**"])
+            status = self.baton(project, "status", check=True)
+            self.assertIn("ambient fixture", status.stdout)
+
+            denied = self.baton(
+                project, "tiers", env={
+                    "BATON_TASK_ID": "T999-explicit",
+                    "BATON_ATTEMPT": "1",
+                    "BATON_LEASE": "explicit-lease",
+                },
+            )
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn(
+                "worker processes cannot run orchestrator commands", denied.stderr,
+            )
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_reduced_performance_benchmark_completes_all_workloads(self):
+        output = self.base / "performance-smoke.json"
+        benchmark = self.command(
+            [
+                sys.executable, ROOT / "tools" / "benchmark_performance.py",
+                "--samples", "1", "--suite-samples", "1", "--skip-suite",
+                "--output", output,
+            ],
+            ROOT, timeout=120,
+        )
+        self.assertEqual(benchmark.returncode, 0, benchmark.stderr)
+        payload = json.loads(output.read_text())
+        self.assertEqual(payload["context"]["tasks"], 500)
+        self.assertEqual(payload["context"]["archived_tasks"], 500)
+        self.assertEqual(set(payload["benchmarks"]), {
+            "startup_help", "start_brief", "large_status", "large_validate",
+            "capsule_memory_references", "archive_stats", "init", "snapshot_diff",
+        })
+        self.assertEqual(
+            payload["hot_paths"]["task_create_snapshot"]["directory_loads_per_call"],
+            {"active": 1, "archive": 1, "total": 2},
+        )
+
+    def make_reduced_performance_fixture(self, name):
+        module = runpy.run_path(
+            str(ROOT / "tools" / "benchmark_performance.py"),
+            run_name="baton_performance_fixture_probe_" + name,
+        )
+        module["prepare_fixture"].__globals__["TASKS"] = 2
+        module["prepare_fixture"].__globals__["ARCHIVED"] = 3
+        base = self.base / name
+        base.mkdir()
+        project = module["prepare_fixture"](SOURCE_BATON, base)
+        return project, module
+
+    def test_performance_suite_environment_selects_running_python(self):
+        module = runpy.run_path(
+            str(ROOT / "tools" / "benchmark_performance.py"),
+            run_name="baton_performance_suite_environment_probe",
+        )
+        base = self.base / "suite-environment"
+        base.mkdir()
+        environment = module["suite_environment"](base)
+
+        selected = shutil.which("python3", path=environment["PATH"])
+        self.assertIsNotNone(selected)
+        self.assertEqual(Path(selected).resolve(), Path(sys.executable).resolve())
+        for key in module["BATON_ENVIRONMENT_KEYS"]:
+            self.assertNotIn(key, environment)
+
+    def test_performance_fixture_has_valid_finalized_review_evidence(self):
+        project, module = self.make_reduced_performance_fixture(
+            "finalized-performance-fixture",
+        )
+        archive = project / ".baton" / "archive"
+        states = [
+            json.loads(path.read_text())
+            for path in sorted(archive.glob("*.json"))
+        ]
+        self.assertEqual(len(states), 3)
+        for state in states:
+            with self.subTest(task_id=state["id"]):
+                evidence = module["finalized_evidence"](state["id"])
+                self.assertEqual(state["status"], "done")
+                self.assertEqual(
+                    [entry["event"] for entry in state["history"]],
+                    ["launched", "worker_exited", "accepted"],
+                )
+                launch, worker_exit, _accepted = state["history"]
+                self.assertEqual(launch["attempt"], state["attempt"])
+                self.assertEqual(launch["lease"], evidence["lease"])
+                self.assertEqual(worker_exit["attempt"], state["attempt"])
+                self.assertEqual(worker_exit["status"], "needs_review")
+                self.assertEqual(worker_exit["declared_paths"], [evidence["changed_path"]])
+                self.assertEqual(worker_exit["observed_paths"], [evidence["changed_path"]])
+                work = archive / (state["id"] + ".work")
+                result_path = work / "attempt-1.result.json"
+                result = json.loads(result_path.read_text())
+                self.assertEqual(result["changed_paths"], worker_exit["declared_paths"])
+                self.assertEqual(result["lease"], launch["lease"])
+                self.assertEqual(result["status"], worker_exit["status"])
+                self.assertEqual(result["note"], worker_exit["note"])
+                self.assertEqual(
+                    worker_exit["result_digest"],
+                    "sha256:" + hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                )
+                self.assertGreater((work / "attempt-1.report.md").stat().st_size, 1500)
+                self.assertGreater((work / "attempt-1.diff").stat().st_size, 3000)
+
+        validation = self.command(
+            [sys.executable, project / ".baton" / "baton", "validate"], project,
+        )
+        self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
+
+    def test_performance_fixture_detects_finalized_result_mutation(self):
+        project, _module = self.make_reduced_performance_fixture(
+            "mutated-performance-fixture",
+        )
+        result_path = next(
+            (project / ".baton" / "archive").glob(
+                "*.work/attempt-1.result.json",
+            )
+        )
+        result_path.write_text(result_path.read_text() + " ")
+
+        validation = self.command(
+            [sys.executable, project / ".baton" / "baton", "validate"], project,
+        )
+        self.assertEqual(validation.returncode, 1)
+        self.assertIn("review result changed after finalization", validation.stdout)
+
     def test_hook_cap_handles_edge_lines_and_preserves_normal_input(self):
         module = runpy.run_path(str(SOURCE_BATON), run_name="baton_hook_edges_probe")
         cap = module["cap_hook_output"]
@@ -2849,7 +5948,9 @@ class BatonTests(unittest.TestCase):
         self.configure(project, worker)
         task_id = self.create_task(project, "once", ["once/**"])
         starts = self.base / "starts"
-        env = dict(os.environ, STARTS=str(starts), FINISH_MARKER=str(self.base / "wait"))
+        env = clean_test_environment({
+            "STARTS": starts, "FINISH_MARKER": self.base / "wait",
+        })
         commands = [str(project / ".baton" / "baton"), "run", task_id]
         first = subprocess.Popen(commands, cwd=project, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
@@ -2869,7 +5970,7 @@ class BatonTests(unittest.TestCase):
         one = self.create_task(project, "alpha", ["alpha/**"])
         two = self.create_task(project, "beta", ["beta/**"])
         baton = str(project / ".baton" / "baton")
-        env = dict(os.environ, SLEEP_AFTER_FINISH="0.8")
+        env = clean_test_environment({"SLEEP_AFTER_FINISH": "0.8"})
         first = subprocess.Popen(
             [baton, "run", one], cwd=project, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -2947,6 +6048,30 @@ class BatonTests(unittest.TestCase):
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["last_note"], "invalid_worker_output")
         self.assertIsInstance(state["last_note"], str)
+
+    def test_finalization_rejects_nonexact_and_invalid_timestamp_result_schema(self):
+        mutations = (
+            ("extra-field", "result['forged'] = True\n"),
+            ("invalid-time", "result['at'] = '2026-02-30T00:00:00Z'\n"),
+        )
+        for name, mutation in mutations:
+            with self.subTest(case=name):
+                worker = self.write_worker(NO_CHANGE_WORKER + f'''\nimport json
+result_path = rd / "work" / tid / f"attempt-{{attempt}}.result.json"
+result = json.loads(result_path.read_text())
+{mutation}result_path.write_text(json.dumps(result))
+''')
+                project = self.make_project("finalize-schema-" + name)
+                self.configure(project, worker)
+                task_id = self.create_task(project, name)
+                self.baton(project, "run", task_id, check=True)
+                state = self.state(project, task_id)
+                self.assertEqual(state["status"], "failed")
+                self.assertEqual(state["last_note"], "invalid_worker_output")
+                self.assertFalse(
+                    (project / ".baton" / "work" / task_id
+                     / "review-brief-token.json").exists()
+                )
 
     def test_valid_submission_survives_nonzero_exit_with_review_warning(self):
         project = self.make_project()
@@ -3451,6 +6576,46 @@ class BatonTests(unittest.TestCase):
                     self.assertIn("history entry 0", status.stderr)
                     self.assertNotIn("Traceback", status.stderr)
 
+    def test_validate_needs_review_with_malformed_scalar_history_is_diagnostic(self):
+        project = self.make_project("needs-review-malformed-scalar-history")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        config = project / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\nreport_requires_sections = true\n"
+        )
+        task_id = self.create_task(project, "needs review malformed scalar history")
+        self.baton(project, "run", task_id, check=True)
+        state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+        valid_state = json.loads(state_path.read_text())
+        self.baton(project, "validate", check=True)
+        report = project / ".baton" / "work" / task_id / "attempt-1.report.md"
+        report.write_text("# Incomplete review report\n")
+
+        malformed_histories = ([1], [{"event": "worker_exited", "at": []}])
+        for history in malformed_histories:
+            with self.subTest(history=history):
+                state = dict(valid_state)
+                state["history"] = history
+                state_path.write_text(json.dumps(state))
+                state_before = state_path.read_bytes()
+
+                validation = self.baton(project, "validate")
+
+                output = validation.stdout + validation.stderr
+                self.assertEqual(validation.returncode, 1, output)
+                self.assertIn(f"{task_id}: history entry 0", validation.stdout, output)
+                self.assertIn(
+                    f"{task_id}: missing required report section `## Result`",
+                    validation.stdout,
+                    output,
+                )
+                self.assertNotIn("Traceback", output)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertFalse(
+                    (project / ".baton" / "work" / task_id
+                     / "review-brief-token.json").exists()
+                )
+
     def test_validate_rejects_malformed_active_task_field_shapes(self):
         cases = (
             ("id", ["bad"], "task id must look like"),
@@ -3532,6 +6697,35 @@ class BatonTests(unittest.TestCase):
                         validation.stdout,
                     )
 
+    def test_validate_rejects_nonterminal_archived_task_status(self):
+        for status in ("queued", "needs_review", "failed", "running"):
+            with self.subTest(status=status):
+                project = self.make_project("nonterminal-archive-" + status)
+                task_id = self.create_task(project, "nonterminal archived " + status)
+                state_path = project / ".baton" / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                self.baton(project, "archive", check=True)
+
+                archive_path = project / ".baton" / "archive" / f"{task_id}.json"
+                archived = json.loads(archive_path.read_text())
+                archived["status"] = status
+                archive_path.write_text(json.dumps(archived))
+
+                validation = self.baton(project, "validate")
+                self.assertEqual(validation.returncode, 1)
+                self.assertIn(
+                    f"{task_id}: archived task status must be done or cancelled",
+                    validation.stdout,
+                )
+                if status == "queued":
+                    rejected_run = self.baton(project, "run", task_id)
+                    self.assertEqual(rejected_run.returncode, 1)
+                    self.assertIn(
+                        f"no such active task: {task_id}", rejected_run.stderr,
+                    )
+
     def test_valid_archived_done_and_cancelled_records_validate(self):
         project = self.make_project()
         done_id = self.create_task(project, "valid archived done")
@@ -3548,6 +6742,175 @@ class BatonTests(unittest.TestCase):
         validation = self.baton(project, "validate")
         self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
         self.assertEqual(validation.stdout, "ok: 0 active task(s)\n")
+
+    def test_validate_rejects_missing_needs_review_result_before_review(self):
+        project = self.make_project("missing-review-result-validation")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(project, "missing review result", ["review/**"])
+        self.baton(project, "run", task_id, check=True)
+        work = project / ".baton" / "work" / task_id
+        (work / "attempt-1.result.json").unlink()
+
+        review = self.baton(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+        )
+        self.assertEqual(review.returncode, 1)
+        self.assertIn("No such file or directory", review.stderr)
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        self.assertIn(f"{task_id}: review result", validation.stdout)
+
+    def test_validate_enforces_review_report_section_gate_with_brief_parity(self):
+        project = self.make_project("validate-report-section-gate")
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        config = project / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\nreport_requires_sections = true\n"
+        )
+        task_id = self.create_task(project, "validate report sections")
+        self.baton(project, "run", task_id, check=True)
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        work = runtime / "work" / task_id
+        (work / "attempt-1.report.md").write_text(
+            "# Regular but incomplete report\n\nWork completed successfully.\n"
+        )
+        state_before = state_path.read_bytes()
+
+        review = self.baton(
+            project, "orchestrator", "brief", "--phase", "review", task_id,
+        )
+        self.assertEqual(review.returncode, 1)
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        for section in ("Result", "Changes", "Verification", "Decisions and risks"):
+            problem = f"missing required report section `## {section}`"
+            self.assertIn(problem, review.stderr)
+            self.assertIn(f"{task_id}: {problem}", validation.stdout)
+        self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertFalse((work / "review-brief-token.json").exists())
+
+    def test_validate_report_gate_compatibility_controls(self):
+        gate_off = self.make_project("validate-report-gate-off")
+        self.configure(gate_off, self.write_worker(NO_CHANGE_WORKER))
+        config = gate_off / ".baton" / "config.toml"
+        config.write_text(
+            config.read_text() + "\n[gates]\nreport_requires_sections = false\n"
+        )
+        task_id = self.create_task(gate_off, "validate free-form report")
+        self.baton(gate_off, "run", task_id, check=True)
+        report = (
+            gate_off / ".baton" / "work" / task_id / "attempt-1.report.md"
+        )
+        report.write_text("Free-form review report.\n")
+        self.baton(gate_off, "validate", check=True)
+
+        non_review = self.make_project("validate-non-review-states")
+        for status in ("needs_decision", "blocked", "failed"):
+            task_id = self.create_task(non_review, "validate " + status)
+            state_path = non_review / ".baton" / "tasks" / f"{task_id}.json"
+            state = json.loads(state_path.read_text())
+            state["status"] = status
+            state_path.write_text(json.dumps(state))
+        self.baton(non_review, "validate", check=True)
+
+    def test_validate_rejects_unusable_needs_review_evidence_shapes(self):
+        cases = (
+            ("missing-report", "report", "missing", "review report"),
+            ("empty-report", "report", "empty", "review report"),
+            ("directory-report", "report", "directory", "review report"),
+            ("missing-diff", "diff", "missing", "review diff"),
+            ("directory-diff", "diff", "directory", "review diff"),
+            ("malformed-result", "result", "malformed", "review result JSON"),
+            ("wrong-type-result", "result", "wrong-type", "JSON object"),
+            ("directory-result", "result", "directory", "review result"),
+            ("wrong-changed-paths", "result", "wrong-paths", "changed_paths"),
+            ("wrong-observed-paths", "state", "wrong-observed", "observed changed paths"),
+        )
+        for name, artifact, mutation, message in cases:
+            with self.subTest(mutation=mutation):
+                project = self.make_project(name)
+                self.configure(project, self.write_worker(GOOD_WORKER))
+                task_id = self.create_task(project, name, ["evidence/**"])
+                self.baton(project, "run", task_id, check=True)
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                work = runtime / "work" / task_id
+                artifact_path = {
+                    "report": work / "attempt-1.report.md",
+                    "result": work / "attempt-1.result.json",
+                    "diff": work / "attempt-1.diff",
+                }.get(artifact)
+                if mutation == "missing":
+                    artifact_path.unlink()
+                elif mutation == "empty":
+                    artifact_path.write_text("")
+                elif mutation == "directory":
+                    artifact_path.unlink()
+                    artifact_path.mkdir()
+                elif mutation == "malformed":
+                    artifact_path.write_text("{")
+                elif mutation == "wrong-type":
+                    artifact_path.write_text("[]")
+                elif mutation == "wrong-paths":
+                    result = json.loads(artifact_path.read_text())
+                    result["changed_paths"] = "evidence/not-a-list.txt"
+                    artifact_path.write_text(json.dumps(result))
+                else:
+                    state = json.loads(state_path.read_text())
+                    state["history"][-1]["observed_paths"] = "evidence/not-a-list.txt"
+                    state_path.write_text(json.dumps(state))
+
+                state_before = state_path.read_bytes()
+                validation = self.baton(project, "validate")
+                self.assertEqual(validation.returncode, 1)
+                self.assertIn(f"{task_id}:", validation.stdout)
+                self.assertIn(message, validation.stdout)
+                self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertFalse((work / "review-brief-token.json").exists())
+
+    def test_validate_aggregates_review_evidence_problems_and_accepts_legacy_empty_diff(self):
+        invalid = self.make_project("aggregate-review-evidence")
+        self.configure(invalid, self.write_worker(NO_CHANGE_WORKER))
+        invalid_id = self.create_task(invalid, "aggregate review evidence")
+        self.baton(invalid, "run", invalid_id, check=True)
+        invalid_runtime = invalid / ".baton"
+        invalid_work = invalid_runtime / "work" / invalid_id
+        report = invalid_work / "attempt-1.report.md"
+        report.write_text("# Incomplete report\n\nEvidence summary.\n")
+        (invalid_work / "attempt-1.result.json").write_text("[]")
+        diff = invalid_work / "attempt-1.diff"
+        diff.unlink()
+        diff.mkdir()
+        state_path = invalid_runtime / "tasks" / f"{invalid_id}.json"
+        state = json.loads(state_path.read_text())
+        state["history"][-1]["observed_paths"] = 1
+        state_path.write_text(json.dumps(state))
+        state_before = state_path.read_bytes()
+
+        validation = self.baton(invalid, "validate")
+        self.assertEqual(validation.returncode, 1)
+        for message in (
+                "missing required report section `## Result`", "review diff", "JSON object",
+                "observed changed paths"):
+            self.assertIn(message, validation.stdout)
+        self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+        self.assertEqual(state_path.read_bytes(), state_before)
+
+        legacy = self.make_project("legacy-review-evidence")
+        self.configure(legacy, self.write_worker(NO_CHANGE_WORKER))
+        legacy_id = self.create_task(legacy, "legacy empty review evidence")
+        self.baton(legacy, "run", legacy_id, check=True)
+        legacy_runtime = legacy / ".baton"
+        legacy_work = legacy_runtime / "work" / legacy_id
+        self.assertEqual((legacy_work / "attempt-1.diff").read_text(), "")
+        legacy_state_path = legacy_runtime / "tasks" / f"{legacy_id}.json"
+        legacy_state = json.loads(legacy_state_path.read_text())
+        legacy_state["history"][-1].pop("observed_paths")
+        legacy_state_path.write_text(json.dumps(legacy_state))
+        self.baton(legacy, "validate", check=True)
 
     def test_validate_reports_every_malformed_unused_tier_setting_and_name(self):
         project = self.make_project()
@@ -3679,7 +7042,7 @@ class BatonTests(unittest.TestCase):
                 process = subprocess.Popen(
                     [str(project / ".baton" / "baton"), "run", task_id],
                     cwd=project,
-                    env=dict(os.environ, LATE_MARKER=str(marker)),
+                    env=clean_test_environment({"LATE_MARKER": marker}),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -3732,7 +7095,7 @@ class BatonTests(unittest.TestCase):
         marker = self.base / "parallel-late-marker"
         process = subprocess.Popen(
             [str(project / ".baton" / "baton"), "run", *task_ids],
-            cwd=project, env=dict(os.environ, LATE_MARKER=str(marker)),
+            cwd=project, env=clean_test_environment({"LATE_MARKER": marker}),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
@@ -3916,6 +7279,7 @@ class BatonTests(unittest.TestCase):
         medium_state["tier"] = "medium"
         medium_state["history"] = [{"event": "launched", "attempt": 1}]
         medium_path.write_text(json.dumps(medium_state))
+        (runtime / "work" / medium).mkdir(parents=True)
         self.baton(project, "archive", check=True)
 
         for task_id, tier, launches in (
@@ -3995,6 +7359,342 @@ class BatonTests(unittest.TestCase):
             self.assertTrue((runtime / "tasks" / f"{task_id}.json").exists())
             self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
 
+    def test_atomic_archive_rename_binds_linux_and_macos_no_replace_flags(self):
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_native_binding_probe",
+        )
+
+        class Operation:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return 0
+
+        for platform_name, attribute, expected in (
+                ("linux", "renameat2", (-100, b"source", -100, b"target", 1)),
+                ("darwin", "renamex_np", (b"source", b"target", 0x00000004))):
+            with self.subTest(platform=platform_name):
+                operation = Operation()
+                library = SimpleNamespace(**{attribute: operation})
+                bound, diagnostic = module["bind_atomic_archive_rename"](
+                    platform_name, library,
+                )
+                self.assertEqual(bound(b"source", b"target"), 0)
+                self.assertEqual(operation.calls, [expected])
+                self.assertEqual(operation.restype, module["ctypes"].c_int)
+                self.assertIn(attribute, diagnostic)
+
+    def test_atomic_archive_rename_validates_and_fails_closed_when_unavailable(self):
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_unavailable_probe",
+        )
+        globals_ = module["atomic_archive_rename_no_replace"].__globals__
+        source = self.base / "unavailable-source"
+        destination = self.base / "unavailable-destination"
+        source_bytes = b"preserved source\n"
+        source.write_bytes(source_bytes)
+        boundary_called = False
+
+        def boundary(_source, _destination):
+            nonlocal boundary_called
+            boundary_called = True
+
+        globals_["archive_atomic_rename_boundary"] = boundary
+        globals_["ATOMIC_ARCHIVE_RENAME"] = None
+        globals_["ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC"] = "injected unavailable"
+        with self.assertRaisesRegex(
+                RuntimeError, "atomic no-replace archive move is unavailable"):
+            module["durable_archive_rename"](source, destination)
+        self.assertFalse(boundary_called)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertFalse(destination.exists())
+
+        for invalid, message in (("", "must not be empty"), ("bad\0path", "null byte")):
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaisesRegex(ValueError, message):
+                    module["atomic_archive_rename_no_replace"](invalid, destination)
+        with self.assertRaisesRegex(TypeError, "path-like"):
+            module["atomic_archive_rename_no_replace"](object(), destination)
+
+    def test_atomic_archive_rename_maps_native_errno_without_mutation(self):
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_native_errno_probe",
+        )
+        globals_ = module["atomic_archive_rename_no_replace"].__globals__
+        source = self.base / "errno-source"
+        destination = self.base / "errno-destination"
+        source.write_bytes(b"source evidence\n")
+
+        def failing_operation(error_number):
+            def operation(_source, _destination):
+                module["ctypes"].set_errno(error_number)
+                return -1
+            return operation
+
+        globals_["ATOMIC_ARCHIVE_RENAME_DIAGNOSTIC"] = "injected native operation"
+        for error_number, exception, message in (
+                (module["errno"].EEXIST, ValueError, "refusing to overwrite"),
+                (module["errno"].EINVAL, RuntimeError, "unavailable on this filesystem"),
+                (module["errno"].EIO, OSError, "failed from")):
+            with self.subTest(error_number=error_number):
+                globals_["ATOMIC_ARCHIVE_RENAME"] = failing_operation(error_number)
+                with self.assertRaisesRegex(exception, message) as caught:
+                    module["atomic_archive_rename_no_replace"](source, destination)
+                self.assertEqual(source.read_bytes(), b"source evidence\n")
+                self.assertFalse(destination.exists())
+                if error_number == module["errno"].EIO:
+                    self.assertEqual(Path(caught.exception.filename), source)
+                    self.assertEqual(Path(caught.exception.filename2), destination)
+
+    def test_archive_move_boundary_never_replaces_destination_topologies(self):
+        for index, destination_kind in enumerate(
+                ("file", "empty-directory", "nonempty-directory", "symlink")):
+            with self.subTest(destination_kind=destination_kind):
+                project = self.make_project("archive-move-race-{}".format(index))
+                task_id = self.create_task(project, "archive move race")
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                source_before = state_path.read_bytes()
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                spec_before = spec_path.read_bytes()
+                work = runtime / "work" / task_id
+                work.mkdir()
+                work_evidence = work / "evidence"
+                work_evidence.write_bytes(b"unrelated work evidence\n")
+                destination = runtime / "archive" / f"{task_id}.json"
+                symlink_target = self.base / "archive-race-symlink-target"
+                symlink_target.write_bytes(b"symlink target\n")
+
+                module = runpy.run_path(
+                    str(SOURCE_BATON),
+                    run_name="baton_archive_move_race_probe_{}".format(index),
+                )
+                globals_ = module["cmd_archive"].__globals__
+                globals_["require_baton_dir"] = lambda: str(runtime)
+                collided = False
+
+                def collide(source, target):
+                    nonlocal collided
+                    if collided or Path(target) != destination:
+                        return
+                    collided = True
+                    if destination_kind == "file":
+                        destination.write_bytes(b"concurrent sentinel\n")
+                    elif destination_kind == "empty-directory":
+                        destination.mkdir()
+                    elif destination_kind == "nonempty-directory":
+                        destination.mkdir()
+                        (destination / "sentinel").write_bytes(b"directory sentinel\n")
+                    else:
+                        destination.symlink_to(symlink_target)
+
+                globals_["archive_atomic_rename_boundary"] = collide
+                with self.assertRaisesRegex(RuntimeError, "pending journal preserved"):
+                    module["cmd_archive"](SimpleNamespace())
+
+                journal = runtime / "archive-transaction.json"
+                self.assertTrue(collided)
+                self.assertTrue(journal.is_file())
+                self.assertEqual(state_path.read_bytes(), source_before)
+                self.assertEqual(spec_path.read_bytes(), spec_before)
+                self.assertEqual(work_evidence.read_bytes(), b"unrelated work evidence\n")
+                if destination_kind == "file":
+                    self.assertEqual(destination.read_bytes(), b"concurrent sentinel\n")
+                    destination.unlink()
+                elif destination_kind == "empty-directory":
+                    self.assertEqual(list(destination.iterdir()), [])
+                    destination.rmdir()
+                elif destination_kind == "nonempty-directory":
+                    self.assertEqual(
+                        (destination / "sentinel").read_bytes(),
+                        b"directory sentinel\n",
+                    )
+                    shutil.rmtree(destination)
+                else:
+                    self.assertTrue(destination.is_symlink())
+                    self.assertEqual(destination.readlink(), symlink_target)
+                    self.assertEqual(symlink_target.read_bytes(), b"symlink target\n")
+                    destination.unlink()
+
+                globals_["archive_atomic_rename_boundary"] = lambda *_args: None
+                with redirect_stdout(io.StringIO()):
+                    module["cmd_archive"](SimpleNamespace())
+                self.assertFalse(journal.exists())
+                self.assertFalse(state_path.exists())
+                self.assertFalse(spec_path.exists())
+                self.assertFalse(work.exists())
+                self.assertEqual(destination.read_bytes(), source_before)
+                self.assertEqual(
+                    (runtime / "archive" / f"{task_id}.work" / "evidence").read_bytes(),
+                    b"unrelated work evidence\n",
+                )
+
+    def test_archive_recovery_move_boundary_preserves_collision_and_retries(self):
+        project = self.make_project("archive-recovery-move-race")
+        task_id = self.create_task(project, "archive recovery move race")
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "done"
+        state_path.write_text(json.dumps(state))
+        source_before = state_path.read_bytes()
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_recovery_move_race_probe",
+        )
+        transaction = module["build_archive_transaction"](
+            str(runtime), module["load_all_tasks"](str(runtime)),
+        )
+        journal = runtime / "archive-transaction.json"
+        module["atomic_json"](journal, transaction)
+        journal_before = journal.read_bytes()
+        destination = runtime / "archive" / f"{task_id}.json"
+        sentinel = b"recovery collision sentinel\n"
+        globals_ = module["recover_archive_transaction"].__globals__
+
+        def collide(_source, target):
+            if Path(target) == destination and not destination.exists():
+                destination.write_bytes(sentinel)
+
+        globals_["archive_atomic_rename_boundary"] = collide
+        with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
+            module["recover_archive_transaction"](str(runtime))
+        self.assertEqual(journal.read_bytes(), journal_before)
+        self.assertEqual(state_path.read_bytes(), source_before)
+        self.assertEqual(destination.read_bytes(), sentinel)
+        self.assertTrue((runtime / "tasks" / f"{task_id}.md").is_file())
+
+        destination.unlink()
+        globals_["archive_atomic_rename_boundary"] = lambda *_args: None
+        self.assertTrue(module["recover_archive_transaction"](str(runtime)))
+        self.assertFalse(journal.exists())
+        self.assertFalse(state_path.exists())
+        self.assertEqual(destination.read_bytes(), source_before)
+
+    def test_archive_rollback_move_boundary_preserves_collision_and_retries(self):
+        project = self.make_project("archive-rollback-move-race")
+        task_id = self.create_task(project, "archive rollback move race")
+        runtime = project / ".baton"
+        active_state = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(active_state.read_text())
+        state["status"] = "done"
+        active_state.write_text(json.dumps(state))
+        archived_state = runtime / "archive" / f"{task_id}.json"
+        source_before = active_state.read_bytes()
+        sentinel = b"rollback collision sentinel\n"
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_rollback_move_race_probe",
+        )
+        globals_ = module["cmd_archive"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+
+        def fail_forward_then_collide_rollback(source, destination):
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if destination_path == runtime / "archive" / f"{task_id}.md":
+                raise RuntimeError("injected ordinary archive failure")
+            if source_path == archived_state and destination_path == active_state:
+                active_state.write_bytes(sentinel)
+
+        globals_["archive_atomic_rename_boundary"] = fail_forward_then_collide_rollback
+        with self.assertRaisesRegex(RuntimeError, "durable rollback could not complete"):
+            module["cmd_archive"](SimpleNamespace())
+
+        journal = runtime / "archive-transaction.json"
+        self.assertTrue(journal.is_file())
+        self.assertEqual(active_state.read_bytes(), sentinel)
+        self.assertEqual(archived_state.read_bytes(), source_before)
+        self.assertTrue((runtime / "tasks" / f"{task_id}.md").is_file())
+
+        active_state.unlink()
+        globals_["archive_atomic_rename_boundary"] = lambda *_args: None
+        with redirect_stdout(io.StringIO()):
+            module["cmd_archive"](SimpleNamespace())
+        self.assertFalse(journal.exists())
+        self.assertFalse(active_state.exists())
+        self.assertEqual(archived_state.read_bytes(), source_before)
+
+    def test_accept_serializes_done_write_and_token_consumption_with_archive(self):
+        project = self.make_project("accept-archive-race")
+        self.configure(project, self.write_worker(GOOD_WORKER))
+        task_id = self.create_task(project, "accept archive race", ["race/**"])
+        self.baton(project, "run", task_id, check=True)
+        _brief, token = self.review_brief_token(project, task_id)
+
+        runtime = project / ".baton"
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_accept_archive_probe")
+        globals_ = module["cmd_task_accept"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        original_save_task = globals_["save_task"]
+        original_file_lock = globals_["file_lock"]
+        accepted_state_saved = threading.Event()
+        release_accept = threading.Event()
+        archive_lock_attempted = threading.Event()
+        archive_finished = threading.Event()
+        errors = {}
+
+        def synchronized_save_task(baton_dir, task):
+            original_save_task(baton_dir, task)
+            if (
+                    threading.current_thread().name == "accept-probe"
+                    and task.get("id") == task_id
+                    and task.get("status") == "done"):
+                accepted_state_saved.set()
+                if not release_accept.wait(5):
+                    raise RuntimeError("accept synchronization timed out")
+
+        @contextmanager
+        def observed_file_lock(path):
+            if (
+                    threading.current_thread().name == "archive-probe"
+                    and path == globals_["lock_path"](str(runtime), "scheduler")):
+                archive_lock_attempted.set()
+            with original_file_lock(path):
+                yield
+
+        globals_["save_task"] = synchronized_save_task
+        globals_["file_lock"] = observed_file_lock
+
+        def accept():
+            try:
+                module["cmd_task_accept"](SimpleNamespace(
+                    id=task_id, brief=token, note=None,
+                ))
+            except BaseException as error:
+                errors["accept"] = error
+
+        def archive():
+            try:
+                module["cmd_archive"](SimpleNamespace())
+            except BaseException as error:
+                errors["archive"] = error
+            finally:
+                archive_finished.set()
+
+        accept_thread = threading.Thread(target=accept, name="accept-probe")
+        archive_thread = threading.Thread(target=archive, name="archive-probe")
+        accept_thread.start()
+        self.assertTrue(accepted_state_saved.wait(5))
+        archive_thread.start()
+        self.assertTrue(archive_lock_attempted.wait(5))
+        archive_completed_before_accept = archive_finished.wait(0.5)
+        release_accept.set()
+        accept_thread.join(5)
+        archive_thread.join(5)
+
+        self.assertFalse(accept_thread.is_alive())
+        self.assertFalse(archive_thread.is_alive())
+        self.assertFalse(archive_completed_before_accept)
+        self.assertEqual(errors, {})
+        self.assertFalse((runtime / "tasks" / f"{task_id}.json").exists())
+        archived_work = runtime / "archive" / f"{task_id}.work"
+        self.assertTrue(archived_work.is_dir())
+        self.assertFalse((archived_work / "review-brief-token.json").exists())
+
     def test_archive_defers_sigterm_until_transaction_is_complete(self):
         project = self.make_project()
         task_id = self.create_task(project, "archive signal", ["archive/**"])
@@ -4016,7 +7716,8 @@ import time
 from types import SimpleNamespace
 
 module = runpy.run_path(sys.argv[1], run_name="baton_archive_probe")
-original = module["shutil"].move
+globals_ = module["cmd_archive"].__globals__
+original = globals_["durable_archive_rename"]
 marker = Path(sys.argv[3])
 
 def slow_move(source, target):
@@ -4025,13 +7726,14 @@ def slow_move(source, target):
     time.sleep(0.25)
     return result
 
-module["shutil"].move = slow_move
+globals_["durable_archive_rename"] = slow_move
 os.chdir(sys.argv[2])
 module["cmd_archive"](SimpleNamespace())
 '''
         process = subprocess.Popen(
             [sys.executable, "-c", code, str(SOURCE_BATON), str(project), str(marker)],
-            cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=project, env=clean_test_environment(), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         deadline = time.monotonic() + 5
         while not marker.exists() and time.monotonic() < deadline:
@@ -4046,6 +7748,403 @@ module["cmd_archive"](SimpleNamespace())
         self.assertTrue((runtime / "archive" / f"{task_id}.json").exists())
         self.assertTrue((runtime / "archive" / f"{task_id}.md").exists())
         self.assertTrue((runtime / "archive" / f"{task_id}.work").exists())
+
+    def test_archive_recovers_sigkill_at_every_durable_boundary(self):
+        boundaries = (
+            "journal-created", "move-0", "move-1", "move-2", "journal-removed",
+        )
+        for index, boundary in enumerate(boundaries):
+            with self.subTest(boundary=boundary):
+                project = self.make_project("archive-crash-{}".format(index))
+                task_id = self.create_task(
+                    project, "archive crash {}".format(index), ["crash-{}/**".format(index)],
+                )
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                work = runtime / "work" / task_id
+                work.mkdir(parents=True)
+                (work / "artifact").write_text("evidence\n")
+                marker = self.base / "archive-crash-boundary-{}".format(index)
+                code = r'''
+import os
+from pathlib import Path
+import runpy
+import signal
+import sys
+from types import SimpleNamespace
+
+module = runpy.run_path(sys.argv[1], run_name="baton_archive_crash_probe")
+globals_ = module["cmd_archive"].__globals__
+marker = Path(sys.argv[3])
+target = sys.argv[4]
+
+def stop_at_boundary(name):
+    if name == target:
+        marker.write_text(name + "\n")
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+globals_["archive_transaction_boundary"] = stop_at_boundary
+os.chdir(sys.argv[2])
+module["cmd_archive"](SimpleNamespace())
+'''
+                process = subprocess.Popen(
+                    [
+                        sys.executable, "-c", code, str(SOURCE_BATON), str(project),
+                        str(marker), boundary,
+                    ],
+                    cwd=project, env=clean_test_environment(), text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(marker.exists(), boundary)
+                    os.kill(process.pid, signal.SIGKILL)
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual(
+                        process.returncode, -signal.SIGKILL, stdout + stderr,
+                    )
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+                before_recovery = self.baton(project, "validate")
+                if boundary == "journal-removed":
+                    self.assertEqual(
+                        before_recovery.returncode, 0,
+                        before_recovery.stdout + before_recovery.stderr,
+                    )
+                else:
+                    self.assertEqual(before_recovery.returncode, 1)
+                    self.assertIn(
+                        "archive transaction is pending", before_recovery.stdout,
+                    )
+
+                recovered = self.baton(project, "archive", check=True)
+                self.assertEqual(recovered.stdout, "archived 0 task(s)\n")
+                self.assertFalse((runtime / "archive-transaction.json").exists())
+                self.assertFalse((runtime / "tasks" / f"{task_id}.json").exists())
+                self.assertFalse((runtime / "tasks" / f"{task_id}.md").exists())
+                self.assertFalse((runtime / "work" / task_id).exists())
+                self.assertTrue((runtime / "archive" / f"{task_id}.json").is_file())
+                self.assertTrue((runtime / "archive" / f"{task_id}.md").is_file())
+                self.assertTrue((runtime / "archive" / f"{task_id}.work").is_dir())
+                retry = self.baton(project, "archive", check=True)
+                self.assertEqual(retry.stdout, "archived 0 task(s)\n")
+                self.baton(project, "validate", check=True)
+
+    def test_archive_ordinary_exception_rolls_back_and_removes_journal(self):
+        project = self.make_project("archive-exception-rollback")
+        task_id = self.create_task(project, "archive exception rollback")
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "done"
+        state_path.write_text(json.dumps(state))
+        work = runtime / "work" / task_id
+        work.mkdir(parents=True)
+        (work / "artifact").write_text("evidence\n")
+
+        module = runpy.run_path(str(SOURCE_BATON), run_name="baton_archive_rollback_probe")
+        globals_ = module["cmd_archive"].__globals__
+        globals_["require_baton_dir"] = lambda: str(runtime)
+        original = globals_["durable_archive_rename"]
+        forward_moves = 0
+
+        def fail_second_forward_move(source, destination):
+            nonlocal forward_moves
+            if Path(source).parent.name in ("tasks", "work"):
+                forward_moves += 1
+                if forward_moves == 2:
+                    raise RuntimeError("injected archive move failure")
+            return original(source, destination)
+
+        globals_["durable_archive_rename"] = fail_second_forward_move
+        with self.assertRaisesRegex(RuntimeError, "injected archive move failure"):
+            module["cmd_archive"](SimpleNamespace())
+
+        self.assertFalse((runtime / "archive-transaction.json").exists())
+        self.assertTrue((runtime / "tasks" / f"{task_id}.json").is_file())
+        self.assertTrue((runtime / "tasks" / f"{task_id}.md").is_file())
+        self.assertTrue((runtime / "work" / task_id).is_dir())
+        self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
+        self.assertFalse((runtime / "archive" / f"{task_id}.md").exists())
+        self.assertFalse((runtime / "archive" / f"{task_id}.work").exists())
+
+    def test_archive_recovery_fails_closed_for_ambiguous_or_tampered_journal(self):
+        for index, mode in enumerate(("ambiguous", "tampered")):
+            with self.subTest(mode=mode):
+                project = self.make_project("archive-journal-{}".format(index))
+                task_id = self.create_task(project, "archive journal " + mode)
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                module = runpy.run_path(
+                    str(SOURCE_BATON), run_name="baton_archive_journal_probe_" + mode,
+                )
+                transaction = module["build_archive_transaction"](
+                    str(runtime), module["load_all_tasks"](str(runtime)),
+                )
+                journal = runtime / "archive-transaction.json"
+                if mode == "ambiguous":
+                    collision = runtime / "archive" / f"{task_id}.json"
+                    collision.write_text("pre-existing evidence\n")
+                    expected = "both source and destination exist"
+                else:
+                    transaction["artifacts"][0]["source"] = "../seed.txt"
+                    collision = None
+                    expected = "artifact paths are not trusted"
+                module["atomic_json"](str(journal), transaction)
+
+                recovered = self.baton(project, "archive")
+                self.assertEqual(recovered.returncode, 1)
+                self.assertIn(expected, recovered.stderr)
+                self.assertTrue(journal.is_file())
+                self.assertTrue(state_path.is_file())
+                if collision is not None:
+                    self.assertEqual(collision.read_text(), "pre-existing evidence\n")
+
+    def test_archive_recovery_rejects_non_integer_journal_versions_without_mutation(self):
+        invalid_versions = {
+            "boolean": True,
+            "float": 1.0,
+            "null": None,
+            "string": "1",
+            "unsupported": 2,
+        }
+        for index, (label, version) in enumerate(invalid_versions.items()):
+            with self.subTest(label=label):
+                project = self.make_project("archive-version-{}".format(index))
+                task_id = self.create_task(project, "archive version " + label)
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                spec_path = runtime / "tasks" / f"{task_id}.md"
+                module = runpy.run_path(
+                    str(SOURCE_BATON),
+                    run_name="baton_archive_version_probe_" + label,
+                )
+                transaction = module["build_archive_transaction"](
+                    str(runtime), module["load_all_tasks"](str(runtime)),
+                )
+                transaction["version"] = version
+                journal = runtime / "archive-transaction.json"
+                module["atomic_json"](str(journal), transaction)
+                before = {
+                    path: path.read_bytes() for path in (journal, state_path, spec_path)
+                }
+
+                recovered = self.baton(project, "archive")
+
+                self.assertEqual(recovered.returncode, 1)
+                self.assertIn("unsupported version", recovered.stderr)
+                self.assertEqual(
+                    {path: path.read_bytes() for path in before}, before,
+                )
+                self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
+                self.assertFalse((runtime / "archive" / f"{task_id}.md").exists())
+
+    def test_archive_recovery_rejects_omitted_work_then_recovers_repaired_journal(self):
+        project = self.make_project("archive-omitted-work")
+        task_id = self.create_task(project, "archive omitted work")
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "done"
+        state["history"].append({
+            "at": "2026-07-17T00:00:00Z", "event": "launched", "attempt": 1,
+        })
+        state_path.write_text(json.dumps(state))
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        active_work = runtime / "work" / task_id
+        active_work.mkdir(parents=True)
+        evidence = active_work / "evidence.txt"
+        evidence.write_text("preserved evidence\n")
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_omitted_work_probe",
+        )
+        transaction = module["build_archive_transaction"](
+            str(runtime), module["load_all_tasks"](str(runtime)),
+        )
+        tampered = dict(transaction)
+        tampered["artifacts"] = [
+            artifact for artifact in transaction["artifacts"]
+            if artifact["kind"] != "directory"
+        ]
+        journal = runtime / "archive-transaction.json"
+        module["atomic_json"](str(journal), tampered)
+        before = {
+            path: path.read_bytes()
+            for path in (journal, state_path, spec_path, evidence)
+        }
+
+        rejected = self.baton(project, "archive")
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("canonical work artifact entry is missing", rejected.stderr)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        for suffix in (".json", ".md", ".work"):
+            self.assertFalse((runtime / "archive" / f"{task_id}{suffix}").exists())
+
+        module["atomic_json"](str(journal), transaction)
+        recovered = self.baton(project, "archive", check=True)
+        self.assertEqual(recovered.stdout, "archived 0 task(s)\n")
+        self.assertFalse(journal.exists())
+        self.assertFalse(state_path.exists())
+        self.assertFalse(spec_path.exists())
+        self.assertFalse(active_work.exists())
+        self.assertTrue((runtime / "archive" / f"{task_id}.json").is_file())
+        self.assertTrue((runtime / "archive" / f"{task_id}.md").is_file())
+        self.assertEqual(
+            (runtime / "archive" / f"{task_id}.work" / "evidence.txt").read_text(),
+            "preserved evidence\n",
+        )
+        retry = self.baton(project, "archive", check=True)
+        self.assertEqual(retry.stdout, "archived 0 task(s)\n")
+        self.baton(project, "validate", check=True)
+
+    def test_archive_recovery_requires_launched_work_absent_from_journal_and_disk(self):
+        project = self.make_project("archive-required-work-absent")
+        task_id = self.create_task(project, "archive required work absent")
+        runtime = project / ".baton"
+        state_path = runtime / "tasks" / f"{task_id}.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "done"
+        state["history"].append({
+            "at": "2026-07-17T00:00:00Z", "event": "launched", "attempt": 1,
+        })
+        state_path.write_text(json.dumps(state))
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        active_work = runtime / "work" / task_id
+        active_work.mkdir(parents=True)
+        evidence_bytes = b"restored evidence\n"
+        (active_work / "evidence.txt").write_bytes(evidence_bytes)
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_archive_required_work_absent_probe",
+        )
+        transaction = module["build_archive_transaction"](
+            str(runtime), module["load_all_tasks"](str(runtime)),
+        )
+        tampered = dict(transaction)
+        tampered["artifacts"] = [
+            artifact for artifact in transaction["artifacts"]
+            if artifact["kind"] != "directory"
+        ]
+        shutil.rmtree(active_work)
+        journal = runtime / "archive-transaction.json"
+        module["atomic_json"](str(journal), tampered)
+        before = {
+            path: path.read_bytes() for path in (journal, state_path, spec_path)
+        }
+
+        rejected = self.baton(project, "archive")
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("canonical required work artifact entry is missing", rejected.stderr)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertFalse(active_work.exists())
+        for suffix in (".json", ".md", ".work"):
+            self.assertFalse((runtime / "archive" / f"{task_id}{suffix}").exists())
+
+        active_work.mkdir()
+        (active_work / "evidence.txt").write_bytes(evidence_bytes)
+        module["atomic_json"](str(journal), transaction)
+        recovered = self.baton(project, "archive", check=True)
+        self.assertEqual(recovered.stdout, "archived 0 task(s)\n")
+        self.assertFalse(journal.exists())
+        self.assertFalse(state_path.exists())
+        self.assertFalse(spec_path.exists())
+        self.assertFalse(active_work.exists())
+        self.assertEqual(
+            (runtime / "archive" / f"{task_id}.work" / "evidence.txt").read_bytes(),
+            evidence_bytes,
+        )
+        retry = self.baton(project, "archive", check=True)
+        self.assertEqual(retry.stdout, "archived 0 task(s)\n")
+        self.baton(project, "validate", check=True)
+
+    def test_archive_recovery_preflights_extra_and_ambiguous_work_topology(self):
+        for index, mode in enumerate(("extra", "ambiguous")):
+            with self.subTest(mode=mode):
+                project = self.make_project("archive-work-topology-{}".format(index))
+                task_id = self.create_task(project, "archive work " + mode)
+                runtime = project / ".baton"
+                state_path = runtime / "tasks" / f"{task_id}.json"
+                state = json.loads(state_path.read_text())
+                state["status"] = "done"
+                state_path.write_text(json.dumps(state))
+                active_work = runtime / "work" / task_id
+                active_work.mkdir(parents=True)
+                (active_work / "evidence").write_text("evidence\n")
+                module = runpy.run_path(
+                    str(SOURCE_BATON),
+                    run_name="baton_archive_work_topology_probe_" + mode,
+                )
+                transaction = module["build_archive_transaction"](
+                    str(runtime), module["load_all_tasks"](str(runtime)),
+                )
+                if mode == "extra":
+                    shutil.rmtree(active_work)
+                    expected = "no active or archived work"
+                else:
+                    archived_work = runtime / "archive" / f"{task_id}.work"
+                    shutil.copytree(active_work, archived_work)
+                    expected = "both active and archived work exist"
+                journal = runtime / "archive-transaction.json"
+                module["atomic_json"](str(journal), transaction)
+                state_before = state_path.read_bytes()
+                journal_before = journal.read_bytes()
+
+                recovered = self.baton(project, "archive")
+
+                self.assertEqual(recovered.returncode, 1)
+                self.assertIn(expected, recovered.stderr)
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertEqual(journal.read_bytes(), journal_before)
+                self.assertFalse((runtime / "archive" / f"{task_id}.json").exists())
+                self.assertFalse((runtime / "archive" / f"{task_id}.md").exists())
+
+    def test_validate_rejects_split_orphaned_and_required_companion_layouts(self):
+        project = self.make_project("archive-layout-validation")
+        runtime = project / ".baton"
+
+        archived_id = self.create_task(project, "split archived state")
+        archived_state = runtime / "tasks" / f"{archived_id}.json"
+        os.rename(archived_state, runtime / "archive" / archived_state.name)
+
+        active_id = self.create_task(project, "split active state")
+        active_spec = runtime / "tasks" / f"{active_id}.md"
+        os.rename(active_spec, runtime / "archive" / active_spec.name)
+
+        required_id = self.create_task(project, "missing required work")
+        required_state = runtime / "tasks" / f"{required_id}.json"
+        required = json.loads(required_state.read_text())
+        required["history"].append({"at": "now", "event": "launched", "attempt": 1})
+        required_state.write_text(json.dumps(required))
+
+        orphan_spec_id = "T997-orphan-spec"
+        orphan_work_id = "T998-orphan-work"
+        (runtime / "tasks" / f"{orphan_spec_id}.md").write_text("orphan\n")
+        (runtime / "archive" / f"{orphan_work_id}.work").mkdir()
+
+        validation = self.baton(project, "validate")
+        self.assertEqual(validation.returncode, 1)
+        for message in (
+                f"{archived_id}: archived task state has active companion artifacts",
+                f"{active_id}: active task state has archived companion artifacts",
+                f"{orphan_spec_id}: active task spec has no corresponding active state",
+                f"{orphan_work_id}: archived work has no corresponding archived state",
+                f"{required_id}: required active work is missing"):
+            self.assertIn(message, validation.stdout)
 
     def test_unborn_repository_diff_uses_worktree_content(self):
         project = self.make_project(commit=False)
@@ -4398,7 +8497,207 @@ module["cmd_archive"](SimpleNamespace())
         ])
         shown = self.baton(project, "memory", "show", "M999")
         self.assertEqual(shown.returncode, 1)
-        self.assertIn("no memory entry M999", shown.stderr)
+        self.assertIn("orphan full entry headings for ids: M999", shown.stderr)
+
+    def test_memory_add_preserves_inline_entries_text_in_earlier_summary(self):
+        project = self.make_project("inline-entries-memory-summary")
+        first_summary = "Markdown may contain inline ## Entries text"
+        first = self.baton(
+            project, "memory", "add", "--for", "worker",
+            first_summary, "first body", check=True,
+        )
+        second = self.baton(
+            project, "memory", "add", "--for", "both",
+            "Normal second summary", "second body", check=True,
+        )
+
+        self.assertEqual(first.stdout, "added M001\n")
+        self.assertEqual(second.stdout, "added M002\n")
+        indexed = self.baton(project, "memory", "index", check=True)
+        self.assertEqual(indexed.stdout, (
+            f"M001 [W] {first_summary}\n"
+            "M002 [B] Normal second summary\n"
+        ))
+        first_shown = self.baton(project, "memory", "show", "M001", check=True)
+        second_shown = self.baton(project, "memory", "show", "M002", check=True)
+        self.assertEqual(
+            first_shown.stdout,
+            f"### M001 [W] {first_summary}\nfirst body\n",
+        )
+        self.assertEqual(
+            second_shown.stdout,
+            "### M002 [B] Normal second summary\nsecond body\n",
+        )
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_added_memory_fresh_parse_probe",
+        )
+        entries, bodies = module["memory_records"](
+            (project / ".baton" / "memory.md").read_text()
+        )
+        self.assertEqual([entry[0] for entry in entries], ["M001", "M002"])
+        self.assertEqual(set(bodies), {"M001", "M002"})
+        self.assertEqual(self.baton(project, "validate").returncode, 0)
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        task_id = self.create_task(project, "valid memory launch", ["memory/**"])
+        spec_path = project / ".baton" / "tasks" / f"{task_id}.md"
+        spec_path.write_text(spec_path.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            "Use M001 and M002.",
+        ))
+        self.baton(project, "task", "capsule", task_id, check=True)
+        self.baton(project, "run", task_id, check=True)
+
+    def test_memory_add_rejects_duplicate_entries_heading_inside_body(self):
+        project = self.make_project("entries-heading-memory-body")
+        body = "Body introduction\n\n## Entries\n\nOrdinary body section"
+        memory = project / ".baton" / "memory.md"
+        before = memory.read_bytes()
+
+        rejected = self.baton(
+            project, "memory", "add", "--for", "worker",
+            "Body uses an Entries heading", body,
+        )
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("memory structure", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertEqual(memory.read_bytes(), before)
+        self.assertEqual(self.baton(project, "validate").returncode, 0)
+
+    def test_memory_rejects_orphan_and_noncanonical_entries_layouts_without_mutation(self):
+        cases = {
+            "empty-index-intervening-section": (
+                "# Memory\n\n## Index\n\n## Notes\nnot memory\n\n## Entries\n\n"
+                "### M001 [W] Invisible fact\ninvisible body\n"
+            ),
+            "populated-index-intervening-section": (
+                "# Memory\n\n## Index\n- M001 [W] Indexed fact\n\n"
+                "## Notes\nnot memory\n\n## Entries\n\n"
+                "### M001 [W] Indexed fact\nbody\n"
+            ),
+            "duplicate-entries": (
+                "# Memory\n\n## Index\n- M001 [W] Indexed fact\n\n"
+                "## Entries\n\n### M001 [W] Indexed fact\nbody\n\n"
+                "## Entries\n"
+            ),
+            "entries-before-index": (
+                "# Memory\n\n## Entries\n\n## Index\n\n## Entries\n"
+            ),
+            "orphan-before-entries": (
+                "# Memory\n\n### M999 [W] Orphan fact\norphan body\n\n"
+                "## Index\n\n## Entries\n"
+            ),
+            "orphan-after-entries": (
+                "# Memory\n\n## Index\n\n## Entries\n\n"
+                "### M999 [W] Orphan fact\norphan body\n"
+            ),
+            "malformed-orphan-heading": (
+                "# Memory\n\n## Index\n\n## Entries\n\n"
+                "### M01 [W] Invisible fact\ninvisible body\n"
+            ),
+        }
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_orphan_memory_parser_probe",
+        )
+        records = module["memory_records"]
+
+        for name, malformed in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "memory structure"):
+                    records(malformed)
+                project = self.make_project("malformed-memory-" + name)
+                memory = project / ".baton" / "memory.md"
+                memory.write_text(malformed)
+                before = memory.read_bytes()
+
+                rejected = self.baton(
+                    project, "memory", "add", "--for", "worker",
+                    "New fact", "new body",
+                )
+
+                self.assertEqual(rejected.returncode, 1)
+                self.assertIn("memory structure", rejected.stderr)
+                self.assertNotIn("Traceback", rejected.stderr)
+                self.assertEqual(memory.read_bytes(), before)
+
+    def test_memory_add_migrates_legacy_empty_layout_and_serializes_concurrent_ids(self):
+        legacy = self.make_project("legacy-empty-memory")
+        legacy_memory = legacy / ".baton" / "memory.md"
+        legacy_memory.write_text("# Memory\n\n## Index\n")
+
+        migrated = self.baton(
+            legacy, "memory", "add", "--for", "worker",
+            "Migrated fact", "migrated body", check=True,
+        )
+
+        self.assertEqual(migrated.stdout, "added M001\n")
+        self.assertIn("\n## Entries\n\n### M001", legacy_memory.read_text())
+        self.assertEqual(self.baton(legacy, "validate").returncode, 0)
+
+        project = self.make_project("concurrent-memory-add")
+        barrier = threading.Barrier(3)
+        results = []
+
+        def add_memory(number):
+            barrier.wait()
+            results.append(self.baton(
+                project, "memory", "add", "--for", "both",
+                f"Concurrent fact {number}", f"body {number}",
+            ))
+
+        threads = [threading.Thread(target=add_memory, args=(number,))
+                   for number in (1, 2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual([result.returncode for result in results], [0, 0])
+        self.assertEqual(
+            {result.stdout for result in results}, {"added M001\n", "added M002\n"},
+        )
+        module = runpy.run_path(
+            str(SOURCE_BATON), run_name="baton_concurrent_memory_parse_probe",
+        )
+        entries, bodies = module["memory_records"](
+            (project / ".baton" / "memory.md").read_text()
+        )
+        self.assertEqual([entry[0] for entry in entries], ["M001", "M002"])
+        self.assertEqual(set(bodies), {"M001", "M002"})
+        self.assertEqual(self.baton(project, "validate").returncode, 0)
+
+    def test_missing_memory_body_fails_validate_preview_and_launch_without_claim(self):
+        project = self.make_project("missing-memory-body")
+        self.configure(project, self.write_worker(NO_CHANGE_WORKER))
+        self.baton(
+            project, "memory", "add", "--for", "worker",
+            "Required worker fact", "full body", check=True,
+        )
+        task_id = self.create_task(project, "missing memory body", ["memory/**"])
+        runtime = project / ".baton"
+        spec_path = runtime / "tasks" / f"{task_id}.md"
+        spec_path.write_text(spec_path.read_text().replace(
+            "List the paths and facts the worker needs. Reference memory ids when useful.",
+            "Use M001.",
+        ))
+        memory_path = runtime / "memory.md"
+        memory_text = memory_path.read_text()
+        heading = "### M001 [W] Required worker fact"
+        memory_path.write_text(memory_text[:memory_text.index(heading)].rstrip() + "\n")
+        before = (runtime / "tasks" / f"{task_id}.json").read_bytes()
+
+        shown = self.baton(project, "memory", "show", "M001")
+        validation = self.baton(project, "validate")
+        preview = self.baton(project, "task", "capsule", task_id, "--raw")
+        launch = self.baton(project, "run", task_id)
+
+        for result in (shown, preview, launch):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("M001", result.stdout + result.stderr)
+        self.assertNotEqual(validation.returncode, 0)
+        self.assertIn("M001", validation.stdout + validation.stderr)
+        self.assertEqual((runtime / "tasks" / f"{task_id}.json").read_bytes(), before)
 
     def test_memory_add_rejects_unicode_line_separators_without_mutation(self):
         for separator in ("\u2028", "\u2029"):
@@ -4427,11 +8726,14 @@ module["cmd_archive"](SimpleNamespace())
     def test_memory_index_parser_is_strict_and_preserves_four_digit_ids(self):
         module = runpy.run_path(str(SOURCE_BATON), run_name="baton_memory_parser_probe")
         parse = module["memory_index_entries"]
+        records = module["memory_records"]
         valid = (
             "# Memory\n\n## Index\n"
             "- M1000 [B] Shared fact\n"
             "- M001 [W] Worker fact\n\n"
-            "## Entries\n"
+            "## Entries\n\n"
+            "### M1000 [B] Shared fact\nshared body\n\n## Body details\nlegacy markdown\n\n"
+            "### M001 [W] Worker fact\nworker body\n"
         )
         self.assertEqual(
             parse(valid),
@@ -4441,6 +8743,28 @@ module["cmd_archive"](SimpleNamespace())
             parse(valid.replace("- M001 [W] Worker fact", "- M01 [W] Worker fact"))
         with self.assertRaisesRegex(ValueError, "duplicate id M1000"):
             parse(valid.replace("M001 [W] Worker fact", "M1000 [W] Worker fact"))
+        entries, bodies = records(valid)
+        self.assertEqual(entries, parse(valid))
+        self.assertEqual(
+            bodies["M1000"],
+            "### M1000 [B] Shared fact\nshared body\n\n## Body details\nlegacy markdown",
+        )
+        damaged = {
+            "missing": valid.replace(
+                "\n### M001 [W] Worker fact\nworker body", "",
+            ),
+            "mismatched": valid.replace(
+                "### M001 [W] Worker fact", "### M001 [O] Different fact",
+            ),
+            "duplicate": valid + "\n### M001 [W] Worker fact\nduplicate body\n",
+            "orphan": valid + "\n### M999 [W] Orphan fact\norphan body\n",
+        }
+        for problem, text in damaged.items():
+            with self.subTest(problem=problem):
+                with self.assertRaisesRegex(
+                        ValueError, rf"{problem}.*M001" if problem != "orphan"
+                        else r"orphan.*M999"):
+                    records(text)
 
         project = self.make_project()
         memory = project / ".baton" / "memory.md"
