@@ -278,4 +278,4 @@ Every task creation requires an explicit configured tier; `default` is rejected.
 | Debug an archive crash/collision | `read_archive_transaction` → topology validation → `complete_archive_transaction`/rollback → `atomic_archive_rename_no_replace`; use deterministic boundary probes and search tests for `archive_recovery`, `archive_rollback`, `archive_move_boundary`, and `atomic_archive_rename`. |
 | Debug duplicate/missing handoff completions | Treat `orchestrator-handoff-cursor.json` as canonical; inspect `read_handoff_cursor` and `orchestrator_close_brief`; run same-second, clock-rollback, cursor-drift, overflow, and consumption tests. |
 
-Last updated 2026-07-17 from commits `eeb6894` and `28dc3c2` using `/mnt/e/dashboard/skills/summary-create-update.md`; corrected provenance and expanded the source-backed debugging map after parallel implementation/history audits.
+Last updated 2026-07-17 from commits `eeb6894` and `28dc3c2`; corrected provenance and expanded the source-backed debugging map after parallel implementation/history audits.
