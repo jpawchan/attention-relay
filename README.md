@@ -1,5 +1,7 @@
 # Baton
 
+Introduction article: https://jpawchan.substack.com/p/baton-agentic-orchestration-framework
+
 ## What is Baton?
 
 Baton coordinates coding agents. Each worker handles a focused task, and one orchestrator checks the result.
